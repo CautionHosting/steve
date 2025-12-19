@@ -1,4 +1,3 @@
-use serde::Serialize;
 use x25519_dalek::EphemeralSecret;
 use ed25519_dalek::SigningKey;
 
@@ -7,7 +6,7 @@ use ed25519_dalek::SigningKey;
 // we encrypt the shared secret to, and have the client send the encrypted shared secret back to us
 // for each request, so it can be shared to multiple enclaves that share the decryption secret.
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct MetadataOutput {
     public_verifying_key: [u8; 32],
 }
