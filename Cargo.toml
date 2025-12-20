@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
 	"crates/steve",
+	"crates/steve-sdk",
 ]
 
 [workspace.dependencies]
