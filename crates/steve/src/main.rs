@@ -44,6 +44,7 @@ impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
             .field("persistent_decryption_key", &"<secret key>")
+            .field("signing_key", &"<secret key>")
             .finish()
     }
 }
