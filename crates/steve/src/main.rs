@@ -1,4 +1,4 @@
-//! Enclave Encrypt Proxy
+//! Secure Transport Encryption Via Enclave
 
 use std::sync::Arc;
 

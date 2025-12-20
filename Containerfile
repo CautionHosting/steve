@@ -9,6 +9,6 @@ RUN cargo build --release --target x86_64-unknown-linux-musl
 
 FROM scratch
 
-COPY --from=builder /tmp/cargo-target/x86_64-unknown-linux-musl/release/keyfork-testing /usr/bin/keyfork-testing
+COPY --from=builder /tmp/cargo-target/x86_64-unknown-linux-musl/release/steve /usr/bin/steve
 EXPOSE 1337
-ENTRYPOINT ["/usr/bin/keyfork-testing"]
+ENTRYPOINT ["/usr/bin/steve"]
