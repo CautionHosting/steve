@@ -3,7 +3,8 @@ import { verify } from 'tee-attestation-js/nitro';
 let CONFIG = {
   attestationEndpoint: '/attestation',
   keyExchangeEndpoint: '/e2p/v1/create_shared_key',
-  excludePaths: ['/attestation', '/e2p/'],
+  passthroughPaths: ['/', '/enclave-sw.js', '/register.js'],
+  excludePrefixes: ['/attestation', '/e2p/'],
   keyRotationInterval: 30 * 60 * 1000
 };
 
@@ -32,8 +33,9 @@ self.addEventListener('message', (event) => {
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-  const isExcluded = CONFIG.excludePaths.some(path => url.pathname.startsWith(path));
-  if (isExcluded) {
+  const isPassthrough = CONFIG.passthroughPaths.includes(url.pathname);
+  const isExcluded = CONFIG.excludePrefixes.some(prefix => url.pathname.startsWith(prefix));
+  if (isPassthrough || isExcluded) {
     return;
   }
   event.respondWith(handleEncryptedRequest(event.request));

@@ -297,6 +297,7 @@ async fn passthrough_request(
     request: axum::extract::Request,
 ) -> Response {
     let path = request.uri().path();
+    debug!(%path, "incoming request");
 
     // Check if this is a passthrough path
     if PASSTHROUGH_PATHS.contains(&path) {
