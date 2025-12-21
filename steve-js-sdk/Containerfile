@@ -1,0 +1,19 @@
+FROM stagex/core-git@sha256:6b3e0055f6aeaa8465f207a871db2c63a939cd7406113e9d769ff3b37239f3d0 AS git
+FROM stagex/core-ca-certificates@sha256:d135f1189e9b232eb7316626bf7858534c5540b2fc53dced80a4c9a95f26493e AS ca-certificates
+FROM stagex/core-curl@sha256:bc8bab43d96a9167fbb85022ea773644a45ef335e7a9b747f203078973fa988e AS curl
+
+FROM stagex/pallet-nodejs@sha256:1f705b58321b17e87ea68c04431ad83be6e6b64253d0443be4c61501902d57c3 AS builder
+
+COPY --from=git . /
+COPY --from=ca-certificates . /
+COPY --from=curl . /
+
+WORKDIR /build
+
+COPY package.json ./
+RUN npm install
+
+COPY build.js ./
+COPY src/ ./src/
+
+RUN npm run build
