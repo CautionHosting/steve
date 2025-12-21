@@ -698,12 +698,12 @@ async function encryptRequest(request) {
   const url = new URL(request.url);
   const body = await request.arrayBuffer();
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const plaintext = new TextEncoder().encode(JSON.stringify({
+  const plaintext = encode({
     method: request.method,
     path: url.pathname + url.search,
     headers: Object.fromEntries(request.headers),
-    body: body.byteLength > 0 ? btoa(String.fromCharCode(...new Uint8Array(body))) : null
-  }));
+    body: body.byteLength > 0 ? new Uint8Array(body) : null
+  });
   const ciphertext = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv },
     state.sessionKey,
@@ -734,8 +734,8 @@ async function decryptResponse(response) {
     state.sessionKey,
     ciphertext
   );
-  const decoded = JSON.parse(new TextDecoder().decode(plaintext));
-  const bodyBytes = decoded.body ? Uint8Array.from(atob(decoded.body), (c) => c.charCodeAt(0)) : new Uint8Array(0);
+  const decoded = decode(new Uint8Array(plaintext));
+  const bodyBytes = decoded.body instanceof Uint8Array ? decoded.body : new Uint8Array(0);
   return new Response(bodyBytes, {
     status: decoded.status || 200,
     headers: decoded.headers || {}

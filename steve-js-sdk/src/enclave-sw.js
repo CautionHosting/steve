@@ -1,4 +1,5 @@
 import { verify } from 'tee-attestation-js/nitro';
+import { encode as encodeCBOR, decode as decodeCBOR } from 'tee-attestation-js/lib/cbor';
 
 let CONFIG = {
   attestationEndpoint: '/attestation',
@@ -307,12 +308,12 @@ async function encryptRequest(request) {
 
   const iv = crypto.getRandomValues(new Uint8Array(12));
 
-  const plaintext = new TextEncoder().encode(JSON.stringify({
+  const plaintext = encodeCBOR({
     method: request.method,
     path: url.pathname + url.search,
     headers: Object.fromEntries(request.headers),
-    body: body.byteLength > 0 ? btoa(String.fromCharCode(...new Uint8Array(body))) : null
-  }));
+    body: body.byteLength > 0 ? new Uint8Array(body) : null
+  });
 
   const ciphertext = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv },
@@ -351,9 +352,9 @@ async function decryptResponse(response) {
     ciphertext
   );
 
-  const decoded = JSON.parse(new TextDecoder().decode(plaintext));
-  const bodyBytes = decoded.body
-    ? Uint8Array.from(atob(decoded.body), c => c.charCodeAt(0))
+  const decoded = decodeCBOR(new Uint8Array(plaintext));
+  const bodyBytes = decoded.body instanceof Uint8Array
+    ? decoded.body
     : new Uint8Array(0);
 
   return new Response(bodyBytes, {

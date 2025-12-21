@@ -3,7 +3,7 @@ CONTAINER_ENGINE ?= docker
 .PHONY: build clean
 
 build:
-	$(CONTAINER_ENGINE) build -f Containerfile -t enclave-service-worker-build .
+	$(CONTAINER_ENGINE) build -f Containerfile -t enclave-service-worker-build . --no-cache
 	container_id=$$($(CONTAINER_ENGINE) create enclave-service-worker-build true) && \
 	mkdir -p dist && \
 	$(CONTAINER_ENGINE) cp "$$container_id:/build/dist/." dist/ && \

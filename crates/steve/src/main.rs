@@ -152,14 +152,16 @@ struct DecryptedRequest {
     method: String,
     path: String,
     headers: std::collections::HashMap<String, String>,
-    body: Option<String>,
+    #[serde(with = "serde_bytes", default)]
+    body: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize)]
 struct EncryptedResponse {
     status: u16,
     headers: std::collections::HashMap<String, String>,
-    body: Option<String>,
+    #[serde(with = "serde_bytes")]
+    body: Option<Vec<u8>>,
 }
 
 
@@ -207,7 +209,7 @@ async fn handle_encrypted_request(
         .map_err(|_| "Failed to decrypt request body")?;
 
     let request: DecryptedRequest =
-        serde_json::from_slice(&plaintext).map_err(|e| format!("Invalid request JSON: {e}"))?;
+        ciborium::from_reader(&plaintext[..]).map_err(|e| format!("Invalid request CBOR: {e}"))?;
 
     debug!(method = %request.method, path = %request.path, "forwarding decrypted request");
 
@@ -232,11 +234,8 @@ async fn handle_encrypted_request(
         }
     }
 
-    if let Some(ref body_b64) = request.body {
-        let body_bytes = BASE64
-            .decode(body_b64)
-            .map_err(|_| "Invalid base64 in request body")?;
-        req_builder = req_builder.body(body_bytes);
+    if let Some(ref body_bytes) = request.body {
+        req_builder = req_builder.body(body_bytes.clone());
     }
 
     let upstream_response = req_builder
@@ -257,19 +256,20 @@ async fn handle_encrypted_request(
         .await
         .map_err(|e| format!("Failed to read upstream response: {e}"))?;
 
-    let body_b64 = if response_body.is_empty() {
+    let body_bytes = if response_body.is_empty() {
         None
     } else {
-        Some(BASE64.encode(&response_body))
+        Some(response_body.to_vec())
     };
 
-    let response_json = EncryptedResponse {
+    let response_cbor = EncryptedResponse {
         status,
         headers: response_headers,
-        body: body_b64,
+        body: body_bytes,
     };
 
-    let response_plaintext = serde_json::to_vec(&response_json)
+    let mut response_plaintext = Vec::new();
+    ciborium::into_writer(&response_cbor, &mut response_plaintext)
         .map_err(|e| format!("Failed to serialize response: {e}"))?;
 
     // Encrypt the response
