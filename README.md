@@ -27,8 +27,11 @@ flowchart LR
     TLS <-->|"E2E Encrypted<br/>(TLS terminated)"| STEVE
     STEVE <-->|Plaintext| APP_E
 
-    style Host fill:#fee,stroke:#c00
-    style Enclave fill:#efe,stroke:#0a0
+    style Host fill:#722,stroke:#500,color:#fff
+    style Enclave fill:#246,stroke:#135,color:#fff
+    style TLS fill:#944,stroke:#722,color:#fff
+    style STEVE fill:#48a,stroke:#246,color:#fff
+    style APP_E fill:#48a,stroke:#246,color:#fff
 ```
 
 ## Two Layers of Encryption
