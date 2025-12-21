@@ -29,22 +29,30 @@ type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
 const APP_UPSTREAM: &str = "http://127.0.0.1:8083";
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct MetadataOutput {
     verifying_key: [u8; 32],
 }
+
+// NOTE: Be wary when impl the following traits:
+// * Clone
+// * Debug
+// * Display
+//
+// Use an Arc instead of .clone()
 
 struct AppState {
     persistent_decryption_key: Key<Aes256Gcm>,
     signing_key: SigningKey,
     http_client: Client,
+    upstream_url: url::Url,
 }
 
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
-            .field("persistent_decryption_key", &"<redacted>")
-            .field("signing_key", &"<redacted>")
+            .field("persistent_decryption_key", &"<secret_key>")
+            .field("signing_key", &"<secret_key>")
             .finish()
     }
 }
@@ -60,15 +68,27 @@ async fn main() -> Result<()> {
     };
 
     debug!("setting up app state");
+
+    // TODO: Use Keyfork reconstitution to get the E2 decryption key
+    // We don't have access to that now, so instead generate an ephemeral one.
+    //
     let app_state = AppState {
         persistent_decryption_key: Aes256Gcm::generate_key(OsRng),
         signing_key,
         http_client: Client::new(),
+        upstream_url: url::Url::parse(APP_UPSTREAM)?,
     };
 
-    let metadata_path =
-        std::env::var("E2P_METADATA_FILE").unwrap_or_else(|_| String::from("/metadata.json"));
-    debug!(?metadata_output, ?metadata_path, "writing verifying key to file");
+    let metadata_path = std::env::var("E2P_METADATA_FILE").unwrap_or_else(|e| {
+        debug!("could not use E2P_METADATA_FILE: {e}");
+        String::from("/metadata.json")
+    });
+    debug!(
+        ?metadata_output,
+        ?metadata_path,
+        "writing public key to file"
+    );
+
     let metadata_file = std::fs::File::create_new(&metadata_path)?;
     serde_json::to_writer(metadata_file, &metadata_output)?;
 
@@ -88,14 +108,16 @@ async fn create_shared_key(
     State(app_state): State<Arc<AppState>>,
     Json(data): Json<CreateSharedKeyRequest>,
 ) -> Json<serde_json::Value> {
-    debug!("performing ECDH key exchange");
+    debug!(?data, "performing ECDH against their key"); 
     let their_pubkey = PublicKey::from(data.public_key_bytes);
     let our_privkey = EphemeralSecret::random_from_rng(OsRng);
     let our_pubkey = PublicKey::from(&our_privkey);
     let shared_secret = our_privkey.diffie_hellman(&their_pubkey);
 
+    debug!("performing ECDH against the shared secret"); 
+
     let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
-    let mut shared_key_bytes = [0u8; 32];
+    let mut shared_key_bytes = [0u8; 256 / 8];
     hkdf.expand(b"key", &mut shared_key_bytes).unwrap();
 
     debug!("encrypting shared key with persistent key");
@@ -117,6 +139,7 @@ async fn create_shared_key(
         .collect();
     let signature = app_state.signing_key.sign(&to_sign);
 
+    // NOTE: signature.to_bytes() returns [u8; 64], which serde didn't impl Serialize for
     Json(json!({
         "public_key": our_pubkey.to_bytes(),
         "signature": &signature.to_bytes()[..],
@@ -129,7 +152,7 @@ struct DecryptedRequest {
     method: String,
     path: String,
     headers: std::collections::HashMap<String, String>,
-    body: Option<String>,
+    body: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,11 +163,12 @@ struct EncryptedResponse {
 }
 
 
+#[tracing::instrument(skip(app_state, encrypted_body))]
 async fn handle_encrypted_request(
     app_state: &AppState,
     headers: &HeaderMap,
     encrypted_body: &[u8],
-) -> Result<Response, String> {
+) -> Result<Response, String> { // TODO fixup using String as Err
     // Get and decode the encrypted shared key from header
     let e2p_key_header = headers
         .get("x-e2p-key")
@@ -193,9 +217,10 @@ async fn handle_encrypted_request(
         .parse()
         .map_err(|_| "Invalid HTTP method")?;
 
-    let url = format!("{}{}", APP_UPSTREAM, request.path);
+    let url = app_state.upstream_url.join(&request.path)
+        .map_err(|e| format!("Invalid path: {e}"))?;
 
-    let mut req_builder = app_state.http_client.request(method, &url);
+    let mut req_builder = app_state.http_client.request(method, url);
 
     for (key, value) in &request.headers {
         if !key.eq_ignore_ascii_case("host")
@@ -207,7 +232,7 @@ async fn handle_encrypted_request(
         }
     }
 
-    if let Some(ref body_b64) = request.body {
+    if let Some(ref body_b64) = request.body { // TODO check multipart form data
         let body_bytes = BASE64
             .decode(body_b64)
             .map_err(|_| "Invalid base64 in request body")?;
@@ -281,7 +306,7 @@ async fn passthrough_request(
 
     // Otherwise require encryption
     let (parts, body) = request.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
         Err(e) => {
             error!("failed to read body: {e}");
