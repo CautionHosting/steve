@@ -309,7 +309,7 @@ async function encryptRequest(request) {
     method: request.method,
     path: url.pathname + url.search,
     headers: Object.fromEntries(request.headers),
-    body: body.byteLength > 0 ? Array.from(new Uint8Array(body)) : null
+    body: body.byteLength > 0 ? btoa(String.fromCharCode(...new Uint8Array(body))) : null
   }));
 
   const ciphertext = await crypto.subtle.encrypt(

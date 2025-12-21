@@ -152,7 +152,7 @@ struct DecryptedRequest {
     method: String,
     path: String,
     headers: std::collections::HashMap<String, String>,
-    body: Option<Vec<u8>>,
+    body: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
