@@ -305,7 +305,14 @@ async fn passthrough_request(
         return forward_unencrypted(&app_state, request).await;
     }
 
-    // Otherwise require encryption
+    // Check if client is using E2E encryption
+    let has_e2p_header = request.headers().contains_key("x-e2p-key");
+    if !has_e2p_header {
+        debug!(%path, "no X-E2P-Key header, forwarding unencrypted");
+        return forward_unencrypted(&app_state, request).await;
+    }
+
+    // Handle encrypted request
     let (parts, body) = request.into_parts();
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
