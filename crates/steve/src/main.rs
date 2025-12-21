@@ -232,10 +232,11 @@ async fn handle_encrypted_request(
         }
     }
 
-    // Body is passed as raw bytes - works for JSON, form data, multipart, etc.
-    // The Content-Type header is preserved from request.headers
-    if let Some(ref body_bytes) = request.body {
-        req_builder = req_builder.body(body_bytes.clone());
+    if let Some(ref body_b64) = request.body {
+        let body_bytes = BASE64
+            .decode(body_b64)
+            .map_err(|_| "Invalid base64 in request body")?;
+        req_builder = req_builder.body(body_bytes);
     }
 
     let upstream_response = req_builder
