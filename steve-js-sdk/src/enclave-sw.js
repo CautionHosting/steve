@@ -6,7 +6,8 @@ let CONFIG = {
   keyExchangeEndpoint: '/e2p/v1/create_shared_key',
   passthroughPaths: ['/', '/enclave-sw.js', '/register.js'],
   excludePrefixes: ['/attestation', '/e2p/'],
-  keyRotationInterval: 30 * 60 * 1000
+  keyRotationInterval: 30 * 60 * 1000,
+  emitEncryptedPayloads: false
 };
 
 let state = {
@@ -96,11 +97,31 @@ async function handleEncryptedRequest(request) {
     await ensureInitialized();
     await checkKeyRotation();
 
+    const url = new URL(request.url);
     const encryptedRequest = await encryptRequest(request);
+
+    if (CONFIG.emitEncryptedPayloads) {
+      const encryptedBody = new Uint8Array(await encryptedRequest.clone().arrayBuffer());
+      notifyClients('encrypted-request', {
+        path: url.pathname,
+        size: encryptedBody.length,
+        payload: bytesToHex(encryptedBody.slice(0, 64)) + (encryptedBody.length > 64 ? '...' : '')
+      });
+    }
+
     const response = await fetch(encryptedRequest);
 
     if (!response.ok && response.status >= 500) {
       throw new Error(`Server error: ${response.status}`);
+    }
+
+    if (CONFIG.emitEncryptedPayloads) {
+      const encryptedResponse = new Uint8Array(await response.clone().arrayBuffer());
+      notifyClients('encrypted-response', {
+        status: response.status,
+        size: encryptedResponse.length,
+        payload: bytesToHex(encryptedResponse.slice(0, 64)) + (encryptedResponse.length > 64 ? '...' : '')
+      });
     }
 
     return await decryptResponse(response);
@@ -111,6 +132,10 @@ async function handleEncryptedRequest(request) {
       headers: { 'Content-Type': 'application/json' }
     });
   }
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 async function ensureInitialized() {
