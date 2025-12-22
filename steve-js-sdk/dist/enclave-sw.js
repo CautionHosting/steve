@@ -455,7 +455,7 @@ async function verifyCOSESignature(protectedHeader, payload, signature, signingC
 var CONFIG = {
   attestationEndpoint: "/attestation",
   keyExchangeEndpoint: "/e2p/v1/create_shared_key",
-  passthroughPaths: ["/", "/enclave-sw.js", "/register.js"],
+  passthroughPaths: ["/", "/enclave-sw.js", "/register.js", "/attestation-widget.js"],
   excludePrefixes: ["/attestation", "/e2p/"],
   keyRotationInterval: 30 * 60 * 1e3,
   emitEncryptedPayloads: false

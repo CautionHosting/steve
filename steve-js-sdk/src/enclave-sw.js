@@ -4,7 +4,7 @@ import { encode as encodeCBOR, decode as decodeCBOR } from 'tee-attestation-js/l
 let CONFIG = {
   attestationEndpoint: '/attestation',
   keyExchangeEndpoint: '/e2p/v1/create_shared_key',
-  passthroughPaths: ['/', '/enclave-sw.js', '/register.js'],
+  passthroughPaths: ['/', '/enclave-sw.js', '/register.js', '/attestation-widget.js'],
   excludePrefixes: ['/attestation', '/e2p/'],
   keyRotationInterval: 30 * 60 * 1000,
   emitEncryptedPayloads: false
