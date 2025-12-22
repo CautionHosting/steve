@@ -95,12 +95,3 @@ client.verify_attestation().await?;
 let response = client.post("/api/secret", payload).await?;
 ```
 
-### Enclave
-
-STEVE runs natively inside of [EnclaveOS](https://git.distrust.co/public/enclaveos), listening on port 8080, forwarding to your app:
-
-```
-STEVE_LISTEN_ADDR=0.0.0.0:8080
-APP_UPSTREAM=http://127.0.0.1:8083
-```
-
