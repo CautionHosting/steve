@@ -290,7 +290,7 @@ async fn handle_encrypted_request(
 }
 
 /// Paths that should be passed through without encryption (bootstrap files)
-const PASSTHROUGH_PATHS: &[&str] = &["/", "/enclave-sw.js", "/register.js"];
+const PASSTHROUGH_PATHS: &[&str] = &["/", "/enclave-sw.js", "/register.js", "/attestation-widget.js"];
 
 async fn passthrough_request(
     State(app_state): State<Arc<AppState>>,
