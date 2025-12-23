@@ -4,6 +4,8 @@
 
 End-to-end encryption for applications communicating with TEE enclaves. Traffic is encrypted on the client and only decrypted inside the enclave - the host cannot read it, because it is only able to terminate TLS, it does not have access to the E2E decryption key which is inside of the enclave.
 
+**Note:** Without signing enforcement on the service worker, the server could send a malicious service worker to the client at any time, providing a false attestation. Cryptographic signatures for service worker integrity ensure that the service worker cannot be maliciously updated. Upadates to address this are coming soon.
+
 ## Architecture
 
 ```mermaid
