@@ -569,6 +569,9 @@ async function handleEncryptedRequest(request) {
 function bytesToHex2(bytes) {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+function bytesToBase64(bytes) {
+  return btoa(String.fromCharCode(...bytes));
+}
 async function ensureInitialized() {
   if (state.initialized) {
     return;
@@ -587,10 +590,11 @@ async function initializeSecureChannel() {
   try {
     notifyClients("status", { stage: "requesting-attestation" });
     const nonce = crypto.getRandomValues(new Uint8Array(32));
+    const encodedNonce = bytesToBase64(nonce);
     const response = await fetch(CONFIG.attestationEndpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ nonce: Array.from(nonce) })
+      body: JSON.stringify({ nonce: encodedNonce })
     });
     if (!response.ok) {
       throw new Error(`Attestation request failed: ${response.status}`);
@@ -599,7 +603,7 @@ async function initializeSecureChannel() {
     if (jsonResponse.error) {
       throw new Error(jsonResponse.error);
     }
-    const attestationB64 = jsonResponse.attestation_document;
+    const attestationB64 = jsonResponse.document;
     if (!attestationB64) {
       throw new Error("No attestation document in response");
     }
