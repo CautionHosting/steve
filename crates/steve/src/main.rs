@@ -387,7 +387,7 @@ async fn run_proxy(app_state: AppState) -> Result<()> {
         .fallback(passthrough_request)
         .with_state(state);
 
-    let listen_addr = std::env::var("STEVE_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let listen_addr = std::env::var("STEVE_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:49500".into());
     debug!(%listen_addr, "binding listener");
     let listener = TcpListener::bind(&listen_addr).await?;
 
