@@ -9,10 +9,11 @@ use aes_gcm::{
 use axum::{
     body::Body,
     extract::State,
-    http::{HeaderMap, Method, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing, Json, Router,
 };
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{SigningKey, Signer};
 use hkdf::Hkdf;
@@ -386,6 +387,38 @@ async fn run_proxy(app_state: AppState) -> Result<()> {
         .route("/e2p/v1/create_shared_key", routing::post(create_shared_key))
         .fallback(passthrough_request)
         .with_state(state);
+
+    // Optional CORS via STEVE_CORS_ORIGINS env var.
+    // Set to "*" to allow any origin, or a comma-separated list of origins
+    // (e.g. "https://tester.example.com,http://localhost:5173").
+    let app = if let Some(origins) = std::env::var("STEVE_CORS_ORIGINS").ok() {
+        let allow_origin = if origins.trim() == "*" {
+            AllowOrigin::any()
+        } else {
+            let values: Vec<HeaderValue> = origins
+                .split(',')
+                .map(|o| {
+                    o.trim()
+                        .parse::<HeaderValue>()
+                        .map_err(|_| format!("invalid CORS origin: {}", o.trim()).into())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if values.is_empty() {
+                return Err("STEVE_CORS_ORIGINS is set but contains no valid origins".into());
+            }
+            AllowOrigin::list(values)
+        };
+        let cors = CorsLayer::new()
+            .allow_origin(allow_origin)
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers([
+                header::CONTENT_TYPE,
+                HeaderName::from_static("x-e2p-key"),
+            ]);
+        app.layer(cors)
+    } else {
+        app
+    };
 
     let listen_addr = std::env::var("STEVE_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:49500".into());
     debug!(%listen_addr, "binding listener");
