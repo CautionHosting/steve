@@ -391,7 +391,7 @@ async fn run_proxy(app_state: AppState) -> Result<()> {
     // Optional CORS via STEVE_CORS_ORIGINS env var.
     // Set to "*" to allow any origin, or a comma-separated list of origins
     // (e.g. "https://tester.example.com,http://localhost:5173").
-    let app = if let Some(origins) = std::env::var("STEVE_CORS_ORIGINS").ok() {
+    let app = if let Ok(origins) = std::env::var("STEVE_CORS_ORIGINS") {
         let allow_origin = if origins.trim() == "*" {
             AllowOrigin::any()
         } else {
