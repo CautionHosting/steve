@@ -3,18 +3,19 @@
 use std::sync::Arc;
 
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit},
     Aes256Gcm, Key, Nonce,
+    aead::{Aead, AeadCore, KeyInit},
 };
 use axum::{
+    Json, Router,
     body::Body,
     extract::State,
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing, Json, Router,
+    routing,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use ed25519_dalek::{SigningKey, Signer};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use ed25519_dalek::{Signer, SigningKey};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use reqwest::Client;
@@ -27,7 +28,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 
 type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
-const APP_UPSTREAM: &str = "http://127.0.0.1:8083";
+const DEFAULT_APP_UPSTREAM: &str = "http://127.0.0.1:8083";
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct MetadataOutput {
@@ -53,6 +54,7 @@ impl std::fmt::Debug for AppState {
         f.debug_struct("AppState")
             .field("persistent_decryption_key", &"<secret_key>")
             .field("signing_key", &"<secret_key>")
+            .field("upstream_url", &self.upstream_url.as_str())
             .finish()
     }
 }
@@ -72,11 +74,16 @@ async fn main() -> Result<()> {
     // TODO: Use Keyfork reconstitution to get the E2 decryption key
     // We don't have access to that now, so instead generate an ephemeral one.
     //
+    let upstream_url = std::env::var("STEVE_APP_UPSTREAM").unwrap_or_else(|e| {
+        debug!("could not use STEVE_APP_UPSTREAM: {e}");
+        DEFAULT_APP_UPSTREAM.into()
+    });
+
     let app_state = AppState {
         persistent_decryption_key: Aes256Gcm::generate_key(OsRng),
         signing_key,
         http_client: Client::new(),
-        upstream_url: url::Url::parse(APP_UPSTREAM)?,
+        upstream_url: url::Url::parse(&upstream_url)?,
     };
 
     let metadata_path = std::env::var("E2P_METADATA_FILE").unwrap_or_else(|e| {
@@ -108,13 +115,13 @@ async fn create_shared_key(
     State(app_state): State<Arc<AppState>>,
     Json(data): Json<CreateSharedKeyRequest>,
 ) -> Json<serde_json::Value> {
-    debug!(?data, "performing ECDH against their key"); 
+    debug!(?data, "performing ECDH against their key");
     let their_pubkey = PublicKey::from(data.public_key_bytes);
     let our_privkey = EphemeralSecret::random_from_rng(OsRng);
     let our_pubkey = PublicKey::from(&our_privkey);
     let shared_secret = our_privkey.diffie_hellman(&their_pubkey);
 
-    debug!("performing ECDH against the shared secret"); 
+    debug!("performing ECDH against the shared secret");
 
     let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
     let mut shared_key_bytes = [0u8; 256 / 8];
@@ -164,13 +171,13 @@ struct EncryptedResponse {
     body: Option<Vec<u8>>,
 }
 
-
 #[tracing::instrument(skip(app_state, encrypted_body))]
 async fn handle_encrypted_request(
     app_state: &AppState,
     headers: &HeaderMap,
     encrypted_body: &[u8],
-) -> Result<Response, String> { // TODO fixup using String as Err
+) -> Result<Response, String> {
+    // TODO fixup using String as Err
     // Get and decode the encrypted shared key from header
     let e2p_key_header = headers
         .get("x-e2p-key")
@@ -214,12 +221,11 @@ async fn handle_encrypted_request(
     debug!(method = %request.method, path = %request.path, "forwarding decrypted request");
 
     // Build and send request to upstream app
-    let method: Method = request
-        .method
-        .parse()
-        .map_err(|_| "Invalid HTTP method")?;
+    let method: Method = request.method.parse().map_err(|_| "Invalid HTTP method")?;
 
-    let url = app_state.upstream_url.join(&request.path)
+    let url = app_state
+        .upstream_url
+        .join(&request.path)
         .map_err(|e| format!("Invalid path: {e}"))?;
 
     let mut req_builder = app_state.http_client.request(method, url);
@@ -290,7 +296,12 @@ async fn handle_encrypted_request(
 }
 
 /// Paths that should be passed through without encryption (bootstrap files)
-const PASSTHROUGH_PATHS: &[&str] = &["/", "/enclave-sw.js", "/register.js", "/attestation-widget.js"];
+const PASSTHROUGH_PATHS: &[&str] = &[
+    "/",
+    "/enclave-sw.js",
+    "/register.js",
+    "/attestation-widget.js",
+];
 
 async fn passthrough_request(
     State(app_state): State<Arc<AppState>>,
@@ -334,10 +345,18 @@ async fn passthrough_request(
 
 async fn forward_unencrypted(app_state: &AppState, request: axum::extract::Request) -> Response {
     let method = request.method().clone();
-    let path = request.uri().path_and_query()
+    let path = request
+        .uri()
+        .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or(request.uri().path());
-    let url = format!("{}{}", APP_UPSTREAM, path);
+    let url = match app_state.upstream_url.join(path) {
+        Ok(url) => url,
+        Err(e) => {
+            error!("invalid upstream path: {e}");
+            return (StatusCode::BAD_REQUEST, "Invalid request path").into_response();
+        }
+    };
 
     let body_bytes = match axum::body::to_bytes(request.into_body(), 1024 * 1024).await {
         Ok(b) => b,
@@ -347,8 +366,9 @@ async fn forward_unencrypted(app_state: &AppState, request: axum::extract::Reque
         }
     };
 
-    let upstream_response = match app_state.http_client
-        .request(method, &url)
+    let upstream_response = match app_state
+        .http_client
+        .request(method, url)
         .body(body_bytes.to_vec())
         .send()
         .await
@@ -375,7 +395,11 @@ async fn forward_unencrypted(app_state: &AppState, request: axum::extract::Reque
         response = response.header(key, value);
     }
     response.body(Body::from(body)).unwrap_or_else(|_| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build response").into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to build response",
+        )
+            .into_response()
     })
 }
 
@@ -383,7 +407,10 @@ async fn run_proxy(app_state: AppState) -> Result<()> {
     let state = Arc::new(app_state);
 
     let app = Router::new()
-        .route("/e2p/v1/create_shared_key", routing::post(create_shared_key))
+        .route(
+            "/e2p/v1/create_shared_key",
+            routing::post(create_shared_key),
+        )
         .fallback(passthrough_request)
         .with_state(state);
 
