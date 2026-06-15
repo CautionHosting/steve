@@ -397,10 +397,11 @@ async fn run_proxy(app_state: AppState) -> Result<()> {
         } else {
             let values: Vec<HeaderValue> = origins
                 .split(',')
+                .map(str::trim)
+                .filter(|o| !o.is_empty())
                 .map(|o| {
-                    o.trim()
-                        .parse::<HeaderValue>()
-                        .map_err(|_| format!("invalid CORS origin: {}", o.trim()).into())
+                    o.parse::<HeaderValue>()
+                        .map_err(|_| format!("invalid CORS origin: {o}").into())
                 })
                 .collect::<Result<Vec<_>>>()?;
             if values.is_empty() {
@@ -414,6 +415,7 @@ async fn run_proxy(app_state: AppState) -> Result<()> {
             .allow_headers([
                 header::CONTENT_TYPE,
                 HeaderName::from_static("x-e2p-key"),
+                HeaderName::from_static("x-e2p-original-method"),
             ]);
         app.layer(cors)
     } else {
