@@ -28,7 +28,9 @@ registerEnclaveServiceWorker({
 })
 ```
 
-The three v2 protocol endpoints are fixed and cannot be reconfigured. Passthrough rules only control service-worker interception; STEVE still permits plaintext fallback until separate fail-closed routing work lands.
+The three v2 protocol endpoints are fixed and cannot be reconfigured; the
+`/e2p/` prefix is always kept in `excludePrefixes` even if the option is
+overridden, so the worker can never intercept its own protocol traffic. Passthrough rules only control service-worker interception; STEVE still permits plaintext fallback until separate fail-closed routing work lands.
 
 ## Build
 

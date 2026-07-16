@@ -67,6 +67,11 @@ For requests intercepted by the active v2 worker, the host terminates TLS but on
 | `steve-sdk` | Client (Rust) | Rust SDK for native applications |
 | `steve-js-sdk` | Client (Browser) | Service worker for web applications |
 
+At startup `steve` writes enclave metadata to `E2P_METADATA_FILE` (default
+`/metadata.json`), which bootproofd embeds as attestation `user_data`. In v2
+this carries `{"e2p_protocol_version": 2}` — the v1 persistent `verifying_key`
+is intentionally gone, since attestation is now bound per session.
+
 ## Security Properties
 
 - **E2E Encryption**: Data encrypted client ↔ enclave (AES-256-GCM)
