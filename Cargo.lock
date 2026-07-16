@@ -164,6 +164,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bootproof"
+version = "0.1.0"
+source = "git+https://git.distrust.co/public/bootproof#78f531a2c245404a9d8879fb71cc397096ae0077"
+dependencies = [
+ "aws-nitro-enclaves-nsm-api",
+ "serde_bytes",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1591,9 +1602,9 @@ name = "steve"
 version = "0.2.0"
 dependencies = [
  "aes-gcm",
- "aws-nitro-enclaves-nsm-api",
  "axum",
  "base64",
+ "bootproof",
  "ciborium",
  "hkdf",
  "rand 0.8.5",

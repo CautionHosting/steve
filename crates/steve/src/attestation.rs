@@ -1,15 +1,9 @@
-use aws_nitro_enclaves_nsm_api::{
-    api::{Request, Response},
-    driver::{nsm_exit, nsm_init, nsm_process_request},
-};
-use serde_bytes::ByteBuf;
+use bootproof::format::{Format, nitro::Nitro};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AttestationError {
-    #[error("Nitro Security Module is unavailable")]
-    Unavailable,
-    #[error("Nitro attestation failed")]
-    Failed,
+    #[error("Nitro attestation failed: {0}")]
+    Failed(#[from] bootproof::format::BoxError),
 }
 
 pub trait AttestationProvider: Send + Sync {
@@ -21,25 +15,8 @@ pub struct NitroAttestationProvider;
 
 impl AttestationProvider for NitroAttestationProvider {
     fn attest(&self, nonce: &[u8], user_data: &[u8]) -> Result<Vec<u8>, AttestationError> {
-        let fd = nsm_init();
-        if fd < 0 {
-            return Err(AttestationError::Unavailable);
-        }
-
-        let response = nsm_process_request(
-            fd,
-            Request::Attestation {
-                user_data: Some(ByteBuf::from(user_data.to_vec())),
-                nonce: Some(ByteBuf::from(nonce.to_vec())),
-                public_key: None,
-            },
-        );
-        nsm_exit(fd);
-
-        match response {
-            Response::Attestation { document } => Ok(document),
-            _ => Err(AttestationError::Failed),
-        }
+        Nitro.generate(Some(user_data), Some(nonce))
+            .map_err(AttestationError::Failed)
     }
 }
 
