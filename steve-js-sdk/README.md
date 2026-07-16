@@ -15,19 +15,20 @@ const client = await registerEnclaveServiceWorker()
 await client.initialize()
 ```
 
-All requests are now encrypted except `/attestation` and `/e2p/`.
+The worker establishes an attestation-bound v2 session and encrypts intercepted application requests through `/e2p/v2/request`.
 
 ## Configuration
 
 ```javascript
 registerEnclaveServiceWorker({
   config: {
-    attestationEndpoint: '/attestation',
-    keyExchangeEndpoint: '/e2p/v1/create_shared_key',
-    excludePaths: ['/attestation', '/e2p/', '/public/']
+    passthroughPaths: ['/', '/enclave-sw.js', '/register.js', '/attestation-widget.js'],
+    excludePrefixes: ['/attestation', '/e2p/']
   }
 })
 ```
+
+The three v2 protocol endpoints are fixed and cannot be reconfigured. Passthrough rules only control service-worker interception; STEVE still permits plaintext fallback until separate fail-closed routing work lands.
 
 ## Build
 

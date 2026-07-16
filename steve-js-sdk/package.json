@@ -1,6 +1,6 @@
 {
   "name": "transport-security-service-worker",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "End-to-end encryption for web apps running in TEE enclaves",
   "type": "module",
   "main": "dist/register.js",
@@ -16,7 +16,8 @@
   ],
   "scripts": {
     "build": "node build.js",
-    "watch": "node build.js --watch"
+    "watch": "node build.js --watch",
+    "test": "node --test test/*.test.js"
   },
   "keywords": ["tee", "enclave", "encryption", "service-worker", "attestation", "verifiable", "confidential compute"],
   "license": "MIT",
@@ -25,7 +26,7 @@
     "url": "https://codeberg.org/caution/transport-security-service-worker.git"
   },
   "dependencies": {
-    "tee-attestation-js": "git+https://git.distrust.co/public/tee-attestation-js.git"
+    "tee-attestation-js": "git+https://git.distrust.co/public/tee-attestation-js.git#bca7b2ab0b819f66148dd58cd397958554dd1ad4"
   },
   "devDependencies": {
     "esbuild": "^0.24.0"
