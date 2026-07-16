@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use sessions::{CLEANUP_INTERVAL, PENDING_TTL, Session, SessionError, SessionStore};
 use tokio::task;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 use zeroize::Zeroizing;
 
@@ -40,6 +40,34 @@ pub struct ServerConfig {
     pub listen_addr: String,
     pub upstream_url: url::Url,
     pub cors_origins: Option<String>,
+}
+
+/// Enclave metadata surfaced by bootproofd as attestation `user_data`.
+///
+/// E2P v2 binds attestation to sessions directly, so there is no persistent
+/// `verifying_key` anymore; the protocol version tells consumers the v1 key
+/// channel is intentionally gone.
+#[derive(Debug, Serialize)]
+struct MetadataOutput {
+    e2p_protocol_version: u32,
+}
+
+/// Write enclave metadata to `E2P_METADATA_FILE` (default `/metadata.json`)
+/// for bootproofd to embed as attestation `user_data`.
+pub fn write_metadata() -> Result<(), BoxError> {
+    let metadata_path =
+        std::env::var("E2P_METADATA_FILE").unwrap_or_else(|_| String::from("/metadata.json"));
+    write_metadata_to(&metadata_path)
+}
+
+fn write_metadata_to(metadata_path: &str) -> Result<(), BoxError> {
+    let metadata = MetadataOutput {
+        e2p_protocol_version: 2,
+    };
+    debug!(?metadata, %metadata_path, "writing enclave metadata");
+    let metadata_file = std::fs::File::create_new(metadata_path)?;
+    serde_json::to_writer(metadata_file, &metadata)?;
+    Ok(())
 }
 
 impl ServerConfig {
@@ -783,6 +811,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn metadata_reports_protocol_version_without_verifying_key() {
+        let path = std::env::temp_dir().join(format!(
+            "steve-metadata-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = path.to_str().unwrap();
+        write_metadata_to(path_str).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["e2p_protocol_version"], 2);
+        assert!(value.get("verifying_key").is_none());
+        // create_new must refuse to clobber an existing file
+        assert!(write_metadata_to(path_str).is_err());
+        std::fs::remove_file(&path).unwrap();
     }
 
     async fn send_cbor<T: Serialize>(app: &Router, path: &str, value: &T) -> Response {
