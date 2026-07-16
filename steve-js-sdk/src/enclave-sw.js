@@ -23,6 +23,7 @@ import {
 
 const DEFAULT_BOOTSTRAP_PATHS = ['/', '/enclave-sw.js', '/register.js', '/attestation-widget.js'];
 const ROTATION_INTERVAL_MS = 25 * 60 * 1000;
+const PROTOCOL_EXCLUDE_PREFIXES = ['/e2p/'];
 
 let config = {
   passthroughPaths: DEFAULT_BOOTSTRAP_PATHS,
@@ -133,8 +134,14 @@ async function handleProtectedRequest(request) {
         : null;
     return new Response(body, { status: decoded.status, headers: decoded.headers || {} });
   } catch (error) {
-    if (!session || state.session === session) resetState(publicError(error));
-    notifyClients('error', { message: publicError(error), url: request.url });
+    if (session ? state.session === session : !hasValidSession(state.session)) {
+      resetState(publicError(error));
+    }
+    notifyClients('error', {
+      message: publicError(error),
+      url: request.url,
+      stage: session ? 'request' : 'initialization'
+    });
     return new Response(JSON.stringify({ error: 'secure channel failed' }), {
       status: 502,
       headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
@@ -150,20 +157,27 @@ async function currentSession() {
   return session;
 }
 
+// Indirection so tests can substitute a controllable stub without mocking
+// crypto/fetch; production code always leaves this pointed at establishSession.
+let establishSessionFn = establishSession;
+
 async function ensureSession() {
   if (state.session) return state.session;
   if (!state.sessionPromise) {
-    state.sessionPromise = establishSession()
+    const s = state;
+    s.sessionPromise = establishSessionFn()
       .then(session => {
-        state.session = session;
-        state.error = null;
+        if (state === s) {
+          state.session = session;
+          state.error = null;
+        }
         return session;
       })
       .catch(error => {
-        state.error = publicError(error);
+        if (state === s) state.error = publicError(error);
         throw error;
       })
-      .finally(() => { state.sessionPromise = null; });
+      .finally(() => { if (state === s) state.sessionPromise = null; });
   }
   return state.sessionPromise;
 }
@@ -171,15 +185,18 @@ async function ensureSession() {
 async function rotateSession() {
   if (state.rotationPromise) return state.rotationPromise;
   notifyClients('status', { stage: 'rotating-session' });
-  state.rotationPromise = establishSession()
+  const s = state;
+  s.rotationPromise = establishSessionFn()
     .then(session => {
-      state.session = session;
-      state.error = null;
-      notifyClients('key-rotated', { timestamp: session.createdAt });
+      if (state === s) {
+        state.session = session;
+        state.error = null;
+        notifyClients('key-rotated', { timestamp: session.createdAt });
+      }
       return session;
     })
-    .finally(() => { state.rotationPromise = null; });
-  return state.rotationPromise;
+    .finally(() => { if (state === s) state.rotationPromise = null; });
+  return s.rotationPromise;
 }
 
 async function establishSession() {
@@ -308,6 +325,9 @@ function configure(update) {
   if (update.passthroughPaths) validatePathList(update.passthroughPaths);
   if (update.excludePrefixes) validatePathList(update.excludePrefixes);
   config = { ...config, ...update };
+  config.excludePrefixes = [
+    ...new Set([...PROTOCOL_EXCLUDE_PREFIXES, ...config.excludePrefixes])
+  ];
 }
 
 function validatePathList(values) {
@@ -331,6 +351,10 @@ function statusMessage() {
   };
 }
 
+function hasValidSession(session) {
+  return Boolean(session) && Date.now() - session.createdAt < ROTATION_INTERVAL_MS;
+}
+
 function freshState(error = null) {
   return { session: null, sessionPromise: null, rotationPromise: null, error };
 }
@@ -347,3 +371,23 @@ async function notifyClients(type, data) {
   const allClients = await self.clients.matchAll({ type: 'window' });
   for (const client of allClients) client.postMessage({ type: `enclave:${type}`, ...data });
 }
+
+// Test-only surface, attached as a plain global rather than an ESM export.
+// This file is bundled by esbuild and shipped as dist/enclave-sw.js, which is
+// registered as a *classic* (non-module) service worker script (see
+// register.js: navigator.serviceWorker.register() with no `type: 'module'`).
+// A top-level `export` statement would survive bundling and throw a
+// SyntaxError when that classic script is parsed by the browser, so tests
+// reach internals via `self.__ENCLAVE_SW_TEST__` instead. Do not use outside
+// tests.
+self.__ENCLAVE_SW_TEST__ = {
+  configure,
+  hasValidSession,
+  resetState,
+  ensureSession,
+  rotateSession,
+  getState: () => state,
+  getConfig: () => config,
+  setEstablishSession: fn => { establishSessionFn = fn; },
+  resetEstablishSession: () => { establishSessionFn = establishSession; }
+};

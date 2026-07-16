@@ -31,6 +31,7 @@ use zeroize::Zeroizing;
 const DEFAULT_APP_UPSTREAM: &str = "http://127.0.0.1:8083";
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:49500";
 const MAX_ENVELOPE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_UNENCRYPTED_BODY_BYTES: usize = 1024 * 1024;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -147,7 +148,7 @@ fn build_router_with_components(
         Ok(app.layer(
             CorsLayer::new()
                 .allow_origin(allow_origin)
-                .allow_methods([Method::POST, Method::OPTIONS])
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
                 .allow_headers([header::CONTENT_TYPE]),
         ))
     } else {
@@ -373,7 +374,7 @@ async fn forward_unencrypted(state: &AppState, request: Request) -> Response {
     };
 
     let headers = request.headers().clone();
-    let body = match axum::body::to_bytes(request.into_body(), MAX_ENVELOPE_BYTES).await {
+    let body = match axum::body::to_bytes(request.into_body(), MAX_UNENCRYPTED_BODY_BYTES).await {
         Ok(body) => body,
         Err(_) => return ApiError::Malformed.into_response(),
     };
@@ -725,6 +726,63 @@ mod tests {
         let replay = send_cbor(&app, "/e2p/v2/request", &application_envelope).await;
         assert_eq!(replay.status(), StatusCode::CONFLICT);
         assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    fn test_router(cors_origins: Option<String>) -> Router {
+        build_router_with_components(
+            ServerConfig {
+                listen_addr: "127.0.0.1:0".to_string(),
+                upstream_url: url::Url::parse("http://127.0.0.1:8083").unwrap(),
+                cors_origins,
+            },
+            Arc::new(FakeAttestationProvider::default()),
+            Arc::new(CountingUpstream {
+                executions: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_allows_get() {
+        let app = test_router(Some("https://app.example".to_string()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/data")
+                    .header(header::ORIGIN, "https://app.example")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let allow_methods = response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+            .expect("preflight should include allow-methods")
+            .to_str()
+            .unwrap();
+        assert!(allow_methods.contains("GET"), "got {allow_methods}");
+        assert!(allow_methods.contains("POST"), "got {allow_methods}");
+    }
+
+    #[tokio::test]
+    async fn passthrough_rejects_oversized_body() {
+        let app = test_router(None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/upload")
+                    .body(Body::from(vec![0u8; MAX_UNENCRYPTED_BODY_BYTES + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     async fn send_cbor<T: Serialize>(app: &Router, path: &str, value: &T) -> Response {

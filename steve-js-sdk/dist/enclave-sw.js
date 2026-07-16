@@ -665,6 +665,7 @@ function requireLength(name, value, length) {
 // src/enclave-sw.js
 var DEFAULT_BOOTSTRAP_PATHS = ["/", "/enclave-sw.js", "/register.js", "/attestation-widget.js"];
 var ROTATION_INTERVAL_MS = 25 * 60 * 1e3;
+var PROTOCOL_EXCLUDE_PREFIXES = ["/e2p/"];
 var config = {
   passthroughPaths: DEFAULT_BOOTSTRAP_PATHS,
   excludePrefixes: ["/attestation", "/e2p/"],
@@ -761,8 +762,14 @@ async function handleProtectedRequest(request) {
     const body = decoded.body instanceof Uint8Array ? decoded.body : decoded.error ? new TextEncoder().encode(JSON.stringify({ error: decoded.error })) : null;
     return new Response(body, { status: decoded.status, headers: decoded.headers || {} });
   } catch (error) {
-    if (!session || state.session === session) resetState(publicError(error));
-    notifyClients("error", { message: publicError(error), url: request.url });
+    if (session ? state.session === session : !hasValidSession(state.session)) {
+      resetState(publicError(error));
+    }
+    notifyClients("error", {
+      message: publicError(error),
+      url: request.url,
+      stage: session ? "request" : "initialization"
+    });
     return new Response(JSON.stringify({ error: "secure channel failed" }), {
       status: 502,
       headers: { "Content-Type": "application/json", "Cache-Control": "no-store" }
@@ -776,18 +783,22 @@ async function currentSession() {
   }
   return session;
 }
+var establishSessionFn = establishSession;
 async function ensureSession() {
   if (state.session) return state.session;
   if (!state.sessionPromise) {
-    state.sessionPromise = establishSession().then((session) => {
-      state.session = session;
-      state.error = null;
+    const s = state;
+    s.sessionPromise = establishSessionFn().then((session) => {
+      if (state === s) {
+        state.session = session;
+        state.error = null;
+      }
       return session;
     }).catch((error) => {
-      state.error = publicError(error);
+      if (state === s) state.error = publicError(error);
       throw error;
     }).finally(() => {
-      state.sessionPromise = null;
+      if (state === s) state.sessionPromise = null;
     });
   }
   return state.sessionPromise;
@@ -795,15 +806,18 @@ async function ensureSession() {
 async function rotateSession() {
   if (state.rotationPromise) return state.rotationPromise;
   notifyClients("status", { stage: "rotating-session" });
-  state.rotationPromise = establishSession().then((session) => {
-    state.session = session;
-    state.error = null;
-    notifyClients("key-rotated", { timestamp: session.createdAt });
+  const s = state;
+  s.rotationPromise = establishSessionFn().then((session) => {
+    if (state === s) {
+      state.session = session;
+      state.error = null;
+      notifyClients("key-rotated", { timestamp: session.createdAt });
+    }
     return session;
   }).finally(() => {
-    state.rotationPromise = null;
+    if (state === s) state.rotationPromise = null;
   });
-  return state.rotationPromise;
+  return s.rotationPromise;
 }
 async function establishSession() {
   notifyClients("status", { stage: "creating-session" });
@@ -922,6 +936,9 @@ function configure(update) {
   if (update.passthroughPaths) validatePathList(update.passthroughPaths);
   if (update.excludePrefixes) validatePathList(update.excludePrefixes);
   config = { ...config, ...update };
+  config.excludePrefixes = [
+    .../* @__PURE__ */ new Set([...PROTOCOL_EXCLUDE_PREFIXES, ...config.excludePrefixes])
+  ];
 }
 function validatePathList(values) {
   if (!Array.isArray(values)) throw new Error("passthrough rules must be arrays");
@@ -941,6 +958,9 @@ function statusMessage() {
     protocolVersion: 2
   };
 }
+function hasValidSession(session) {
+  return Boolean(session) && Date.now() - session.createdAt < ROTATION_INTERVAL_MS;
+}
 function freshState(error = null) {
   return { session: null, sessionPromise: null, rotationPromise: null, error };
 }
@@ -954,3 +974,18 @@ async function notifyClients(type, data) {
   const allClients = await self.clients.matchAll({ type: "window" });
   for (const client of allClients) client.postMessage({ type: `enclave:${type}`, ...data });
 }
+self.__ENCLAVE_SW_TEST__ = {
+  configure,
+  hasValidSession,
+  resetState,
+  ensureSession,
+  rotateSession,
+  getState: () => state,
+  getConfig: () => config,
+  setEstablishSession: (fn) => {
+    establishSessionFn = fn;
+  },
+  resetEstablishSession: () => {
+    establishSessionFn = establishSession;
+  }
+};
