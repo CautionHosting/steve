@@ -22,7 +22,7 @@ use rand::{RngCore, rngs::OsRng};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sessions::{CLEANUP_INTERVAL, PENDING_TTL, Session, SessionError, SessionStore};
-use tokio::task;
+use tokio::{sync::Semaphore, task};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, error, warn};
 use x25519_dalek::{EphemeralSecret, PublicKey};
@@ -32,6 +32,7 @@ const DEFAULT_APP_UPSTREAM: &str = "http://127.0.0.1:8083";
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:49500";
 const MAX_ENVELOPE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_UNENCRYPTED_BODY_BYTES: usize = 1024 * 1024;
+const MAX_CONCURRENT_ATTESTATIONS: usize = 8;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -85,6 +86,7 @@ impl ServerConfig {
 
 struct AppState {
     attestation: Arc<dyn AttestationProvider>,
+    attestation_slots: Arc<Semaphore>,
     sessions: Arc<SessionStore>,
     http_client: Client,
     upstream_url: url::Url,
@@ -132,7 +134,20 @@ fn build_router_with_components(
     attestation: Arc<dyn AttestationProvider>,
     protected_upstream: Arc<dyn ProtectedUpstream>,
 ) -> Result<Router, BoxError> {
-    let sessions = Arc::new(SessionStore::default());
+    build_router_with_components_and_store(
+        config,
+        attestation,
+        protected_upstream,
+        Arc::new(SessionStore::default()),
+    )
+}
+
+fn build_router_with_components_and_store(
+    config: ServerConfig,
+    attestation: Arc<dyn AttestationProvider>,
+    protected_upstream: Arc<dyn ProtectedUpstream>,
+    sessions: Arc<SessionStore>,
+) -> Result<Router, BoxError> {
     let cleanup_sessions = Arc::clone(&sessions);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
@@ -144,6 +159,7 @@ fn build_router_with_components(
 
     let state = Arc::new(AppState {
         attestation,
+        attestation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ATTESTATIONS)),
         sessions,
         http_client: enclave_http_client()?,
         upstream_url: config.upstream_url,
@@ -231,16 +247,25 @@ async fn create_session(
     ))
     .map_err(|_| ApiError::Internal)?;
 
+    let reservation = state.sessions.reserve().map_err(ApiError::from)?;
+    let attestation_slot = Arc::clone(&state.attestation_slots)
+        .try_acquire_owned()
+        .map_err(|_| ApiError::Capacity)?;
     let provider = Arc::clone(&state.attestation);
-    let attestation_document =
-        task::spawn_blocking(move || provider.attest(&client_nonce, &user_data))
-            .await
-            .map_err(|_| ApiError::Attestation)?
-            .map_err(|_| ApiError::Attestation)?;
+    let attestation_document = task::spawn_blocking(move || {
+        let _attestation_slot = attestation_slot;
+        provider.attest(&client_nonce, &user_data)
+    })
+    .await
+    .map_err(|_| ApiError::Attestation)?
+    .map_err(|_| ApiError::Attestation)?;
 
     state
         .sessions
-        .insert(Session::new(session_id, transcript_hash, secrets))
+        .insert(
+            Session::new(session_id, transcript_hash, secrets),
+            reservation,
+        )
         .map_err(ApiError::from)?;
 
     cbor_response(&SessionResponse {
@@ -514,6 +539,7 @@ impl From<SessionError> for ApiError {
             SessionError::Unconfirmed => Self::Unconfirmed,
             SessionError::AlreadyConfirmed | SessionError::Replay => Self::Replay,
             SessionError::Capacity => Self::Capacity,
+            SessionError::Collision => Self::Internal,
             SessionError::Authentication | SessionError::ConfirmationMismatch => Self::Malformed,
         }
     }
@@ -754,6 +780,42 @@ mod tests {
         let replay = send_cbor(&app, "/e2p/v2/request", &application_envelope).await;
         assert_eq!(replay.status(), StatusCode::CONFLICT);
         assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn full_session_store_rejects_before_attestation() {
+        let fake = Arc::new(FakeAttestationProvider::default());
+        let provider: Arc<dyn AttestationProvider> = fake.clone();
+        let app = build_router_with_components_and_store(
+            ServerConfig {
+                listen_addr: "127.0.0.1:0".to_string(),
+                upstream_url: url::Url::parse("http://127.0.0.1:8083").unwrap(),
+                cors_origins: None,
+            },
+            provider,
+            Arc::new(CountingUpstream {
+                executions: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(SessionStore::new(0)),
+        )
+        .unwrap();
+        let client_secret = EphemeralSecret::random_from_rng(OsRng);
+        let client_public = PublicKey::from(&client_secret).to_bytes();
+
+        let response = send_cbor(
+            &app,
+            "/e2p/v2/session",
+            &SessionRequest {
+                version: VERSION,
+                client_nonce: vec![7; NONCE_LEN],
+                client_public_key: client_public.to_vec(),
+                context_hash: vec![8; CONTEXT_HASH_LEN],
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(fake.last_call().is_none());
     }
 
     fn test_router(cors_origins: Option<String>) -> Router {

@@ -80,7 +80,7 @@ async function handleProtectedRequest(request) {
   let session;
   try {
     session = await currentSession();
-    const sequence = session.sequences.allocate();
+    const sequence = await session.sequences.allocate();
     const url = new URL(request.url);
     const requestBody = new Uint8Array(await request.arrayBuffer());
     const plaintext = encodeCBOR({
@@ -134,6 +134,7 @@ async function handleProtectedRequest(request) {
         : null;
     return new Response(body, { status: decoded.status, headers: decoded.headers || {} });
   } catch (error) {
+    if (session) session.sequences.close(new Error(publicError(error)));
     if (session ? state.session === session : !hasValidSession(state.session)) {
       resetState(publicError(error));
     }
@@ -360,6 +361,7 @@ function freshState(error = null) {
 }
 
 function resetState(error = null) {
+  state.session?.sequences?.close(new Error(error || 'secure channel reset'));
   state = freshState(error);
 }
 

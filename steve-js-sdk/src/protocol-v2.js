@@ -8,6 +8,7 @@ export const REQUEST_ENDPOINT = '/e2p/v2/request';
 
 const encoder = new TextEncoder();
 const MAGIC = encoder.encode('STEVE-E2P-V2\0');
+const REPLAY_WINDOW_SIZE = 64n;
 const LABELS = {
   c2sKey: encoder.encode('steve-e2p-v2/c2s-key'),
   s2cKey: encoder.encode('steve-e2p-v2/s2c-key'),
@@ -23,21 +24,47 @@ export class SequenceTracker {
   constructor() {
     this.next = 1n;
     this.pending = new Set();
+    this.waiters = [];
+    this.closedError = null;
   }
 
-  allocate() {
+  async allocate() {
+    while (!this.canAllocate()) {
+      await new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
+    }
+    if (this.closedError) throw this.closedError;
     const sequence = this.next;
     if (sequence > 0xffffffffffffffffn) throw new Error('session sequence exhausted');
     this.next += 1n;
-    this.pending.add(sequence.toString());
+    this.pending.add(sequence);
     return sequence;
   }
 
   accept(expected, received) {
-    const key = expected.toString();
-    if (received !== expected || !this.pending.delete(key)) {
+    if (this.closedError) throw this.closedError;
+    if (received !== expected || !this.pending.delete(expected)) {
       throw new Error('unexpected v2 response sequence');
     }
+    this.wakeWaiters();
+  }
+
+  close(error = new Error('session sequence tracker closed')) {
+    if (this.closedError) return;
+    this.closedError = error instanceof Error ? error : new Error(String(error));
+    this.pending.clear();
+    const waiters = this.waiters.splice(0);
+    for (const waiter of waiters) waiter.reject(this.closedError);
+  }
+
+  canAllocate() {
+    if (this.closedError) return true;
+    const oldest = this.pending.values().next().value;
+    return oldest === undefined || this.next - oldest < REPLAY_WINDOW_SIZE;
+  }
+
+  wakeWaiters() {
+    const waiters = this.waiters.splice(0);
+    for (const waiter of waiters) waiter.resolve();
   }
 }
 

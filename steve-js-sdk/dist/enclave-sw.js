@@ -459,6 +459,7 @@ var CONFIRM_ENDPOINT = "/e2p/v2/confirm";
 var REQUEST_ENDPOINT = "/e2p/v2/request";
 var encoder = new TextEncoder();
 var MAGIC = encoder.encode("STEVE-E2P-V2\0");
+var REPLAY_WINDOW_SIZE = 64n;
 var LABELS = {
   c2sKey: encoder.encode("steve-e2p-v2/c2s-key"),
   s2cKey: encoder.encode("steve-e2p-v2/s2c-key"),
@@ -472,19 +473,42 @@ var SequenceTracker = class {
   constructor() {
     this.next = 1n;
     this.pending = /* @__PURE__ */ new Set();
+    this.waiters = [];
+    this.closedError = null;
   }
-  allocate() {
+  async allocate() {
+    while (!this.canAllocate()) {
+      await new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
+    }
+    if (this.closedError) throw this.closedError;
     const sequence = this.next;
     if (sequence > 0xffffffffffffffffn) throw new Error("session sequence exhausted");
     this.next += 1n;
-    this.pending.add(sequence.toString());
+    this.pending.add(sequence);
     return sequence;
   }
   accept(expected, received) {
-    const key = expected.toString();
-    if (received !== expected || !this.pending.delete(key)) {
+    if (this.closedError) throw this.closedError;
+    if (received !== expected || !this.pending.delete(expected)) {
       throw new Error("unexpected v2 response sequence");
     }
+    this.wakeWaiters();
+  }
+  close(error = new Error("session sequence tracker closed")) {
+    if (this.closedError) return;
+    this.closedError = error instanceof Error ? error : new Error(String(error));
+    this.pending.clear();
+    const waiters = this.waiters.splice(0);
+    for (const waiter of waiters) waiter.reject(this.closedError);
+  }
+  canAllocate() {
+    if (this.closedError) return true;
+    const oldest = this.pending.values().next().value;
+    return oldest === void 0 || this.next - oldest < REPLAY_WINDOW_SIZE;
+  }
+  wakeWaiters() {
+    const waiters = this.waiters.splice(0);
+    for (const waiter of waiters) waiter.resolve();
   }
 };
 function concatBytes(...parts) {
@@ -717,7 +741,7 @@ async function handleProtectedRequest(request) {
   let session;
   try {
     session = await currentSession();
-    const sequence = session.sequences.allocate();
+    const sequence = await session.sequences.allocate();
     const url = new URL(request.url);
     const requestBody = new Uint8Array(await request.arrayBuffer());
     const plaintext = encode({
@@ -762,6 +786,7 @@ async function handleProtectedRequest(request) {
     const body = decoded.body instanceof Uint8Array ? decoded.body : decoded.error ? new TextEncoder().encode(JSON.stringify({ error: decoded.error })) : null;
     return new Response(body, { status: decoded.status, headers: decoded.headers || {} });
   } catch (error) {
+    if (session) session.sequences.close(new Error(publicError(error)));
     if (session ? state.session === session : !hasValidSession(state.session)) {
       resetState(publicError(error));
     }
@@ -965,6 +990,7 @@ function freshState(error = null) {
   return { session: null, sessionPromise: null, rotationPromise: null, error };
 }
 function resetState(error = null) {
+  state.session?.sequences?.close(new Error(error || "secure channel reset"));
   state = freshState(error);
 }
 function publicError(error) {

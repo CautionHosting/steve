@@ -107,3 +107,42 @@ test('concurrent sequence allocation is unique and duplicate responses fail', as
   assert.throws(() => tracker.accept(1n, 1n), /unexpected v2 response sequence/u);
   assert.throws(() => tracker.accept(2n, 3n), /unexpected v2 response sequence/u);
 });
+
+test('sequence allocation cannot advance beyond the server replay window', async () => {
+  const tracker = new SequenceTracker();
+  const first = await tracker.allocate();
+  assert.equal(first, 1n);
+
+  for (let expected = 2n; expected <= 64n; expected += 1n) {
+    const sequence = await tracker.allocate();
+    assert.equal(sequence, expected);
+    tracker.accept(sequence, sequence);
+  }
+
+  let settled = false;
+  const blocked = tracker.allocate().then(sequence => {
+    settled = true;
+    return sequence;
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false, 'sequence 65 must wait while sequence 1 is pending');
+
+  tracker.accept(first, first);
+  assert.equal(await blocked, 65n);
+});
+
+test('closing a tracker rejects allocations waiting on the replay window', async () => {
+  const tracker = new SequenceTracker();
+  const first = await tracker.allocate();
+  for (let expected = 2n; expected <= 64n; expected += 1n) {
+    const sequence = await tracker.allocate();
+    tracker.accept(sequence, sequence);
+  }
+
+  const blocked = tracker.allocate();
+  await new Promise(resolve => setImmediate(resolve));
+  tracker.close(new Error('session reset'));
+
+  await assert.rejects(blocked, /session reset/u);
+  assert.throws(() => tracker.accept(first, first), /session reset/u);
+});

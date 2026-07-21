@@ -5,11 +5,13 @@ use std::{
 };
 
 use crate::protocol::{Direction, MessageType, ProtocolError, SESSION_ID_LEN, SessionSecrets};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const PENDING_TTL: Duration = Duration::from_secs(30);
 pub const ACTIVE_TTL: Duration = Duration::from_secs(30 * 60);
 pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 pub const DEFAULT_MAX_SESSIONS: usize = 4_096;
+const CAPACITY_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 const REPLAY_WINDOW_SIZE: u64 = 64;
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -24,6 +26,8 @@ pub enum SessionError {
     Replay,
     #[error("session capacity reached")]
     Capacity,
+    #[error("session identifier collision")]
+    Collision,
     #[error("message authentication failed")]
     Authentication,
     #[error("confirmation payload does not match the transcript")]
@@ -208,8 +212,18 @@ impl ReplayWindow {
 }
 
 pub struct SessionStore {
-    sessions: RwLock<HashMap<[u8; SESSION_ID_LEN], Arc<Session>>>,
-    max_sessions: usize,
+    sessions: RwLock<HashMap<[u8; SESSION_ID_LEN], StoredSession>>,
+    capacity: Arc<Semaphore>,
+    last_capacity_prune: Mutex<Option<Instant>>,
+}
+
+struct StoredSession {
+    session: Arc<Session>,
+    _reservation: SessionReservation,
+}
+
+pub struct SessionReservation {
+    _permit: OwnedSemaphorePermit,
 }
 
 impl Default for SessionStore {
@@ -222,23 +236,51 @@ impl SessionStore {
     pub fn new(max_sessions: usize) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
-            max_sessions,
+            capacity: Arc::new(Semaphore::new(max_sessions)),
+            last_capacity_prune: Mutex::new(None),
         }
     }
 
-    pub fn insert(&self, session: Session) -> Result<Arc<Session>, SessionError> {
-        self.prune();
+    pub fn reserve(&self) -> Result<SessionReservation, SessionError> {
+        if let Ok(permit) = Arc::clone(&self.capacity).try_acquire_owned() {
+            return Ok(SessionReservation { _permit: permit });
+        }
+        if self.capacity_prune_is_due() {
+            self.prune();
+            if let Ok(permit) = Arc::clone(&self.capacity).try_acquire_owned() {
+                return Ok(SessionReservation { _permit: permit });
+            }
+        }
+        Err(SessionError::Capacity)
+    }
+
+    pub fn insert(
+        &self,
+        session: Session,
+        reservation: SessionReservation,
+    ) -> Result<Arc<Session>, SessionError> {
         let mut sessions = self.sessions.write().unwrap();
-        if sessions.len() >= self.max_sessions {
-            return Err(SessionError::Capacity);
+        if sessions.contains_key(session.id()) {
+            return Err(SessionError::Collision);
         }
         let session = Arc::new(session);
-        sessions.insert(*session.id(), Arc::clone(&session));
+        sessions.insert(
+            *session.id(),
+            StoredSession {
+                session: Arc::clone(&session),
+                _reservation: reservation,
+            },
+        );
         Ok(session)
     }
 
     pub fn get(&self, id: &[u8; SESSION_ID_LEN]) -> Result<Arc<Session>, SessionError> {
-        let session = self.sessions.read().unwrap().get(id).cloned();
+        let session = self
+            .sessions
+            .read()
+            .unwrap()
+            .get(id)
+            .map(|stored| Arc::clone(&stored.session));
         match session {
             Some(session) if !session.is_expired(Instant::now()) => Ok(session),
             Some(_) => {
@@ -254,7 +296,18 @@ impl SessionStore {
         self.sessions
             .write()
             .unwrap()
-            .retain(|_, session| !session.is_expired(now));
+            .retain(|_, stored| !stored.session.is_expired(now));
+    }
+
+    fn capacity_prune_is_due(&self) -> bool {
+        let now = Instant::now();
+        let mut last_prune = self.last_capacity_prune.lock().unwrap();
+        if last_prune.is_some_and(|previous| now.duration_since(previous) < CAPACITY_PRUNE_INTERVAL)
+        {
+            return false;
+        }
+        *last_prune = Some(now);
+        true
     }
 }
 
@@ -283,13 +336,27 @@ mod tests {
     #[test]
     fn store_enforces_capacity() {
         let store = SessionStore::new(1);
-        store.insert(session()).unwrap();
-        let other = Session::new(
-            [9u8; 16],
-            [2u8; 32],
-            derive_secrets(&[3u8; 32], &[4u8; 32]).unwrap(),
-        );
-        assert!(matches!(store.insert(other), Err(SessionError::Capacity)));
+        let reservation = store.reserve().unwrap();
+        store.insert(session(), reservation).unwrap();
+        assert!(matches!(store.reserve(), Err(SessionError::Capacity)));
+    }
+
+    #[test]
+    fn dropping_an_unused_reservation_releases_capacity() {
+        let store = SessionStore::new(1);
+        let reservation = store.reserve().unwrap();
+        drop(reservation);
+        assert!(store.reserve().is_ok());
+    }
+
+    #[test]
+    fn capacity_reservation_prunes_expired_sessions() {
+        let store = SessionStore::new(1);
+        let mut expired = session();
+        expired.created_at = Instant::now() - PENDING_TTL;
+        let reservation = store.reserve().unwrap();
+        store.insert(expired, reservation).unwrap();
+        assert!(store.reserve().is_ok());
     }
 
     #[test]
