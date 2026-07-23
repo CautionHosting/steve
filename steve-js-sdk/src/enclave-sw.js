@@ -24,12 +24,24 @@ import {
 const DEFAULT_BOOTSTRAP_PATHS = ['/', '/enclave-sw.js', '/register.js', '/attestation-widget.js'];
 const ROTATION_INTERVAL_MS = 25 * 60 * 1000;
 const PROTOCOL_EXCLUDE_PREFIXES = ['/e2p/'];
+const DEFAULT_REQUEST_TIMEOUT_MS = 30 * 1000;
+const MIN_REQUEST_TIMEOUT_MS = 1000;
+const MAX_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+const SESSION_ESTABLISH_TIMEOUT_MS = 10 * 1000;
+const SESSION_FATAL_HTTP_STATUSES = new Set([400, 401, 409, 425]);
+const REQUEST_LOCAL_HTTP_STATUSES = new Set([403, 404, 408, 429]);
 
-let config = {
-  passthroughPaths: DEFAULT_BOOTSTRAP_PATHS,
-  excludePrefixes: ['/attestation', '/e2p/'],
-  emitEncryptedPayloads: false
-};
+function defaultConfig() {
+  return {
+    enclaveOrigin: self.location.origin,
+    passthroughPaths: [...DEFAULT_BOOTSTRAP_PATHS],
+    excludePrefixes: ['/attestation', '/e2p/'],
+    emitEncryptedPayloads: false,
+    requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+  };
+}
+
+let config = defaultConfig();
 
 let state = freshState();
 
@@ -38,9 +50,7 @@ self.addEventListener('activate', event => event.waitUntil(clients.claim()));
 self.addEventListener('message', event => handleMessage(event));
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
-  if (url.origin !== self.location.origin || isPassthrough(url.pathname)) {
-    return;
-  }
+  if (!shouldProtectUrl(url)) return;
   event.respondWith(handleProtectedRequest(event.request));
 });
 
@@ -78,9 +88,8 @@ async function handleMessage(event) {
 
 async function handleProtectedRequest(request) {
   let session;
+  let sequence;
   try {
-    session = await currentSession();
-    const sequence = await session.sequences.allocate();
     const url = new URL(request.url);
     const requestBody = new Uint8Array(await request.arrayBuffer());
     const plaintext = encodeCBOR({
@@ -89,53 +98,84 @@ async function handleProtectedRequest(request) {
       headers: Object.fromEntries(request.headers),
       body: requestBody.length === 0 ? null : requestBody
     });
-    const ciphertext = await seal(
-      session.material,
-      Direction.CLIENT_TO_SERVER,
-      MessageType.APPLICATION,
-      session.id,
-      sequence,
-      plaintext
+
+    session = await currentSession();
+    sequence = await session.sequences.allocate();
+    const protectedResponse = await withDeadline(
+      config.requestTimeoutMs,
+      request.signal,
+      async signal => {
+        throwIfAborted(signal);
+        const ciphertext = await seal(
+          session.material,
+          Direction.CLIENT_TO_SERVER,
+          MessageType.APPLICATION,
+          session.id,
+          sequence,
+          plaintext
+        );
+        throwIfAborted(signal);
+        const envelope = encodeEnvelope(session.id, sequence, ciphertext);
+
+        if (config.emitEncryptedPayloads) {
+          notifyClients('encrypted-request', { sequence: sequence.toString(), size: envelope.length });
+        }
+
+        const response = await protocolFetch(REQUEST_ENDPOINT, envelope, signal);
+        if (!response.ok) {
+          throw new ProtocolHttpError(response.status, 'v2 request');
+        }
+        const responseBytes = new Uint8Array(await response.arrayBuffer());
+        throwIfAborted(signal);
+        const responseEnvelope = decodeEnvelope(responseBytes);
+        if (!equalBytes(responseEnvelope.session_id, session.id)
+            || responseEnvelope.sequenceValue !== sequence) {
+          throw new Error('unexpected v2 response envelope');
+        }
+
+        const responsePlaintext = await open(
+          session.material,
+          Direction.SERVER_TO_CLIENT,
+          MessageType.APPLICATION,
+          session.id,
+          sequence,
+          responseEnvelope.ciphertext
+        );
+        throwIfAborted(signal);
+        const decoded = decodeCBOR(responsePlaintext);
+        validateApplicationResponse(decoded);
+
+        const body = decoded.body instanceof Uint8Array
+          ? decoded.body
+          : decoded.error
+            ? new TextEncoder().encode(JSON.stringify({ error: decoded.error }))
+            : null;
+        return {
+          response: new Response(body, { status: decoded.status, headers: decoded.headers || {} }),
+          sequenceValue: responseEnvelope.sequenceValue,
+          responseSize: responseBytes.length
+        };
+      },
+      'v2 request timed out'
     );
-    const envelope = encodeEnvelope(session.id, sequence, ciphertext);
 
+    session.sequences.accept(sequence, protectedResponse.sequenceValue);
     if (config.emitEncryptedPayloads) {
-      notifyClients('encrypted-request', { sequence: sequence.toString(), size: envelope.length });
+      notifyClients('encrypted-response', {
+        sequence: sequence.toString(),
+        size: protectedResponse.responseSize
+      });
     }
-
-    const response = await protocolFetch(REQUEST_ENDPOINT, envelope);
-    if (!response.ok) throw new Error(`v2 request rejected (${response.status})`);
-    const responseBytes = new Uint8Array(await response.arrayBuffer());
-    const responseEnvelope = decodeEnvelope(responseBytes);
-    if (!equalBytes(responseEnvelope.session_id, session.id)) {
-      throw new Error('unexpected v2 response envelope');
-    }
-    session.sequences.accept(sequence, responseEnvelope.sequenceValue);
-
-    const responsePlaintext = await open(
-      session.material,
-      Direction.SERVER_TO_CLIENT,
-      MessageType.APPLICATION,
-      session.id,
-      sequence,
-      responseEnvelope.ciphertext
-    );
-    const decoded = decodeCBOR(responsePlaintext);
-    validateApplicationResponse(decoded);
-
-    if (config.emitEncryptedPayloads) {
-      notifyClients('encrypted-response', { sequence: sequence.toString(), size: responseBytes.length });
-    }
-
-    const body = decoded.body instanceof Uint8Array
-      ? decoded.body
-      : decoded.error
-        ? new TextEncoder().encode(JSON.stringify({ error: decoded.error }))
-        : null;
-    return new Response(body, { status: decoded.status, headers: decoded.headers || {} });
+    return protectedResponse.response;
   } catch (error) {
-    if (session) session.sequences.close(new Error(publicError(error)));
-    if (session ? state.session === session : !hasValidSession(state.session)) {
+    if (session && sequence !== undefined && isRequestLocalFailure(error)) {
+      session.sequences.retire(sequence);
+    } else if (session) {
+      session.sequences.close(new Error(publicError(error)));
+    }
+    if (session
+      ? !isRequestLocalFailure(error) && state.session === session
+      : !hasValidSession(state.session)) {
       resetState(publicError(error));
     }
     notifyClients('error', {
@@ -144,7 +184,7 @@ async function handleProtectedRequest(request) {
       stage: session ? 'request' : 'initialization'
     });
     return new Response(JSON.stringify({ error: 'secure channel failed' }), {
-      status: 502,
+      status: error instanceof ProtocolTimeoutError ? 504 : 502,
       headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
     });
   }
@@ -201,17 +241,31 @@ async function rotateSession() {
 }
 
 async function establishSession() {
+  return withDeadline(
+    SESSION_ESTABLISH_TIMEOUT_MS,
+    null,
+    signal => establishSessionWithinDeadline(signal),
+    'session establishment timed out'
+  );
+}
+
+async function establishSessionWithinDeadline(signal) {
   notifyClients('status', { stage: 'creating-session' });
   const clientNonce = crypto.getRandomValues(new Uint8Array(32));
   const clientKeyPair = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
+  throwIfAborted(signal);
   const clientPublicKey = new Uint8Array(await crypto.subtle.exportKey('raw', clientKeyPair.publicKey));
+  throwIfAborted(signal);
   const contextHash = await hashOrigin(self.location.origin);
+  throwIfAborted(signal);
   const response = await protocolFetch(
     SESSION_ENDPOINT,
-    encodeSessionRequest(clientNonce, clientPublicKey, contextHash)
+    encodeSessionRequest(clientNonce, clientPublicKey, contextHash),
+    signal
   );
-  if (!response.ok) throw new Error(`session creation rejected (${response.status})`);
+  if (!response.ok) throw new ProtocolHttpError(response.status, 'session creation');
   const sessionResponse = decodeSessionResponse(new Uint8Array(await response.arrayBuffer()));
+  throwIfAborted(signal);
   const transcript = buildTranscript(
     clientNonce,
     clientPublicKey,
@@ -220,6 +274,7 @@ async function establishSession() {
     contextHash
   );
   const transcriptHash = await sha256(transcript);
+  throwIfAborted(signal);
   const serverPublicKey = await crypto.subtle.importKey(
     'raw',
     sessionResponse.server_public_key,
@@ -227,15 +282,19 @@ async function establishSession() {
     false,
     []
   );
+  throwIfAborted(signal);
   const sharedSecret = new Uint8Array(await crypto.subtle.deriveBits(
     { name: 'X25519', public: serverPublicKey },
     clientKeyPair.privateKey,
     256
   ));
+  throwIfAborted(signal);
   const material = await deriveMaterial(sharedSecret, transcriptHash);
+  throwIfAborted(signal);
 
   notifyClients('status', { stage: 'verifying-session-attestation' });
   const attestation = await verify(sessionResponse.attestation_document, { nonce: clientNonce });
+  throwIfAborted(signal);
   validateAttestationResult(
     attestation,
     sessionResponse.session_id,
@@ -251,16 +310,19 @@ async function establishSession() {
     0n,
     transcriptHash
   );
+  throwIfAborted(signal);
   const confirmationResponse = await protocolFetch(
     CONFIRM_ENDPOINT,
-    encodeEnvelope(sessionResponse.session_id, 0n, confirmationCiphertext)
+    encodeEnvelope(sessionResponse.session_id, 0n, confirmationCiphertext),
+    signal
   );
   if (!confirmationResponse.ok) {
-    throw new Error(`session confirmation rejected (${confirmationResponse.status})`);
+    throw new ProtocolHttpError(confirmationResponse.status, 'session confirmation');
   }
   const confirmationEnvelope = decodeEnvelope(
     new Uint8Array(await confirmationResponse.arrayBuffer())
   );
+  throwIfAborted(signal);
   if (confirmationEnvelope.sequenceValue !== 0n
       || !equalBytes(confirmationEnvelope.session_id, sessionResponse.session_id)) {
     throw new Error('unexpected confirmation response');
@@ -273,6 +335,7 @@ async function establishSession() {
     0n,
     confirmationEnvelope.ciphertext
   );
+  throwIfAborted(signal);
   if (!equalBytes(confirmedHash, transcriptHash)) throw new Error('session confirmation mismatch');
 
   const session = {
@@ -290,15 +353,109 @@ async function establishSession() {
   return session;
 }
 
-async function protocolFetch(path, body) {
-  return fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/cbor' },
-    body,
-    cache: 'no-store',
-    credentials: 'omit',
-    redirect: 'error'
+async function protocolFetch(path, body, signal) {
+  try {
+    return await fetch(resolveProtocolUrl(path), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/cbor' },
+      body,
+      cache: 'no-store',
+      credentials: 'omit',
+      redirect: 'error',
+      signal
+    });
+  } catch (error) {
+    if (signal?.aborted) throw new ProtocolAbortError();
+    throw new ProtocolTransportError(error);
+  }
+}
+
+class ProtocolTimeoutError extends Error {
+  constructor(message = 'v2 operation timed out') {
+    super(message);
+    this.name = 'ProtocolTimeoutError';
+  }
+}
+
+class ProtocolAbortError extends Error {
+  constructor(message = 'v2 request aborted') {
+    super(message);
+    this.name = 'ProtocolAbortError';
+  }
+}
+
+class ProtocolTransportError extends Error {
+  constructor(cause) {
+    super('v2 transport failed');
+    this.name = 'ProtocolTransportError';
+    this.cause = cause;
+  }
+}
+
+class ProtocolHttpError extends Error {
+  constructor(status, stage) {
+    super(`${stage} rejected (${status})`);
+    this.name = 'ProtocolHttpError';
+    this.status = status;
+  }
+}
+
+async function withDeadline(timeoutMs, externalSignal, operation, timeoutMessage) {
+  const controller = new AbortController();
+  let timedOut = false;
+  let forwardAbort;
+  const abortPromise = new Promise((_, reject) => {
+    controller.signal.addEventListener('abort', () => {
+      reject(timedOut
+        ? new ProtocolTimeoutError(timeoutMessage)
+        : new ProtocolAbortError());
+    }, { once: true });
   });
+
+  if (externalSignal) {
+    forwardAbort = () => controller.abort(externalSignal.reason);
+    if (externalSignal.aborted) {
+      forwardAbort();
+    } else {
+      externalSignal.addEventListener('abort', forwardAbort, { once: true });
+    }
+  }
+
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => operation(controller.signal)),
+      abortPromise
+    ]);
+  } finally {
+    clearTimeout(timer);
+    if (externalSignal && forwardAbort) {
+      externalSignal.removeEventListener('abort', forwardAbort);
+    }
+  }
+}
+
+function throwIfAborted(signal) {
+  if (signal.aborted) throw new ProtocolAbortError();
+}
+
+function isRequestLocalFailure(error) {
+  if (error instanceof ProtocolTimeoutError || error instanceof ProtocolAbortError
+      || error instanceof ProtocolTransportError) {
+    return true;
+  }
+  if (!(error instanceof ProtocolHttpError)) return false;
+  if (SESSION_FATAL_HTTP_STATUSES.has(error.status)) return false;
+  return REQUEST_LOCAL_HTTP_STATUSES.has(error.status)
+    || (error.status >= 500 && error.status <= 599);
+}
+
+function resolveProtocolUrl(path) {
+  return new URL(path, `${config.enclaveOrigin}/`).href;
 }
 
 function validateApplicationResponse(response) {
@@ -313,22 +470,72 @@ function validateApplicationResponse(response) {
   }
 }
 
-function isPassthrough(path) {
-  return config.passthroughPaths.includes(path)
-    || config.excludePrefixes.some(prefix => path.startsWith(prefix));
+function shouldProtectUrl(value) {
+  const url = value instanceof URL ? value : new URL(value);
+  if (url.origin !== config.enclaveOrigin) return false;
+  return !isPassthrough(url);
+}
+
+function isPassthrough(url) {
+  const localBootstrap = url.origin === self.location.origin
+    && config.passthroughPaths.includes(url.pathname);
+  return localBootstrap
+    || config.excludePrefixes.some(prefix => url.pathname.startsWith(prefix));
 }
 
 function configure(update) {
-  const allowed = ['passthroughPaths', 'excludePrefixes', 'emitEncryptedPayloads'];
+  const allowed = [
+    'enclaveOrigin',
+    'passthroughPaths',
+    'excludePrefixes',
+    'emitEncryptedPayloads',
+    'requestTimeoutMs'
+  ];
   for (const key of Object.keys(update)) {
     if (!allowed.includes(key)) throw new Error(`unsupported configuration key: ${key}`);
   }
-  if (update.passthroughPaths) validatePathList(update.passthroughPaths);
-  if (update.excludePrefixes) validatePathList(update.excludePrefixes);
-  config = { ...config, ...update };
-  config.excludePrefixes = [
-    ...new Set([...PROTOCOL_EXCLUDE_PREFIXES, ...config.excludePrefixes])
+  if ('passthroughPaths' in update) validatePathList(update.passthroughPaths);
+  if ('excludePrefixes' in update) validatePathList(update.excludePrefixes);
+  if ('requestTimeoutMs' in update) validateRequestTimeout(update.requestTimeoutMs);
+
+  const next = { ...config, ...update };
+  if ('enclaveOrigin' in update) {
+    next.enclaveOrigin = normalizeEnclaveOrigin(update.enclaveOrigin);
+  }
+  next.excludePrefixes = [
+    ...new Set([...PROTOCOL_EXCLUDE_PREFIXES, ...next.excludePrefixes])
   ];
+  const enclaveChanged = next.enclaveOrigin !== config.enclaveOrigin;
+  if (enclaveChanged) resetState();
+  config = next;
+}
+
+function normalizeEnclaveOrigin(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error('enclaveOrigin must be an absolute HTTP(S) origin');
+  }
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error('enclaveOrigin must be an absolute HTTP(S) origin');
+  }
+  if (!['http:', 'https:'].includes(url.protocol)
+      || url.username || url.password
+      || url.pathname !== '/' || url.search || url.hash) {
+    throw new Error('enclaveOrigin must be an absolute HTTP(S) origin');
+  }
+  return url.origin;
+}
+
+function validateRequestTimeout(value) {
+  if (!Number.isInteger(value)
+      || value < MIN_REQUEST_TIMEOUT_MS
+      || value > MAX_REQUEST_TIMEOUT_MS) {
+    throw new Error(
+      `requestTimeoutMs must be an integer between ${MIN_REQUEST_TIMEOUT_MS} and ${MAX_REQUEST_TIMEOUT_MS}`
+    );
+  }
 }
 
 function validatePathList(values) {
@@ -388,8 +595,18 @@ self.__ENCLAVE_SW_TEST__ = {
   resetState,
   ensureSession,
   rotateSession,
+  handleProtectedRequest,
+  protocolFetch,
+  withDeadline,
+  ProtocolHttpError,
+  ProtocolTimeoutError,
+  ProtocolTransportError,
+  isRequestLocalFailure,
+  resolveProtocolUrl,
+  shouldProtectUrl,
   getState: () => state,
   getConfig: () => config,
+  resetConfig: () => { config = defaultConfig(); },
   setEstablishSession: fn => { establishSessionFn = fn; },
   resetEstablishSession: () => { establishSessionFn = establishSession; }
 };

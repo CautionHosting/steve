@@ -146,3 +146,27 @@ test('closing a tracker rejects allocations waiting on the replay window', async
   await assert.rejects(blocked, /session reset/u);
   assert.throws(() => tracker.accept(first, first), /session reset/u);
 });
+
+test('retiring a spent sequence advances the window without reusing it', async () => {
+  const tracker = new SequenceTracker();
+  const first = await tracker.allocate();
+  for (let expected = 2n; expected <= 64n; expected += 1n) {
+    const sequence = await tracker.allocate();
+    tracker.accept(sequence, sequence);
+  }
+
+  const blocked = tracker.allocate();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(tracker.retire(first), true);
+  assert.equal(await blocked, 65n);
+  assert.throws(() => tracker.retire(first), /unexpected v2 retired sequence/u);
+});
+
+test('retiring after a concurrent close is a safe no-op', async () => {
+  const tracker = new SequenceTracker();
+  const sequence = await tracker.allocate();
+  tracker.close(new Error('session reset'));
+
+  assert.equal(tracker.retire(sequence), false);
+  assert.throws(() => tracker.accept(sequence, sequence), /session reset/u);
+});

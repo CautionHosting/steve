@@ -101,4 +101,29 @@ await client.initialize();
 const response = await fetch('/api/secret');
 ```
 
+For a browser application hosted on another origin, configure the enclave
+origin and fetch it explicitly:
+
+```javascript
+const client = await registerEnclaveServiceWorker({
+  config: {
+    enclaveOrigin: 'https://secure.example',
+    requestTimeoutMs: 30000
+  }
+});
+await client.initialize();
+
+const response = await fetch('https://secure.example/api/secret');
+```
+
+Set `STEVE_CORS_ORIGINS` to the browser application's origin (for example,
+`http://localhost:3000`). STEVE applies that policy only to `/e2p/v2/*`;
+plaintext fallback routes retain the upstream application's CORS policy.
+
+Protected application transactions default to a 30-second deadline
+(`requestTimeoutMs` accepts 1,000 through 300,000 milliseconds). Transport
+failures do not reset an otherwise valid secure session. The SDK does not
+automatically retry timed-out requests because the upstream operation may
+already have executed.
+
 The native Rust SDK does not yet implement the v2 client flow.

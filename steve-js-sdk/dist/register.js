@@ -45,31 +45,43 @@ var EnclaveClient = class {
     this.listeners.get(event)?.forEach((cb) => cb(data));
     this.listeners.get("*")?.forEach((cb) => cb(event, data));
   }
-  async sendMessage(type, data = {}) {
+  async sendMessage(type, data = {}, timeout = 1e4) {
     return new Promise((resolve, reject) => {
       const channel = new MessageChannel();
+      let settled = false;
+      const settle = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        channel.port1.onmessage = null;
+        channel.port1.close?.();
+        callback(value);
+      };
       channel.port1.onmessage = (event) => {
         if (event.data.error) {
-          reject(new Error(event.data.error));
+          settle(reject, new Error(event.data.error));
         } else {
-          resolve(event.data);
+          settle(resolve, event.data);
         }
       };
+      const timer = setTimeout(
+        () => settle(reject, new Error("Message timeout")),
+        timeout
+      );
       navigator.serviceWorker.controller?.postMessage(
         { type, ...data },
         [channel.port2]
       );
-      setTimeout(() => reject(new Error("Message timeout")), 1e4);
     });
   }
   async getStatus() {
     return this.sendMessage("get-status");
   }
   async initialize() {
-    return this.sendMessage("initialize");
+    return this.sendMessage("initialize", {}, 15e3);
   }
   async rotateKey() {
-    return this.sendMessage("rotate-key");
+    return this.sendMessage("rotate-key", {}, 15e3);
   }
   async reset() {
     return this.sendMessage("reset");

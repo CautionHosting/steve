@@ -1,5 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { encode as encodeCBOR } from 'tee-attestation-js/lib/cbor';
+import {
+  Direction,
+  MessageType,
+  SequenceTracker,
+  decodeEnvelope,
+  deriveMaterial,
+  encodeEnvelope,
+  seal
+} from '../src/protocol-v2.js';
 
 // enclave-sw.js is a service-worker script: it calls self.addEventListener()
 // at module top-level. Stub the minimal SW globals it needs before import so
@@ -12,13 +22,20 @@ globalThis.self = {
 
 await import('../src/enclave-sw.js');
 const { configure, hasValidSession, resetState, ensureSession, getState, getConfig,
+  protocolFetch, resolveProtocolUrl, shouldProtectUrl, resetConfig,
+  handleProtectedRequest, withDeadline, ProtocolHttpError, ProtocolTimeoutError,
+  ProtocolTransportError,
+  isRequestLocalFailure,
   setEstablishSession, resetEstablishSession } = globalThis.self.__ENCLAVE_SW_TEST__;
 
 const ROTATION_INTERVAL_MS = 25 * 60 * 1000;
+const originalFetch = globalThis.fetch;
 
 test.afterEach(() => {
   resetState();
+  resetConfig();
   resetEstablishSession();
+  globalThis.fetch = originalFetch;
 });
 
 test('configure() cannot drop the /e2p/ protocol prefix', () => {
@@ -34,6 +51,129 @@ test('configure() de-duplicates the forced prefix across repeated calls', () => 
   const excludePrefixes = getConfig().excludePrefixes;
   assert.equal(excludePrefixes.filter(p => p === '/e2p/').length, 1);
   assert.ok(excludePrefixes.includes('/bar'));
+});
+
+test('same-origin interception remains the default', () => {
+  assert.equal(getConfig().enclaveOrigin, 'https://example.test');
+  assert.equal(shouldProtectUrl('https://example.test/data'), true);
+  assert.equal(shouldProtectUrl('https://example.test/'), false);
+  assert.equal(shouldProtectUrl('https://other.test/data'), false);
+});
+
+test('cross-origin enclave configuration protects only the enclave origin', () => {
+  configure({ enclaveOrigin: 'https://secure.example/' });
+
+  assert.equal(getConfig().enclaveOrigin, 'https://secure.example');
+  assert.equal(shouldProtectUrl('https://secure.example/'), true);
+  assert.equal(shouldProtectUrl('https://secure.example/data?q=1'), true);
+  assert.equal(shouldProtectUrl('https://secure.example/e2p/v2/request'), false);
+  assert.equal(shouldProtectUrl('https://secure.example/attestation'), false);
+  assert.equal(shouldProtectUrl('https://example.test/data'), false);
+  assert.equal(shouldProtectUrl('https://other.test/data'), false);
+});
+
+test('enclaveOrigin must be an absolute HTTP(S) origin', () => {
+  for (const value of [
+    '',
+    '/relative',
+    'ftp://secure.example',
+    'https://user@secure.example',
+    'https://secure.example/path',
+    'https://secure.example?query=1',
+    'https://secure.example/#fragment'
+  ]) {
+    assert.throws(
+      () => configure({ enclaveOrigin: value }),
+      /absolute HTTP\(S\) origin/
+    );
+  }
+});
+
+test('requestTimeoutMs must be finite and bounded', () => {
+  for (const value of [0, 999, 300001, 1.5, Infinity, '30000']) {
+    assert.throws(
+      () => configure({ requestTimeoutMs: value }),
+      /requestTimeoutMs must be an integer between 1000 and 300000/u
+    );
+  }
+
+  configure({ requestTimeoutMs: 1000 });
+  assert.equal(getConfig().requestTimeoutMs, 1000);
+  configure({ requestTimeoutMs: 300000 });
+  assert.equal(getConfig().requestTimeoutMs, 300000);
+});
+
+test('protocol requests use the configured enclave origin without credentials', async () => {
+  configure({ enclaveOrigin: 'https://secure.example' });
+  let captured;
+  globalThis.fetch = async (url, options) => {
+    captured = { url, options };
+    return new Response(null, { status: 204 });
+  };
+
+  assert.equal(
+    resolveProtocolUrl('/e2p/v2/session'),
+    'https://secure.example/e2p/v2/session'
+  );
+  await protocolFetch('/e2p/v2/session', new Uint8Array([1, 2, 3]));
+
+  assert.equal(captured.url, 'https://secure.example/e2p/v2/session');
+  assert.equal(captured.options.method, 'POST');
+  assert.equal(captured.options.credentials, 'omit');
+  assert.equal(captured.options.headers['Content-Type'], 'application/cbor');
+});
+
+test('withDeadline rejects a never-settling operation', async () => {
+  await assert.rejects(
+    withDeadline(10, null, () => new Promise(() => {}), 'test deadline expired'),
+    error => error instanceof ProtocolTimeoutError
+      && error.message === 'test deadline expired'
+  );
+});
+
+test('external aborts and transient HTTP failures are request-local', async () => {
+  const controller = new AbortController();
+  const pending = withDeadline(
+    1000,
+    controller.signal,
+    () => new Promise(() => {}),
+    'should not time out'
+  );
+  controller.abort();
+
+  await assert.rejects(pending, error => isRequestLocalFailure(error));
+  assert.equal(isRequestLocalFailure(new TypeError('programming error')), false);
+  assert.equal(
+    isRequestLocalFailure(new ProtocolTransportError(new TypeError('network failure'))),
+    true
+  );
+  assert.equal(isRequestLocalFailure(new ProtocolHttpError(403, 'v2 request')), true);
+  assert.equal(isRequestLocalFailure(new ProtocolHttpError(404, 'v2 request')), true);
+  assert.equal(isRequestLocalFailure(new ProtocolHttpError(408, 'v2 request')), true);
+  assert.equal(isRequestLocalFailure(new ProtocolHttpError(429, 'v2 request')), true);
+  assert.equal(isRequestLocalFailure(new ProtocolHttpError(500, 'v2 request')), true);
+  assert.equal(isRequestLocalFailure(new ProtocolHttpError(401, 'v2 request')), false);
+});
+
+test('withDeadline removes its timer after successful completion', async () => {
+  let aborted = false;
+  const result = await withDeadline(10, null, signal => {
+    signal.addEventListener('abort', () => { aborted = true; }, { once: true });
+    return 'complete';
+  }, 'should not time out');
+
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(result, 'complete');
+  assert.equal(aborted, false);
+});
+
+test('changing enclaveOrigin discards a session established for the old enclave', async () => {
+  setEstablishSession(async () => ({ id: 'session-a', createdAt: Date.now() }));
+  await ensureSession();
+  assert.equal(getState().session.id, 'session-a');
+
+  configure({ enclaveOrigin: 'https://secure.example' });
+  assert.equal(getState().session, null);
 });
 
 test('hasValidSession: false for null/undefined session', () => {
@@ -71,4 +211,171 @@ test('a reset() during in-flight session establishment is not clobbered by the s
   // newer generation has since taken over.
   assert.equal(getState().session, null);
   assert.equal(getState(), stateAfterReset);
+});
+
+test('failed session establishment clears the shared promise for a retry', async () => {
+  setEstablishSession(async () => {
+    throw new Error('temporary attestation failure');
+  });
+  await assert.rejects(ensureSession(), /temporary attestation failure/u);
+  assert.equal(getState().sessionPromise, null);
+
+  setEstablishSession(async () => ({ id: 'session-b', createdAt: Date.now() }));
+  assert.equal((await ensureSession()).id, 'session-b');
+});
+
+async function installFakeSession() {
+  const session = {
+    id: new Uint8Array(16).fill(7),
+    material: await deriveMaterial(
+      new Uint8Array(32).fill(8),
+      new Uint8Array(32).fill(9)
+    ),
+    sequences: new SequenceTracker(),
+    createdAt: Date.now(),
+    attestation: { verified: true, pcrs: {}, moduleId: 'test-module' }
+  };
+  setEstablishSession(async () => session);
+  await ensureSession();
+  return session;
+}
+
+async function validProtocolResponse(options, session, applicationStatus = 200) {
+  const requestEnvelope = decodeEnvelope(new Uint8Array(options.body));
+  const plaintext = encodeCBOR({
+    status: applicationStatus,
+    headers: { 'content-type': 'text/plain' },
+    body: null,
+    error: applicationStatus >= 400 ? 'application rejected' : null
+  });
+  const ciphertext = await seal(
+    session.material,
+    Direction.SERVER_TO_CLIENT,
+    MessageType.APPLICATION,
+    session.id,
+    requestEnvelope.sequenceValue,
+    plaintext
+  );
+  return new Response(
+    encodeEnvelope(session.id, requestEnvelope.sequenceValue, ciphertext),
+    { status: 200, headers: { 'Content-Type': 'application/cbor' } }
+  );
+}
+
+test('a transient request failure does not poison a concurrent sibling', async () => {
+  const session = await installFakeSession();
+  let calls = 0;
+  let rejectFirst;
+  const firstFetch = new Promise((_, reject) => { rejectFirst = reject; });
+  globalThis.fetch = async (url, options) => {
+    calls += 1;
+    if (calls === 1) return firstFetch;
+    const response = await validProtocolResponse(options, session);
+    rejectFirst(new TypeError('transient network failure'));
+    return response;
+  };
+
+  const [failed, succeeded] = await Promise.all([
+    handleProtectedRequest(new Request('https://example.test/first')),
+    handleProtectedRequest(new Request('https://example.test/second'))
+  ]);
+
+  assert.equal(failed.status, 502);
+  assert.equal(succeeded.status, 200);
+  assert.equal(getState().session, session);
+  assert.equal(await session.sequences.allocate(), 3n);
+});
+
+test('retiring a failed oldest request unblocks the 64-entry request window', async () => {
+  const session = await installFakeSession();
+  let rejectFirst;
+  const firstFetch = new Promise((_, reject) => { rejectFirst = reject; });
+  globalThis.fetch = async (url, options) => {
+    const sequence = decodeEnvelope(new Uint8Array(options.body)).sequenceValue;
+    if (sequence === 1n) return firstFetch;
+    const response = await validProtocolResponse(options, session);
+    if (sequence === 64n) {
+      queueMicrotask(() => rejectFirst(new TypeError('oldest request failed')));
+    }
+    return response;
+  };
+
+  const responses = await Promise.all(
+    Array.from(
+      { length: 65 },
+      (_, index) => handleProtectedRequest(
+        new Request(`https://example.test/request-${index + 1}`)
+      )
+    )
+  );
+
+  assert.equal(responses.filter(response => response.status === 502).length, 1);
+  assert.equal(responses.filter(response => response.status === 200).length, 64);
+  assert.equal(getState().session, session);
+  assert.equal(await session.sequences.allocate(), 66n);
+});
+
+test('a hung protected fetch times out without resetting the session', async () => {
+  const session = await installFakeSession();
+  configure({ requestTimeoutMs: 1000 });
+  globalThis.fetch = () => new Promise(() => {});
+
+  const response = await handleProtectedRequest(
+    new Request('https://example.test/hung')
+  );
+
+  assert.equal(response.status, 504);
+  assert.equal(getState().session, session);
+  assert.equal(await session.sequences.allocate(), 2n);
+});
+
+test('outer 500 is request-local but invalid-session 401 resets the session', async () => {
+  const session = await installFakeSession();
+  globalThis.fetch = async () => new Response(null, { status: 500 });
+  const transient = await handleProtectedRequest(
+    new Request('https://example.test/transient')
+  );
+
+  assert.equal(transient.status, 502);
+  assert.equal(getState().session, session);
+
+  globalThis.fetch = async () => new Response(null, { status: 401 });
+  const fatal = await handleProtectedRequest(
+    new Request('https://example.test/invalid-session')
+  );
+
+  assert.equal(fatal.status, 502);
+  assert.equal(getState().session, null);
+  assert.throws(
+    () => session.sequences.accept(2n, 2n),
+    /v2 request rejected \(401\)/u
+  );
+});
+
+test('an encrypted application 401 does not reset the secure session', async () => {
+  const session = await installFakeSession();
+  globalThis.fetch = (url, options) => validProtocolResponse(options, session, 401);
+
+  const response = await handleProtectedRequest(
+    new Request('https://example.test/application-unauthorized')
+  );
+
+  assert.equal(response.status, 401);
+  assert.equal(getState().session, session);
+});
+
+test('an invalid protected response resets the secure session', async () => {
+  const session = await installFakeSession();
+  globalThis.fetch = async () => new Response(new Uint8Array([0]), { status: 200 });
+
+  const response = await handleProtectedRequest(
+    new Request('https://example.test/invalid-response')
+  );
+
+  assert.equal(response.status, 502);
+  assert.equal(getState().session, null);
+  assert.throws(
+    () => session.sequences.accept(1n, 1n),
+    /unsupported envelope version/u
+  );
 });

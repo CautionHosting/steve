@@ -9,7 +9,7 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Request, State},
-    http::{HeaderMap, Method, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -148,6 +148,8 @@ fn build_router_with_components_and_store(
     protected_upstream: Arc<dyn ProtectedUpstream>,
     sessions: Arc<SessionStore>,
 ) -> Result<Router, BoxError> {
+    let cors = config.cors_origins.as_deref().map(cors_layer).transpose()?;
+
     let cleanup_sessions = Arc::clone(&sessions);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
@@ -166,38 +168,61 @@ fn build_router_with_components_and_store(
         protected_upstream,
     });
 
-    let app = Router::new()
-        .route("/e2p/v2/session", post(create_session))
-        .route("/e2p/v2/confirm", post(confirm_session))
-        .route("/e2p/v2/request", post(protected_request))
+    let mut e2p = Router::new()
+        .route("/v2/session", post(create_session))
+        .route("/v2/confirm", post(confirm_session))
+        .route("/v2/request", post(protected_request))
+        .fallback(e2p_not_found);
+    if let Some(cors) = cors {
+        e2p = e2p.layer(cors);
+    }
+
+    Ok(Router::new()
+        .nest("/e2p", e2p)
         .fallback(fallback)
         .layer(DefaultBodyLimit::max(MAX_ENVELOPE_BYTES))
-        .with_state(state);
+        .with_state(state))
+}
 
-    if let Some(origins) = config.cors_origins {
-        let allow_origin = if origins.trim() == "*" {
-            AllowOrigin::any()
-        } else {
-            let values = origins
-                .split(',')
-                .map(str::trim)
-                .filter(|origin| !origin.is_empty())
-                .map(str::parse)
-                .collect::<Result<Vec<_>, _>>()?;
-            if values.is_empty() {
-                return Err("STEVE_CORS_ORIGINS contains no origins".into());
-            }
-            AllowOrigin::list(values)
-        };
-        Ok(app.layer(
-            CorsLayer::new()
-                .allow_origin(allow_origin)
-                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                .allow_headers([header::CONTENT_TYPE]),
-        ))
-    } else {
-        Ok(app)
+fn cors_layer(origins: &str) -> Result<CorsLayer, BoxError> {
+    let configured = origins.split(',').map(str::trim).collect::<Vec<_>>();
+    if configured.iter().any(|origin| origin.is_empty()) {
+        return Err("STEVE_CORS_ORIGINS contains an empty origin entry".into());
     }
+
+    let allow_origin = if configured.contains(&"*") {
+        if configured.len() != 1 {
+            return Err("STEVE_CORS_ORIGINS cannot mix '*' with explicit origins".into());
+        }
+        AllowOrigin::any()
+    } else {
+        let mut values = Vec::with_capacity(configured.len());
+        for configured_origin in configured {
+            let origin = url::Url::parse(configured_origin)
+                .map_err(|_| format!("invalid CORS origin: {configured_origin}"))?;
+            if !matches!(origin.scheme(), "http" | "https")
+                || origin.host().is_none()
+                || !origin.username().is_empty()
+                || origin.password().is_some()
+                || origin.path() != "/"
+                || origin.query().is_some()
+                || origin.fragment().is_some()
+            {
+                return Err(format!("invalid CORS origin: {configured_origin}").into());
+            }
+            let value = HeaderValue::from_str(&origin.origin().ascii_serialization())
+                .map_err(|_| format!("invalid CORS origin: {configured_origin}"))?;
+            if !values.contains(&value) {
+                values.push(value);
+            }
+        }
+        AllowOrigin::list(values)
+    };
+
+    Ok(CorsLayer::new()
+        .allow_origin(allow_origin)
+        .allow_methods([Method::POST])
+        .allow_headers([header::CONTENT_TYPE]))
 }
 
 fn enclave_http_client() -> Result<Client, reqwest::Error> {
@@ -410,6 +435,10 @@ async fn fallback(State(state): State<Arc<AppState>>, request: Request) -> Respo
         return (StatusCode::NOT_FOUND, "E2P endpoint unavailable").into_response();
     }
     forward_unencrypted(&state, request).await
+}
+
+async fn e2p_not_found() -> Response {
+    (StatusCode::NOT_FOUND, "E2P endpoint unavailable").into_response()
 }
 
 // Item 3 (fail-closed enforcement) is intentionally deferred. Until then, requests that are not
@@ -818,7 +847,7 @@ mod tests {
         assert!(fake.last_call().is_none());
     }
 
-    fn test_router(cors_origins: Option<String>) -> Router {
+    fn try_test_router(cors_origins: Option<String>) -> Result<Router, BoxError> {
         build_router_with_components(
             ServerConfig {
                 listen_addr: "127.0.0.1:0".to_string(),
@@ -830,33 +859,184 @@ mod tests {
                 executions: Arc::new(AtomicUsize::new(0)),
             }),
         )
-        .unwrap()
+    }
+
+    fn test_router(cors_origins: Option<String>) -> Router {
+        try_test_router(cors_origins).unwrap()
     }
 
     #[tokio::test]
-    async fn cors_preflight_allows_get() {
+    async fn cors_is_scoped_to_v2_post_endpoints() {
         let app = test_router(Some("https://app.example".to_string()));
+        for endpoint in ["/e2p/v2/session", "/e2p/v2/confirm", "/e2p/v2/request"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::OPTIONS)
+                        .uri(endpoint)
+                        .header(header::ORIGIN, "https://app.example")
+                        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                Some(&HeaderValue::from_static("https://app.example"))
+            );
+            assert_eq!(
+                response.headers().get(header::ACCESS_CONTROL_ALLOW_METHODS),
+                Some(&HeaderValue::from_static("POST"))
+            );
+            assert_eq!(
+                response.headers().get(header::ACCESS_CONTROL_ALLOW_HEADERS),
+                Some(&HeaderValue::from_static("content-type"))
+            );
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .header(header::ORIGIN, "https://app.example")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                Some(&HeaderValue::from_static("https://app.example"))
+            );
+        }
+
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::OPTIONS)
                     .uri("/data")
                     .header(header::ORIGIN, "https://app.example")
-                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let allow_methods = response
-            .headers()
-            .get(header::ACCESS_CONTROL_ALLOW_METHODS)
-            .expect("preflight should include allow-methods")
-            .to_str()
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/e2p/v2/session")
+                    .header(header::ORIGIN, "https://other.example")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
             .unwrap();
-        assert!(allow_methods.contains("GET"), "got {allow_methods}");
-        assert!(allow_methods.contains("POST"), "got {allow_methods}");
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_upstream_cors_headers_are_preserved() {
+        let upstream = Router::new().route(
+            "/data",
+            axum::routing::get(|| async {
+                (
+                    [(
+                        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                        "https://upstream.example",
+                    )],
+                    "ok",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let app = build_router_with_components(
+            ServerConfig {
+                listen_addr: "127.0.0.1:0".to_string(),
+                upstream_url: url::Url::parse(&format!("http://{address}")).unwrap(),
+                cors_origins: Some("https://app.example".to_string()),
+            },
+            Arc::new(FakeAttestationProvider::default()),
+            Arc::new(CountingUpstream {
+                executions: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/data")
+                    .header(header::ORIGIN, "https://app.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("https://upstream.example"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_origin_configuration_is_strict() {
+        let trailing_comma_error =
+            try_test_router(Some("https://app.example,".to_string())).unwrap_err();
+        assert_eq!(
+            trailing_comma_error.to_string(),
+            "STEVE_CORS_ORIGINS contains an empty origin entry"
+        );
+
+        for invalid in [
+            "",
+            " ",
+            "*,https://app.example",
+            "https://app.example/path",
+            "https://user@app.example",
+            "ftp://app.example",
+            "null",
+        ] {
+            assert!(
+                try_test_router(Some(invalid.to_string())).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+
+        assert!(
+            try_test_router(Some(
+                "https://app.example/, http://localhost:3000, https://app.example".to_string()
+            ))
+            .is_ok()
+        );
+        assert!(try_test_router(Some("*".to_string())).is_ok());
     }
 
     #[tokio::test]

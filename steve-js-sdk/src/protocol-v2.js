@@ -48,6 +48,15 @@ export class SequenceTracker {
     this.wakeWaiters();
   }
 
+  retire(sequence) {
+    if (this.closedError) return false;
+    if (!this.pending.delete(sequence)) {
+      throw new Error('unexpected v2 retired sequence');
+    }
+    this.wakeWaiters();
+    return true;
+  }
+
   close(error = new Error('session sequence tracker closed')) {
     if (this.closedError) return;
     this.closedError = error instanceof Error ? error : new Error(String(error));
