@@ -391,4 +391,47 @@ mod tests {
             Err(SessionError::Replay)
         );
     }
+
+    #[test]
+    fn confirm_rejects_a_transcript_hash_mismatch() {
+        // Correct shared secret, but the sealed payload is not the session's
+        // transcript hash: a client that saw a different handshake transcript
+        // (e.g. a tampered server public key) must not be able to confirm.
+        let session = session();
+        let client_secrets = derive_secrets(&[3u8; 32], &[4u8; 32]).unwrap();
+        let ciphertext = client_secrets
+            .seal(
+                Direction::ClientToServer,
+                MessageType::Confirmation,
+                session.id(),
+                0,
+                &[9u8; 32],
+            )
+            .unwrap();
+        assert_eq!(
+            session.confirm(0, &ciphertext),
+            Err(SessionError::ConfirmationMismatch)
+        );
+    }
+
+    #[test]
+    fn confirm_rejects_confirmation_sealed_with_the_wrong_secrets() {
+        // A client that never derived the shared secret cannot confirm, even
+        // with the correct transcript hash as plaintext.
+        let session = session();
+        let wrong_secrets = derive_secrets(&[9u8; 32], &[9u8; 32]).unwrap();
+        let ciphertext = wrong_secrets
+            .seal(
+                Direction::ClientToServer,
+                MessageType::Confirmation,
+                session.id(),
+                0,
+                &[2u8; 32],
+            )
+            .unwrap();
+        assert_eq!(
+            session.confirm(0, &ciphertext),
+            Err(SessionError::Authentication)
+        );
+    }
 }
