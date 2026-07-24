@@ -1,5 +1,5 @@
-import { verify } from 'tee-attestation-js/nitro';
 import { encode as encodeCBOR, decode as decodeCBOR } from 'tee-attestation-js/lib/cbor';
+import { verifyAttestation } from './attestation-verifier.js';
 import {
   CONFIRM_ENDPOINT,
   Direction,
@@ -30,6 +30,8 @@ const MAX_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 const SESSION_ESTABLISH_TIMEOUT_MS = 10 * 1000;
 const SESSION_FATAL_HTTP_STATUSES = new Set([400, 401, 409, 425]);
 const REQUEST_LOCAL_HTTP_STATUSES = new Set([403, 404, 408, 429]);
+const CONFIG_CACHE_NAME = 'steve-sdk-config-v1';
+const CONFIG_CACHE_PATH = '.steve-sdk/config-v1';
 
 function defaultConfig() {
   return {
@@ -42,22 +44,23 @@ function defaultConfig() {
 }
 
 let config = defaultConfig();
+let configRestoreError = null;
+let configReady = initializeConfig();
 
 let state = freshState();
 
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', event => event.waitUntil(clients.claim()));
-self.addEventListener('message', event => handleMessage(event));
+self.addEventListener('message', event => event.waitUntil(handleMessage(event)));
 self.addEventListener('fetch', event => {
-  const url = new URL(event.request.url);
-  if (!shouldProtectUrl(url)) return;
-  event.respondWith(handleProtectedRequest(event.request));
+  event.respondWith(routeRequest(event.request));
 });
 
 async function handleMessage(event) {
   const { type } = event.data;
   const port = event.ports[0];
   try {
+    await configReady;
     switch (type) {
       case 'get-status':
         port?.postMessage(statusMessage());
@@ -74,16 +77,24 @@ async function handleMessage(event) {
         resetState();
         port?.postMessage({ type: 'reset', success: true });
         break;
-      case 'configure':
-        configure(event.data.config || {});
+      case 'configure': {
+        await configureAndPersist(event.data.config || {});
         port?.postMessage({ type: 'configured', success: true, config });
         break;
+      }
       default:
         throw new Error('unknown service-worker command');
     }
   } catch (error) {
     port?.postMessage({ type, success: false, error: publicError(error) });
   }
+}
+
+async function routeRequest(request) {
+  await configReady;
+  const url = new URL(request.url);
+  if (!shouldProtectUrl(url)) return fetch(request);
+  return handleProtectedRequest(request);
 }
 
 async function handleProtectedRequest(request) {
@@ -293,7 +304,10 @@ async function establishSessionWithinDeadline(signal) {
   throwIfAborted(signal);
 
   notifyClients('status', { stage: 'verifying-session-attestation' });
-  const attestation = await verify(sessionResponse.attestation_document, { nonce: clientNonce });
+  const attestation = await verifyAttestation(
+    sessionResponse.attestation_document,
+    { nonce: clientNonce }
+  );
   throwIfAborted(signal);
   validateAttestationResult(
     attestation,
@@ -502,12 +516,61 @@ function configure(update) {
   if ('enclaveOrigin' in update) {
     next.enclaveOrigin = normalizeEnclaveOrigin(update.enclaveOrigin);
   }
+  next.passthroughPaths = [
+    ...new Set([...DEFAULT_BOOTSTRAP_PATHS, ...next.passthroughPaths])
+  ];
   next.excludePrefixes = [
     ...new Set([...PROTOCOL_EXCLUDE_PREFIXES, ...next.excludePrefixes])
   ];
   const enclaveChanged = next.enclaveOrigin !== config.enclaveOrigin;
   if (enclaveChanged) resetState();
   config = next;
+}
+
+async function initializeConfig() {
+  try {
+    await restoreConfig();
+    configRestoreError = null;
+  } catch (error) {
+    configRestoreError = publicError(error);
+  }
+}
+
+async function configureAndPersist(update) {
+  const previous = config;
+  configure(update);
+  try {
+    await persistConfig();
+    configRestoreError = null;
+  } catch (error) {
+    config = previous;
+    throw error;
+  }
+}
+
+function configCacheKey() {
+  if (typeof self.registration?.scope !== 'string') {
+    throw new Error('service worker scope unavailable');
+  }
+  return new URL(CONFIG_CACHE_PATH, self.registration.scope).href;
+}
+
+async function restoreConfig() {
+  if (!self.caches) return;
+  const cache = await self.caches.open(CONFIG_CACHE_NAME);
+  const response = await cache.match(configCacheKey());
+  if (response) configure(await response.json());
+}
+
+async function persistConfig() {
+  if (!self.caches) return;
+  const cache = await self.caches.open(CONFIG_CACHE_NAME);
+  await cache.put(
+    configCacheKey(),
+    new Response(JSON.stringify(config), {
+      headers: { 'Content-Type': 'application/json' }
+    })
+  );
 }
 
 function normalizeEnclaveOrigin(value) {
@@ -602,8 +665,14 @@ self.__ENCLAVE_SW_TEST__ = {
   ProtocolTimeoutError,
   ProtocolTransportError,
   isRequestLocalFailure,
+  configureAndPersist,
+  configCacheKey,
+  initializeConfig,
+  persistConfig,
+  restoreConfig,
   resolveProtocolUrl,
   shouldProtectUrl,
+  getConfigRestoreError: () => configRestoreError,
   getState: () => state,
   getConfig: () => config,
   resetConfig: () => { config = defaultConfig(); },

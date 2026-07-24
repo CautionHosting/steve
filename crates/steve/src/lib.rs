@@ -1,4 +1,6 @@
 pub mod attestation;
+#[cfg(feature = "eval-attestation")]
+pub mod eval_attestation;
 pub mod protocol;
 pub mod sessions;
 

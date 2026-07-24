@@ -127,3 +127,39 @@ automatically retry timed-out requests because the upstream operation may
 already have executed.
 
 The native Rust SDK does not yet implement the v2 client flow.
+
+## Local E2E
+
+The Docker harness runs the real browser SDK, STEVE protocol implementation,
+and a test upstream using pinned StageX `linux/amd64` images. It uses signed
+synthetic Nitro-shaped evidence rooted in public test keys; it validates the
+protocol and attestation bindings, not Nitro hardware authenticity or isolation.
+
+```bash
+npm --prefix steve-js-sdk install
+./scripts/test-e2e.sh
+```
+
+On macOS the test uses installed Google Chrome. Elsewhere, install Playwright
+Chromium once with `npm --prefix steve-js-sdk exec playwright install chromium`.
+To run the same suite with Playwright Firefox:
+
+```bash
+npm --prefix steve-js-sdk exec playwright install firefox
+STEVE_E2E_BROWSER=firefox ./scripts/test-e2e.sh
+```
+
+For the manual demo:
+
+```bash
+./scripts/test-e2e.sh up
+# Open http://127.0.0.1:3000
+./scripts/test-e2e.sh logs
+./scripts/test-e2e.sh down
+```
+
+Production exclusion checks are a separate packaging gate:
+
+```bash
+./scripts/test-production-exclusions.sh
+```

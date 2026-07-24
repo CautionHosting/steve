@@ -1,1 +1,8 @@
 Containerfile
+.git
+.omx
+target
+steve-js-sdk/node_modules
+steve-js-sdk/test-results
+tests/e2e/public/generated
+tests/e2e/test-results

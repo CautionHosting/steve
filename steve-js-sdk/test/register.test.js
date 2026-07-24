@@ -2,18 +2,31 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 const serviceWorker = {
-  addEventListener: () => {},
-  controller: null
+  listeners: new Map(),
+  addEventListener(type, listener) {
+    if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+    this.listeners.get(type).add(listener);
+  },
+  removeEventListener(type, listener) {
+    this.listeners.get(type)?.delete(listener);
+  },
+  dispatch(type) {
+    for (const listener of this.listeners.get(type) || []) listener();
+  },
+  controller: null,
+  register: null
 };
 Object.defineProperty(globalThis, 'navigator', {
   value: { serviceWorker },
   configurable: true
 });
 
-const { EnclaveClient } = await import('../src/register.js');
+const { EnclaveClient, registerEnclaveServiceWorker } = await import('../src/register.js');
 
 test.afterEach(() => {
   serviceWorker.controller = null;
+  serviceWorker.register = null;
+  serviceWorker.listeners.clear();
 });
 
 test('sendMessage supports a bounded caller-selected timeout', async () => {
@@ -24,6 +37,47 @@ test('sendMessage supports a bounded caller-selected timeout', async () => {
     client.sendMessage('never-replies', {}, 10),
     /Message timeout/u
   );
+});
+
+test('sendMessage fails immediately when the page is not controlled', async () => {
+  const client = new EnclaveClient({});
+  await assert.rejects(client.getStatus(), /does not control this page/u);
+});
+
+test('registration configures the newly activated controller, not its predecessor', async () => {
+  const oldController = {
+    messages: [],
+    postMessage(message, ports) {
+      this.messages.push(message);
+      ports[0].postMessage({ type: message.type, success: true });
+    }
+  };
+  const newController = {
+    state: 'activated',
+    messages: [],
+    postMessage(message, ports) {
+      this.messages.push(message);
+      ports[0].postMessage({ type: message.type, success: true });
+    }
+  };
+  const registration = { active: newController, installing: null, waiting: null };
+  serviceWorker.controller = oldController;
+  serviceWorker.register = async () => registration;
+
+  const registrationPromise = registerEnclaveServiceWorker({
+    config: { enclaveOrigin: 'https://enclave.example' }
+  });
+  queueMicrotask(() => {
+    serviceWorker.controller = newController;
+    serviceWorker.dispatch('controllerchange');
+  });
+
+  await registrationPromise;
+  assert.deepEqual(oldController.messages, []);
+  assert.deepEqual(newController.messages, [{
+    type: 'configure',
+    config: { enclaveOrigin: 'https://enclave.example' }
+  }]);
 });
 
 test('initialize clears its message timer after the worker replies', async () => {

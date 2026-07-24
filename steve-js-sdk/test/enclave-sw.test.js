@@ -14,10 +14,26 @@ import {
 // enclave-sw.js is a service-worker script: it calls self.addEventListener()
 // at module top-level. Stub the minimal SW globals it needs before import so
 // those calls are no-ops instead of throwing in Node.
+const cachedResponses = new Map();
+let cacheOpenError = null;
 globalThis.self = {
   addEventListener: () => {},
   location: { origin: 'https://example.test' },
-  clients: { matchAll: async () => [] }
+  registration: { scope: 'https://example.test/' },
+  clients: { matchAll: async () => [] },
+  caches: {
+    async open() {
+      if (cacheOpenError) throw cacheOpenError;
+      return {
+        async match(key) {
+          return cachedResponses.get(key)?.clone();
+        },
+        async put(key, response) {
+          cachedResponses.set(key, response.clone());
+        }
+      };
+    }
+  }
 };
 
 await import('../src/enclave-sw.js');
@@ -26,15 +42,21 @@ const { configure, hasValidSession, resetState, ensureSession, getState, getConf
   handleProtectedRequest, withDeadline, ProtocolHttpError, ProtocolTimeoutError,
   ProtocolTransportError,
   isRequestLocalFailure,
+  configureAndPersist, configCacheKey, getConfigRestoreError, initializeConfig,
+  persistConfig, restoreConfig,
   setEstablishSession, resetEstablishSession } = globalThis.self.__ENCLAVE_SW_TEST__;
 
 const ROTATION_INTERVAL_MS = 25 * 60 * 1000;
 const originalFetch = globalThis.fetch;
 
-test.afterEach(() => {
+test.afterEach(async () => {
   resetState();
   resetConfig();
   resetEstablishSession();
+  cacheOpenError = null;
+  globalThis.self.registration.scope = 'https://example.test/';
+  cachedResponses.clear();
+  await initializeConfig();
   globalThis.fetch = originalFetch;
 });
 
@@ -51,6 +73,17 @@ test('configure() de-duplicates the forced prefix across repeated calls', () => 
   const excludePrefixes = getConfig().excludePrefixes;
   assert.equal(excludePrefixes.filter(p => p === '/e2p/').length, 1);
   assert.ok(excludePrefixes.includes('/bar'));
+});
+
+test('configure() cannot drop capture-proof bootstrap paths', () => {
+  configure({ passthroughPaths: ['/custom-bootstrap.js'] });
+  const passthroughPaths = getConfig().passthroughPaths;
+
+  for (const path of ['/', '/enclave-sw.js', '/register.js', '/attestation-widget.js']) {
+    assert.ok(passthroughPaths.includes(path), `${path} must remain passthrough`);
+    assert.equal(shouldProtectUrl(`https://example.test${path}`), false);
+  }
+  assert.ok(passthroughPaths.includes('/custom-bootstrap.js'));
 });
 
 test('same-origin interception remains the default', () => {
@@ -70,6 +103,59 @@ test('cross-origin enclave configuration protects only the enclave origin', () =
   assert.equal(shouldProtectUrl('https://secure.example/attestation'), false);
   assert.equal(shouldProtectUrl('https://example.test/data'), false);
   assert.equal(shouldProtectUrl('https://other.test/data'), false);
+});
+
+test('configuration survives a service-worker global restart', async () => {
+  configure({
+    enclaveOrigin: 'https://secure.example',
+    requestTimeoutMs: 1234
+  });
+  await persistConfig();
+
+  resetConfig();
+  await restoreConfig();
+
+  assert.equal(getConfig().enclaveOrigin, 'https://secure.example');
+  assert.equal(getConfig().requestTimeoutMs, 1234);
+});
+
+test('configuration cache entries are isolated by service-worker scope', async () => {
+  globalThis.self.registration.scope = 'https://example.test/app-a/';
+  await configureAndPersist({ enclaveOrigin: 'https://enclave-a.example' });
+  const appAKey = configCacheKey();
+
+  globalThis.self.registration.scope = 'https://example.test/app-b/';
+  await configureAndPersist({ enclaveOrigin: 'https://enclave-b.example' });
+  const appBKey = configCacheKey();
+
+  assert.notEqual(appAKey, appBKey);
+
+  resetConfig();
+  globalThis.self.registration.scope = 'https://example.test/app-a/';
+  await restoreConfig();
+  assert.equal(getConfig().enclaveOrigin, 'https://enclave-a.example');
+
+  resetConfig();
+  globalThis.self.registration.scope = 'https://example.test/app-b/';
+  await restoreConfig();
+  assert.equal(getConfig().enclaveOrigin, 'https://enclave-b.example');
+});
+
+test('a failed config restore leaves bootstrap available and can be repaired', async () => {
+  cacheOpenError = new Error('config storage unavailable');
+  await initializeConfig();
+
+  assert.match(getConfigRestoreError(), /config storage unavailable/u);
+  assert.equal(shouldProtectUrl('https://example.test/register.js'), false);
+  assert.equal(shouldProtectUrl('https://example.test/application-data'), true);
+
+  cacheOpenError = null;
+  await configureAndPersist({ enclaveOrigin: 'https://secure.example' });
+
+  assert.equal(getConfigRestoreError(), null);
+  resetConfig();
+  await initializeConfig();
+  assert.equal(getConfig().enclaveOrigin, 'https://secure.example');
 });
 
 test('enclaveOrigin must be an absolute HTTP(S) origin', () => {

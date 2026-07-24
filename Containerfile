@@ -1,7 +1,8 @@
 FROM stagex/pallet-rust@sha256:9c38bf1066dd9ad1b6a6b584974dd798c2bf798985bf82e58024fbe0515592ca AS builder
 
-COPY . /app
 WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
 
 ENV RUSTFLAGS="-C target-feature=+crt-static"
 ENV CARGO_TARGET_DIR=/tmp/cargo-target

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>STEVE local E2E</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body {
+        background: #090b0f;
+        color: #e7eaf0;
+        font: 15px/1.45 system-ui, sans-serif;
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 2.5rem 1.5rem;
+      }
+      h1 { margin: 0 0 1.25rem; font-size: clamp(2rem, 5vw, 3.5rem); }
+      button {
+        background: #1b2029;
+        color: #eef1f6;
+        border: 1px solid #3a4352;
+        border-radius: .4rem;
+        margin: 0 .45rem .55rem 0;
+        padding: .55rem .75rem;
+        cursor: pointer;
+      }
+      button:hover { background: #252c37; }
+      button:disabled { cursor: wait; opacity: .55; }
+      pre {
+        background: #030405;
+        color: #c8facc;
+        border: 1px solid #242a32;
+        border-radius: .45rem;
+        height: min(62vh, 680px);
+        min-height: 420px;
+        margin: 1rem 0 0;
+        padding: 1rem;
+        overflow: auto;
+        white-space: pre-wrap;
+        font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      .warning { color: #ff8b8b; font-weight: 650; }
+      .system-status {
+        display: inline-block;
+        margin: 0 0 1rem;
+        padding: .35rem .6rem;
+        border: 1px solid #596272;
+        border-radius: 999px;
+        color: #c9d0da;
+      }
+      .system-status[data-state="ready"] { border-color: #b28a43; color: #ffd68a; }
+      .system-status[data-state="success"] { border-color: #397b4a; color: #8fecaa; }
+      .system-status[data-state="failure"] { border-color: #9d4040; color: #ff9696; }
+    </style>
+  </head>
+  <body>
+    <h1>STEVE local E2E</h1>
+    <p class="warning">Synthetic test-root attestation. This is not an enclave.</p>
+    <p id="system-status" class="system-status" data-state="loading">Starting service worker…</p>
+    <p>
+      <button data-action="initialize" disabled>Initialize</button>
+      <button data-action="echo" disabled>Encrypted echo</button>
+      <button data-action="unauthorized" disabled>Application 401</button>
+      <button data-action="timeout" disabled>Timeout</button>
+      <button data-action="concurrency" disabled>65 concurrent</button>
+      <button data-action="status" disabled>Status</button>
+    </p>
+    <pre id="output">Starting service worker…</pre>
+    <script type="module" src="/attestation-widget.js"></script>
+  </body>
+</html>

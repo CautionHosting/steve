@@ -1,2 +1,7 @@
 /target
 /steve-js-sdk/node_modules
+/tests/e2e/public/generated
+/tests/e2e/public/enclave-sw.js
+/tests/e2e/public/register.js
+/tests/e2e/test-results
+/steve-js-sdk/test-results
