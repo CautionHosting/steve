@@ -95,7 +95,7 @@ Current limitations:
 import { registerEnclaveServiceWorker } from 'steve-js-sdk';
 
 const client = await registerEnclaveServiceWorker();
-await client.initialize();
+await client.initialize(); // Optional eager establishment
 
 // Same-origin fetch() calls are now transparently E2E encrypted
 const response = await fetch('/api/secret');
@@ -111,10 +111,24 @@ const client = await registerEnclaveServiceWorker({
     requestTimeoutMs: 30000
   }
 });
-await client.initialize();
+await client.initialize(); // Optional eager establishment
 
 const response = await fetch('https://secure.example/api/secret');
 ```
+
+`initialize()` eagerly establishes the session and is recommended when the
+application wants attestation failures before its first protected request. It
+is idempotent and optional: the first protected request establishes a session
+when needed. If the browser restarts the service worker and its in-memory
+session is lost, the next protected request establishes a fresh session.
+
+`client.getStatus()` reports the worker lifecycle and safe session diagnostics:
+the protocol and key-establishment suite, KDF and record protection, base64url
+session ID and transcript hash, establishment trigger and rotation time, and
+attestation checks. PCRs are reported evidence only; v2 does not yet compare
+them with an independently supplied expected-PCR policy. Status never includes
+private keys, shared secrets, derived traffic keys, binders, nonces, or
+application plaintext.
 
 Set `STEVE_CORS_ORIGINS` to the browser application's origin (for example,
 `http://localhost:3000`). STEVE applies that policy only to `/e2p/v2/*`;
@@ -157,6 +171,11 @@ For the manual demo:
 ./scripts/test-e2e.sh logs
 ./scripts/test-e2e.sh down
 ```
+
+The demo accepts an application request body and shows the exact encrypted
+request/response envelopes alongside the plaintext visible to the browser
+before encryption and after decryption. Wire capture is enabled only by the
+demo; the SDK defaults it off.
 
 Production exclusion checks are a separate packaging gate:
 

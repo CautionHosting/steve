@@ -452,6 +452,11 @@ async function verifyCOSESignature(protectedHeader, payload, signature, signingC
 }
 
 // src/attestation-verifier.js
+var ATTESTATION_PROFILE = Object.freeze({
+  id: "aws-nitro",
+  trustAnchor: "AWS Nitro root CA",
+  synthetic: false
+});
 function verifyAttestation(document, options) {
   return verify(document, options);
 }
@@ -459,6 +464,9 @@ function verifyAttestation(document, options) {
 // src/protocol-v2.js
 var VERSION = 2;
 var PROTOCOL_ID = "STEVE-E2P-V2";
+var KEY_ESTABLISHMENT_SUITE = "X25519";
+var KEY_DERIVATION = "HKDF-SHA256";
+var RECORD_PROTECTION = "AES-256-GCM";
 var SESSION_ENDPOINT = "/e2p/v2/session";
 var CONFIRM_ENDPOINT = "/e2p/v2/confirm";
 var REQUEST_ENDPOINT = "/e2p/v2/request";
@@ -685,6 +693,11 @@ function validateAttestationResult(result, sessionId, transcriptHash, binder) {
   }
   verifyBinding(result.userData, sessionId, transcriptHash, binder);
 }
+function encodeBase64Url(bytes) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+}
 function decodeBase64Url(value) {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]*$/u.test(value)) {
     throw new Error("invalid base64url value in attestation");
@@ -740,7 +753,7 @@ async function handleMessage(event) {
         port?.postMessage(statusMessage());
         break;
       case "initialize":
-        await ensureSession();
+        await ensureSession("explicit-initialize");
         port?.postMessage({ type: "initialized", success: true });
         break;
       case "rotate-key":
@@ -799,7 +812,10 @@ async function handleProtectedRequest(request) {
         throwIfAborted(signal);
         const envelope = encodeEnvelope(session.id, sequence, ciphertext);
         if (config.emitEncryptedPayloads) {
-          notifyClients("encrypted-request", { sequence: sequence.toString(), size: envelope.length });
+          await notifyClients(
+            "encrypted-request",
+            encryptedPayloadTrace(session, sequence, envelope)
+          );
         }
         const response = await protocolFetch(REQUEST_ENDPOINT, envelope, signal);
         if (!response.ok) {
@@ -826,17 +842,17 @@ async function handleProtectedRequest(request) {
         return {
           response: new Response(body, { status: decoded.status, headers: decoded.headers || {} }),
           sequenceValue: responseEnvelope.sequenceValue,
-          responseSize: responseBytes.length
+          responseEnvelope: responseBytes
         };
       },
       "v2 request timed out"
     );
     session.sequences.accept(sequence, protectedResponse.sequenceValue);
     if (config.emitEncryptedPayloads) {
-      notifyClients("encrypted-response", {
-        sequence: sequence.toString(),
-        size: protectedResponse.responseSize
-      });
+      await notifyClients(
+        "encrypted-response",
+        encryptedPayloadTrace(session, sequence, protectedResponse.responseEnvelope)
+      );
     }
     return protectedResponse.response;
   } catch (error) {
@@ -860,58 +876,88 @@ async function handleProtectedRequest(request) {
   }
 }
 async function currentSession() {
-  const session = await ensureSession();
+  const session = await ensureSession("protected-request");
   if (Date.now() - session.createdAt >= ROTATION_INTERVAL_MS) {
     return rotateSession();
   }
   return session;
 }
 var establishSessionFn = establishSession;
-async function ensureSession() {
+async function ensureSession(trigger = "protected-request") {
   if (state.session) return state.session;
   if (!state.sessionPromise) {
     const s = state;
-    s.sessionPromise = establishSessionFn().then((session) => {
+    s.trigger = trigger;
+    s.stage = "creating-session";
+    s.sessionPromise = Promise.resolve().then(() => establishSessionFn(trigger, s)).then((session) => {
       if (state === s) {
-        state.session = session;
-        state.error = null;
+        session.trigger = trigger;
+        s.session = session;
+        s.error = null;
+        s.stage = null;
+        notifyStatus();
+        void notifyClients("initialized", {
+          ...session.attestation,
+          status: statusMessage()
+        });
       }
       return session;
     }).catch((error) => {
-      if (state === s) state.error = publicError(error);
+      if (state === s) {
+        s.error = publicError(error);
+        s.stage = null;
+      }
       throw error;
     }).finally(() => {
-      if (state === s) state.sessionPromise = null;
+      if (state === s) {
+        s.sessionPromise = null;
+        notifyStatus();
+      }
     });
+    notifyStatus();
   }
   return state.sessionPromise;
 }
 async function rotateSession() {
   if (state.rotationPromise) return state.rotationPromise;
-  notifyClients("status", { stage: "rotating-session" });
   const s = state;
-  s.rotationPromise = establishSessionFn().then((session) => {
+  s.stage = "creating-session";
+  s.rotationPromise = Promise.resolve().then(() => establishSessionFn("rotation", s));
+  notifyStatus();
+  let rotatedSession;
+  try {
+    rotatedSession = await s.rotationPromise;
     if (state === s) {
-      state.session = session;
-      state.error = null;
-      notifyClients("key-rotated", { timestamp: session.createdAt });
+      rotatedSession.trigger = "rotation";
+      s.session = rotatedSession;
+      s.error = null;
+      s.stage = null;
     }
-    return session;
-  }).finally(() => {
-    if (state === s) state.rotationPromise = null;
-  });
-  return s.rotationPromise;
+    return rotatedSession;
+  } finally {
+    if (state === s) {
+      s.rotationPromise = null;
+      s.stage = null;
+      notifyStatus();
+      if (rotatedSession) {
+        void notifyClients("key-rotated", {
+          timestamp: rotatedSession.createdAt,
+          status: statusMessage()
+        });
+      }
+    }
+  }
 }
-async function establishSession() {
+async function establishSession(_trigger, targetState) {
   return withDeadline(
     SESSION_ESTABLISH_TIMEOUT_MS,
     null,
-    (signal) => establishSessionWithinDeadline(signal),
+    (signal) => establishSessionWithinDeadline(signal, targetState),
     "session establishment timed out"
   );
 }
-async function establishSessionWithinDeadline(signal) {
-  notifyClients("status", { stage: "creating-session" });
+async function establishSessionWithinDeadline(signal, targetState) {
+  updateStage(targetState, "creating-session");
   const clientNonce = crypto.getRandomValues(new Uint8Array(32));
   const clientKeyPair = await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"]);
   throwIfAborted(signal);
@@ -952,7 +998,7 @@ async function establishSessionWithinDeadline(signal) {
   throwIfAborted(signal);
   const material = await deriveMaterial(sharedSecret, transcriptHash);
   throwIfAborted(signal);
-  notifyClients("status", { stage: "verifying-session-attestation" });
+  updateStage(targetState, "verifying-attestation");
   const attestation = await verifyAttestation(
     sessionResponse.attestation_document,
     { nonce: clientNonce }
@@ -964,6 +1010,7 @@ async function establishSessionWithinDeadline(signal) {
     transcriptHash,
     material.binder
   );
+  updateStage(targetState, "confirming-session");
   const confirmationCiphertext = await seal(
     material,
     Direction.CLIENT_TO_SERVER,
@@ -1003,13 +1050,24 @@ async function establishSessionWithinDeadline(signal) {
     material,
     sequences: new SequenceTracker(),
     createdAt: Date.now(),
+    transcriptHash,
+    confirmation: "verified",
     attestation: {
       verified: true,
+      profile: ATTESTATION_PROFILE.id,
+      trustAnchor: ATTESTATION_PROFILE.trustAnchor,
+      synthetic: ATTESTATION_PROFILE.synthetic,
       pcrs: attestation.pcrs,
-      moduleId: attestation.moduleId
+      moduleId: attestation.moduleId,
+      checks: {
+        certificateChain: "verified",
+        nonceBinding: "verified",
+        sessionBinding: "verified",
+        keyConfirmation: "verified",
+        expectedPcrPolicy: "not-checked"
+      }
     }
   };
-  notifyClients("initialized", session.attestation);
   return session;
 }
 async function protocolFetch(path, body, signal) {
@@ -1221,35 +1279,91 @@ function validatePathList(values) {
   }
 }
 function statusMessage() {
+  const session = state.session;
   return {
     type: "status",
-    initialized: Boolean(state.session),
+    state: lifecycleState(),
+    stage: state.stage,
+    initialized: Boolean(session),
     error: state.error,
-    attestation: state.session?.attestation || null,
-    lastKeyRotation: state.session?.createdAt || null,
-    protocolVersion: 2
+    protocol: {
+      id: PROTOCOL_ID,
+      version: VERSION,
+      keyEstablishment: KEY_ESTABLISHMENT_SUITE,
+      keyDerivation: KEY_DERIVATION,
+      recordProtection: RECORD_PROTECTION
+    },
+    session: session ? {
+      id: encodeDiagnosticBytes(session.id),
+      transcriptHash: encodeDiagnosticBytes(session.transcriptHash),
+      establishedAt: session.createdAt,
+      rotatesAt: session.createdAt + ROTATION_INTERVAL_MS,
+      trigger: session.trigger || null,
+      confirmation: session.confirmation || "verified"
+    } : null,
+    attestationVerifier: ATTESTATION_PROFILE,
+    attestation: session?.attestation || null,
+    lastKeyRotation: session?.createdAt || null,
+    protocolVersion: VERSION
   };
+}
+function encodeDiagnosticBytes(value) {
+  return value instanceof Uint8Array ? encodeBase64Url(value) : null;
+}
+function encryptedPayloadTrace(session, sequence, envelope) {
+  return {
+    endpoint: REQUEST_ENDPOINT,
+    sessionId: encodeDiagnosticBytes(session.id),
+    sequence: sequence.toString(),
+    size: envelope.length,
+    envelope: encodeBase64Url(envelope)
+  };
+}
+function lifecycleState() {
+  if (state.rotationPromise) return "rotating";
+  if (state.session) return "ready";
+  if (state.sessionPromise) return "establishing";
+  if (state.error) return "error";
+  return "idle";
 }
 function hasValidSession(session) {
   return Boolean(session) && Date.now() - session.createdAt < ROTATION_INTERVAL_MS;
 }
 function freshState(error = null) {
-  return { session: null, sessionPromise: null, rotationPromise: null, error };
+  return {
+    session: null,
+    sessionPromise: null,
+    rotationPromise: null,
+    error,
+    stage: null,
+    trigger: null
+  };
 }
 function resetState(error = null) {
   state.session?.sequences?.close(new Error(error || "secure channel reset"));
   state = freshState(error);
+  notifyStatus();
 }
 function publicError(error) {
   return error instanceof Error ? error.message : "secure channel error";
 }
 async function notifyClients(type, data) {
   const allClients = await self.clients.matchAll({ type: "window" });
-  for (const client of allClients) client.postMessage({ type: `enclave:${type}`, ...data });
+  for (const client of allClients) client.postMessage({ ...data, type: `enclave:${type}` });
+}
+function notifyStatus() {
+  void notifyClients("status", statusMessage());
+}
+function updateStage(targetState, stage) {
+  if (state !== targetState) return;
+  targetState.stage = stage;
+  notifyStatus();
 }
 self.__ENCLAVE_SW_TEST__ = {
   configure,
   hasValidSession,
+  lifecycleState,
+  statusMessage,
   resetState,
   ensureSession,
   rotateSession,

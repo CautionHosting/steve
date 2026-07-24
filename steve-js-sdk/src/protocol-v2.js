@@ -2,6 +2,9 @@ import { encode as encodeCBOR, decode as decodeCBOR } from 'tee-attestation-js/l
 
 export const VERSION = 2;
 export const PROTOCOL_ID = 'STEVE-E2P-V2';
+export const KEY_ESTABLISHMENT_SUITE = 'X25519';
+export const KEY_DERIVATION = 'HKDF-SHA256';
+export const RECORD_PROTECTION = 'AES-256-GCM';
 export const SESSION_ENDPOINT = '/e2p/v2/session';
 export const CONFIRM_ENDPOINT = '/e2p/v2/confirm';
 export const REQUEST_ENDPOINT = '/e2p/v2/request';

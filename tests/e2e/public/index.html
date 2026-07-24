@@ -5,68 +5,465 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>STEVE local E2E</title>
     <style>
-      :root { color-scheme: dark; }
+      :root {
+        color-scheme: dark;
+        --background: #090b0f;
+        --panel: #11151c;
+        --panel-deep: #07090d;
+        --border: #303846;
+        --muted: #98a3b3;
+        --text: #edf1f7;
+        --green: #8fecaa;
+        --amber: #ffd078;
+        --red: #ff9696;
+        --blue: #8dc5ff;
+      }
       * { box-sizing: border-box; }
       body {
-        background: #090b0f;
-        color: #e7eaf0;
+        background: var(--background);
+        color: var(--text);
         font: 15px/1.45 system-ui, sans-serif;
-        max-width: 1100px;
+        max-width: 1180px;
         margin: 0 auto;
-        padding: 2.5rem 1.5rem;
+        padding: 2rem 1.25rem 3rem;
       }
-      h1 { margin: 0 0 1.25rem; font-size: clamp(2rem, 5vw, 3.5rem); }
+      h1 { margin: 0; font-size: clamp(2rem, 5vw, 3.25rem); }
+      h2 { margin: 0 0 .8rem; font-size: 1.05rem; }
+      h3 {
+        color: var(--muted);
+        font-size: .72rem;
+        letter-spacing: .08em;
+        margin: 0 0 .75rem;
+        text-transform: uppercase;
+      }
+      code, pre {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      code { overflow-wrap: anywhere; }
+      header { margin-bottom: 1.25rem; }
+      .lede, .hint { color: var(--muted); margin: .35rem 0 0; }
+      .warning {
+        background: #251416;
+        border: 1px solid #7b3a3f;
+        border-radius: .45rem;
+        color: var(--red);
+        font-weight: 650;
+        margin: 1rem 0 0;
+        padding: .65rem .8rem;
+      }
+      .system-status {
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        display: inline-block;
+        font-weight: 650;
+        margin: 0 0 1rem;
+        padding: .4rem .7rem;
+      }
+      .system-status[data-state="idle"],
+      .system-status[data-state="establishing"],
+      .system-status[data-state="rotating"] {
+        border-color: #9a7533;
+        color: var(--amber);
+      }
+      .system-status[data-state="ready"] {
+        border-color: #397b4a;
+        color: var(--green);
+      }
+      .system-status[data-state="error"] {
+        border-color: #9d4040;
+        color: var(--red);
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: .6rem;
+        margin-top: 1rem;
+        padding: 1rem;
+      }
+      .diagnostic-grid {
+        display: grid;
+        gap: .8rem;
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      }
+      .diagnostic-card {
+        background: var(--panel-deep);
+        border: 1px solid #252c37;
+        border-radius: .45rem;
+        min-width: 0;
+        padding: .85rem;
+      }
+      dl {
+        display: grid;
+        gap: .45rem .7rem;
+        grid-template-columns: max-content minmax(0, 1fr);
+        margin: 0;
+      }
+      dt { color: var(--muted); }
+      dd { margin: 0; min-width: 0; }
+      .check-list {
+        display: grid;
+        gap: .35rem;
+        list-style: none;
+        margin: 0;
+        padding: 0;
+      }
+      .check-list li {
+        display: flex;
+        gap: .55rem;
+        justify-content: space-between;
+      }
+      .check-result { font-weight: 650; }
+      .check-result[data-result="verified"] { color: var(--green); }
+      .check-result[data-result="not-checked"] { color: var(--amber); }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: .55rem;
+      }
+      .request-composer {
+        align-items: end;
+        display: grid;
+        gap: .7rem;
+        grid-template-columns: minmax(0, 1fr) auto;
+        margin-top: .85rem;
+      }
+      .request-composer label {
+        color: var(--muted);
+        display: grid;
+        gap: .35rem;
+      }
+      textarea {
+        background: var(--panel-deep);
+        border: 1px solid #424d5f;
+        border-radius: .4rem;
+        color: var(--text);
+        font: inherit;
+        min-height: 4.5rem;
+        padding: .65rem;
+        resize: vertical;
+      }
       button {
         background: #1b2029;
-        color: #eef1f6;
-        border: 1px solid #3a4352;
+        border: 1px solid #424d5f;
         border-radius: .4rem;
-        margin: 0 .45rem .55rem 0;
-        padding: .55rem .75rem;
+        color: var(--text);
         cursor: pointer;
+        padding: .55rem .75rem;
       }
       button:hover { background: #252c37; }
-      button:disabled { cursor: wait; opacity: .55; }
-      pre {
-        background: #030405;
-        color: #c8facc;
-        border: 1px solid #242a32;
+      button:disabled { cursor: not-allowed; opacity: .45; }
+      .target {
+        color: var(--muted);
+        margin: .35rem 0 0;
+      }
+      .target code { color: var(--text); }
+      .exchange-grid {
+        display: grid;
+        gap: .7rem;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        margin-top: 1rem;
+      }
+      .exchange-step {
+        background: var(--panel-deep);
+        border: 1px solid #252c37;
         border-radius: .45rem;
-        height: min(62vh, 680px);
-        min-height: 420px;
-        margin: 1rem 0 0;
-        padding: 1rem;
-        overflow: auto;
-        white-space: pre-wrap;
-        font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        min-width: 0;
+        padding: .8rem;
       }
-      .warning { color: #ff8b8b; font-weight: 650; }
-      .system-status {
-        display: inline-block;
-        margin: 0 0 1rem;
-        padding: .35rem .6rem;
-        border: 1px solid #596272;
+      .exchange-step header {
+        align-items: baseline;
+        display: flex;
+        gap: .55rem;
+        margin: 0;
+      }
+      .step-number {
+        align-items: center;
+        border: 1px solid #424d5f;
         border-radius: 999px;
-        color: #c9d0da;
+        color: var(--blue);
+        display: inline-flex;
+        flex: 0 0 1.55rem;
+        font-size: .72rem;
+        height: 1.55rem;
+        justify-content: center;
       }
-      .system-status[data-state="ready"] { border-color: #b28a43; color: #ffd68a; }
-      .system-status[data-state="success"] { border-color: #397b4a; color: #8fecaa; }
-      .system-status[data-state="failure"] { border-color: #9d4040; color: #ff9696; }
+      .exchange-step h3 {
+        color: var(--text);
+        font-size: .82rem;
+        letter-spacing: 0;
+        margin: 0;
+        text-transform: none;
+      }
+      .exchange-step .hint { font-size: .8rem; }
+      .exchange-meta {
+        color: var(--muted);
+        margin: .65rem 0 0;
+      }
+      .exchange-meta code { color: var(--text); }
+      .exchange-step pre {
+        margin: .65rem 0 0;
+        max-height: 180px;
+      }
+      .wire-details { margin-top: .65rem; }
+      .boundary-note {
+        border-left: 2px solid var(--blue);
+        color: var(--muted);
+        margin: .8rem 0 0;
+        padding-left: .7rem;
+      }
+      .scenario-list {
+        display: grid;
+        gap: .65rem;
+        margin-top: .8rem;
+      }
+      .scenario {
+        align-items: center;
+        display: grid;
+        gap: .8rem;
+        grid-template-columns: max-content minmax(0, 1fr);
+      }
+      .scenario span { color: var(--muted); }
+      .scenario-result {
+        color: var(--blue);
+        margin: .8rem 0 0;
+      }
+      details { margin-top: .75rem; }
+      summary { color: var(--blue); cursor: pointer; }
+      .pcr-list { margin-top: .7rem; }
+      .policy-note { color: var(--amber); margin: .65rem 0 0; }
+      .events {
+        display: grid;
+        gap: .45rem;
+        list-style: none;
+        margin: 0;
+        max-height: 360px;
+        overflow: auto;
+        padding: 0;
+      }
+      .event {
+        align-items: baseline;
+        border-bottom: 1px solid #252c37;
+        display: grid;
+        gap: .65rem;
+        grid-template-columns: 5.5rem 5.5rem minmax(0, 1fr);
+        padding: .45rem .15rem .55rem;
+      }
+      .event:last-child { border-bottom: 0; }
+      .event time { color: var(--muted); font-variant-numeric: tabular-nums; }
+      .event-kind {
+        color: var(--blue);
+        font-size: .72rem;
+        font-weight: 700;
+        letter-spacing: .06em;
+        text-transform: uppercase;
+      }
+      .event[data-level="success"] .event-kind { color: var(--green); }
+      .event[data-level="failure"] .event-kind { color: var(--red); }
+      .event[data-level="warning"] .event-kind { color: var(--amber); }
+      pre {
+        background: var(--panel-deep);
+        border: 1px solid #252c37;
+        border-radius: .45rem;
+        color: #c8facc;
+        font-size: .78rem;
+        max-height: 360px;
+        overflow: auto;
+        padding: .8rem;
+        white-space: pre-wrap;
+      }
+      [hidden] { display: none !important; }
+      @media (min-width: 900px) {
+        .diagnostic-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .verification-card { grid-column: span 2; }
+      }
+      @media (max-width: 620px) {
+        .request-composer,
+        .exchange-grid,
+        .scenario { grid-template-columns: 1fr; }
+        .event { grid-template-columns: 4.7rem minmax(0, 1fr); }
+        .event-kind { display: none; }
+      }
     </style>
   </head>
   <body>
-    <h1>STEVE local E2E</h1>
-    <p class="warning">Synthetic test-root attestation. This is not an enclave.</p>
-    <p id="system-status" class="system-status" data-state="loading">Starting service worker…</p>
-    <p>
-      <button data-action="initialize" disabled>Initialize</button>
-      <button data-action="echo" disabled>Encrypted echo</button>
-      <button data-action="unauthorized" disabled>Application 401</button>
-      <button data-action="timeout" disabled>Timeout</button>
-      <button data-action="concurrency" disabled>65 concurrent</button>
-      <button data-action="status" disabled>Status</button>
-    </p>
-    <pre id="output">Starting service worker…</pre>
+    <header>
+      <h1>STEVE local E2E</h1>
+      <p class="lede">Inspect the browser-to-STEVE v2 session without exposing key material.</p>
+      <p id="trust-warning" class="warning" hidden></p>
+    </header>
+
+    <main>
+      <section class="panel" aria-labelledby="diagnostics-heading">
+        <h2 id="diagnostics-heading">Live diagnostics</h2>
+        <p id="system-status" class="system-status" data-state="loading" aria-live="polite">
+          Starting service worker…
+        </p>
+
+        <div class="diagnostic-grid">
+          <article class="diagnostic-card">
+            <h3>Runtime</h3>
+            <dl>
+              <dt>Worker</dt><dd id="runtime-worker">Starting…</dd>
+              <dt>Session</dt><dd id="session-state">Unknown</dd>
+              <dt>Stage</dt><dd id="session-stage">—</dd>
+              <dt>Trigger</dt><dd id="session-trigger">—</dd>
+            </dl>
+          </article>
+
+          <article class="diagnostic-card">
+            <h3>Protocol</h3>
+            <dl>
+              <dt>Protocol</dt><dd id="protocol-id">—</dd>
+              <dt>Suite</dt><dd id="key-establishment">—</dd>
+              <dt>KDF</dt><dd id="key-derivation">—</dd>
+              <dt>Record</dt><dd id="record-protection">—</dd>
+            </dl>
+          </article>
+
+          <article class="diagnostic-card">
+            <h3>Session</h3>
+            <dl>
+              <dt>ID</dt><dd><code id="session-id">—</code></dd>
+              <dt>Transcript</dt><dd><code id="transcript-hash">—</code></dd>
+              <dt>Established</dt><dd id="established-at">—</dd>
+              <dt>Rotate after</dt><dd id="rotates-at">—</dd>
+            </dl>
+          </article>
+
+          <article class="diagnostic-card">
+            <h3>Attestation</h3>
+            <dl>
+              <dt>Profile</dt><dd id="attestation-profile">—</dd>
+              <dt>Trust anchor</dt><dd id="trust-anchor">—</dd>
+              <dt>Module</dt><dd id="module-id">—</dd>
+            </dl>
+            <details id="pcr-details" hidden>
+              <summary>Reported PCR values</summary>
+              <dl id="pcr-values" class="pcr-list"></dl>
+              <p class="policy-note">Reported only; not compared with an approved PCR policy.</p>
+            </details>
+          </article>
+
+          <article class="diagnostic-card verification-card">
+            <h3>Verification checks</h3>
+            <ul id="verification-checks" class="check-list">
+              <li><span>Session not established</span><span>—</span></li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="session-controls-heading">
+        <h2 id="session-controls-heading">Session controls</h2>
+        <p class="hint">
+          Establish eagerly to inspect attestation before application traffic. A protected request
+          also establishes a session automatically when none exists.
+        </p>
+        <div class="controls">
+          <button data-action="initialize" disabled>Establish session</button>
+          <button data-action="rotate" disabled>Rotate session</button>
+          <button data-action="reset" disabled>Reset session</button>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="protected-request-heading">
+        <h2 id="protected-request-heading">Send a protected request</h2>
+        <p class="target">
+          <code>POST /echo</code> to <code id="target-origin">—</code>
+          · <span id="target-kind">checking target…</span>
+        </p>
+        <div class="request-composer">
+          <label for="request-body">
+            Browser plaintext
+            <textarea id="request-body" rows="3">hello STEVE</textarea>
+          </label>
+          <button type="button" data-action="echo" disabled>Send protected request</button>
+        </div>
+
+        <p id="boundary-note" class="boundary-note">
+          The browser encrypts before the wire. STEVE decrypts at its runtime boundary and
+          encrypts the application response before returning it.
+        </p>
+
+        <div class="exchange-grid" aria-live="polite">
+          <article class="exchange-step">
+            <header>
+              <span class="step-number">1</span>
+              <h3>Application request</h3>
+            </header>
+            <p class="hint">Plaintext known to this page before encryption.</p>
+            <p id="application-request-meta" class="exchange-meta">No request sent.</p>
+            <pre id="application-request-body">—</pre>
+          </article>
+
+          <article class="exchange-step">
+            <header>
+              <span class="step-number">2</span>
+              <h3>Encrypted wire request</h3>
+            </header>
+            <p class="hint">Actual CBOR envelope sent to STEVE.</p>
+            <p id="wire-request-meta" class="exchange-meta">Waiting for a request.</p>
+            <details class="wire-details">
+              <summary>Full base64url envelope</summary>
+              <pre id="wire-request-envelope">—</pre>
+            </details>
+          </article>
+
+          <article class="exchange-step">
+            <header>
+              <span class="step-number">3</span>
+              <h3>Encrypted wire response</h3>
+            </header>
+            <p class="hint">Actual CBOR envelope returned by STEVE.</p>
+            <p id="wire-response-meta" class="exchange-meta">Waiting for a response.</p>
+            <details class="wire-details">
+              <summary>Full base64url envelope</summary>
+              <pre id="wire-response-envelope">—</pre>
+            </details>
+          </article>
+
+          <article class="exchange-step">
+            <header>
+              <span class="step-number">4</span>
+              <h3>Application response</h3>
+            </header>
+            <p class="hint">Decrypted by the service worker and returned to this page.</p>
+            <p id="application-response-meta" class="exchange-meta">Waiting for a response.</p>
+            <pre id="application-response-body">—</pre>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="failure-cases-heading">
+        <h2 id="failure-cases-heading">Failure and window cases</h2>
+        <div class="scenario-list">
+          <div class="scenario">
+            <button data-action="unauthorized" disabled>Encrypted application 401</button>
+            <span>The decrypted application error should not reset the secure session.</span>
+          </div>
+          <div class="scenario">
+            <button data-action="timeout" disabled>Client request timeout</button>
+            <span>The timed-out sequence is retired; the session remains usable.</span>
+          </div>
+          <div class="scenario">
+            <button data-action="concurrency" disabled>Sequence-window pressure</button>
+            <span>One slow request fills the oldest slot while 64 requests exercise backpressure.</span>
+          </div>
+        </div>
+        <p id="scenario-result" class="scenario-result">No failure case run.</p>
+      </section>
+
+      <section class="panel" aria-labelledby="events-heading">
+        <h2 id="events-heading">Events</h2>
+        <ol id="events" class="events" aria-live="polite"></ol>
+      </section>
+
+      <details class="panel">
+        <summary>Raw status diagnostics</summary>
+        <pre id="raw-status">Waiting for service worker…</pre>
+      </details>
+    </main>
+
     <script type="module" src="/attestation-widget.js"></script>
   </body>
 </html>

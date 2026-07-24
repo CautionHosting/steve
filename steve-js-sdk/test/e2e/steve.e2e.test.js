@@ -1,20 +1,67 @@
 import { expect, test } from '@playwright/test';
 
-async function initialize(page) {
-  await page.goto('/');
+async function openDemo(page, url = '/') {
+  await page.goto(url);
   await page.waitForFunction(() => Boolean(window.steveDemo));
   await expect(page.locator('#system-status')).toContainText('Service worker active');
-  await expect(page.getByRole('button', { name: 'Initialize' })).toBeEnabled();
+  return page.evaluate(() => window.steveDemo.status());
+}
+
+async function initialize(page) {
+  await openDemo(page);
+  await expect(page.getByRole('button', { name: 'Establish session' })).toBeEnabled();
   return page.evaluate(() => window.steveDemo.initialize());
 }
+
+test('starts with an honest idle state and synthetic verifier profile', async ({ page }) => {
+  const status = await openDemo(page);
+
+  expect(status.state).toBe('idle');
+  expect(status.initialized).toBe(false);
+  expect(status.session).toBeNull();
+  expect(status.protocol).toEqual({
+    id: 'STEVE-E2P-V2',
+    version: 2,
+    keyEstablishment: 'X25519',
+    keyDerivation: 'HKDF-SHA256',
+    recordProtection: 'AES-256-GCM'
+  });
+  expect(status.attestationVerifier).toEqual({
+    id: 'synthetic-eval',
+    trustAnchor: 'STEVE Local Eval Root',
+    synthetic: true
+  });
+  await expect(page.locator('#system-status')).toContainText('session idle');
+  await expect(page.locator('#trust-warning')).toContainText('this is not an enclave');
+  await expect(page.getByRole('button', { name: 'Rotate session' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Reset session' })).toBeDisabled();
+});
 
 test('establishes a signed eval session and completes an encrypted echo', async ({ page }) => {
   const status = await initialize(page);
 
+  expect(status.state).toBe('ready');
   expect(status.initialized).toBe(true);
+  expect(status.session.trigger).toBe('explicit-initialize');
+  expect(status.session.confirmation).toBe('verified');
+  expect(status.session.id).toHaveLength(22);
+  expect(status.session.transcriptHash).toHaveLength(43);
   expect(status.attestation.verified).toBe(true);
+  expect(status.attestation.synthetic).toBe(true);
   expect(status.attestation.moduleId).toBe('steve-local-eval');
   expect(Object.keys(status.attestation.pcrs)).toEqual(['PCR0', 'PCR1', 'PCR2']);
+  expect(status.attestation.checks).toEqual({
+    certificateChain: 'verified',
+    nonceBinding: 'verified',
+    sessionBinding: 'verified',
+    keyConfirmation: 'verified',
+    expectedPcrPolicy: 'not-checked'
+  });
+  await expect(page.locator('#verification-checks')).toContainText('Expected PCR policy');
+  await expect(page.locator('#verification-checks')).toContainText('not-checked');
+  await expect(page.locator('#pcr-details')).toContainText(
+    'Reported only; not compared with an approved PCR policy.'
+  );
 
   expect(await page.evaluate(() => window.steveDemo.echo('browser-to-steve'))).toEqual({
     status: 200,
@@ -22,10 +69,62 @@ test('establishes a signed eval session and completes an encrypted echo', async 
   });
 });
 
-test('initializes from the manually opened localhost demo', async ({ page }) => {
-  await page.goto('http://localhost:3000/');
+test('reports lazy establishment by the first protected request', async ({ page }) => {
+  const before = await openDemo(page);
+  expect(before.state).toBe('idle');
+
+  await page.locator('#request-body').fill('lazy-session');
+  await page.getByRole('button', { name: 'Send protected request' }).click();
+  await expect(page.locator('#application-response-body')).toHaveText('lazy-session');
+  const after = await page.evaluate(() => window.steveDemo.status());
+
+  expect(after.state).toBe('ready');
+  expect(after.session.trigger).toBe('protected-request');
+  await expect(page.locator('#session-trigger')).toHaveText('First protected request');
+  await expect(page.locator('#events')).toContainText('first protected request');
+  await expect(page.locator('#application-request-meta')).toContainText('POST /echo');
+  await expect(page.locator('#application-request-body')).toHaveText('lazy-session');
+  await expect(page.locator('#wire-request-meta')).toContainText('POST /e2p/v2/request');
+  await expect(page.locator('#wire-request-meta')).toContainText('sequence 1');
+  await expect(page.locator('#wire-request-envelope')).not.toHaveText('—');
+  await expect(page.locator('#wire-response-meta')).toContainText(
+    'Response from /e2p/v2/request'
+  );
+  await expect(page.locator('#wire-response-envelope')).not.toHaveText('—');
+  await expect(page.locator('#application-response-meta')).toContainText('HTTP 200');
+  expect(await page.locator('#wire-request-envelope').textContent()).not.toContain('lazy-session');
+});
+
+test('restores the live session status after a page reload', async ({ page }) => {
+  const before = await initialize(page);
+  await page.reload({ waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => Boolean(window.steveDemo));
-  await expect(page.locator('#system-status')).toContainText('Service worker active');
+
+  const after = await page.evaluate(() => window.steveDemo.status());
+  expect(after.state).toBe('ready');
+  expect(after.session.id).toBe(before.session.id);
+  await expect(page.locator('#system-status')).toContainText('secure session ready');
+  await expect(page.locator('#events')).toContainText('resumed an existing secure session');
+});
+
+test('rotates to a fresh session and resets diagnostics to idle', async ({ page }) => {
+  const before = await initialize(page);
+  const rotated = await page.evaluate(() => window.steveDemo.rotate());
+
+  expect(rotated.state).toBe('ready');
+  expect(rotated.session.trigger).toBe('rotation');
+  expect(rotated.session.id).not.toBe(before.session.id);
+
+  const reset = await page.evaluate(() => window.steveDemo.reset());
+  expect(reset.state).toBe('idle');
+  expect(reset.initialized).toBe(false);
+  expect(reset.session).toBeNull();
+  await expect(page.locator('#system-status')).toContainText('session idle');
+  await expect(page.locator('#session-id')).toHaveText('—');
+});
+
+test('initializes from the manually opened localhost demo', async ({ page }) => {
+  await openDemo(page, 'http://localhost:3000/');
 
   const status = await page.evaluate(() => window.steveDemo.initialize());
   const echo = await page.evaluate(() => window.steveDemo.echo('localhost-demo'));
@@ -86,6 +185,30 @@ test('preserves the session across an encrypted application 401', async ({ page 
   expect(unauthorized.status).toBe(401);
   expect(echo).toEqual({ status: 200, body: 'after-401' });
   expect(after.lastKeyRotation).toBe(before.lastKeyRotation);
+});
+
+test('renders concise outcomes for request-debugging controls', async ({ page }) => {
+  await initialize(page);
+
+  await page.getByRole('button', { name: 'Encrypted application 401' }).click();
+  await expect(page.locator('#events')).toContainText('401 HTTP');
+  await expect(page.locator('#scenario-result')).toContainText(
+    'encrypted application HTTP 401; session is ready'
+  );
+
+  await page.getByRole('button', { name: 'Client request timeout' }).click();
+  await expect(page.locator('#events')).toContainText('504 HTTP');
+  await expect(page.locator('#scenario-result')).toContainText(
+    'sequence retired and session is ready'
+  );
+
+  await page.getByRole('button', { name: 'Sequence-window pressure' }).click();
+  await expect(page.locator('#events')).toContainText(
+    '65 requests · 64 HTTP 200 · 1 HTTP 504'
+  );
+  await expect(page.locator('#scenario-result')).toContainText(
+    'sequence window reopened without rotating the session'
+  );
 });
 
 test('restores routing configuration after the service worker is restarted', async ({

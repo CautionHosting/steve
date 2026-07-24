@@ -5,6 +5,7 @@ import {
   Direction,
   MessageType,
   SequenceTracker,
+  decodeBase64Url,
   decodeEnvelope,
   deriveMaterial,
   encodeEnvelope,
@@ -16,11 +17,17 @@ import {
 // those calls are no-ops instead of throwing in Node.
 const cachedResponses = new Map();
 let cacheOpenError = null;
+let captureClientMessages = false;
+const clientMessages = [];
 globalThis.self = {
   addEventListener: () => {},
   location: { origin: 'https://example.test' },
   registration: { scope: 'https://example.test/' },
-  clients: { matchAll: async () => [] },
+  clients: {
+    matchAll: async () => captureClientMessages
+      ? [{ postMessage: message => clientMessages.push(message) }]
+      : []
+  },
   caches: {
     async open() {
       if (cacheOpenError) throw cacheOpenError;
@@ -43,13 +50,15 @@ const { configure, hasValidSession, resetState, ensureSession, getState, getConf
   ProtocolTransportError,
   isRequestLocalFailure,
   configureAndPersist, configCacheKey, getConfigRestoreError, initializeConfig,
-  persistConfig, restoreConfig,
+  persistConfig, restoreConfig, lifecycleState, statusMessage, rotateSession,
   setEstablishSession, resetEstablishSession } = globalThis.self.__ENCLAVE_SW_TEST__;
 
 const ROTATION_INTERVAL_MS = 25 * 60 * 1000;
 const originalFetch = globalThis.fetch;
 
 test.afterEach(async () => {
+  captureClientMessages = false;
+  clientMessages.length = 0;
   resetState();
   resetConfig();
   resetEstablishSession();
@@ -305,9 +314,106 @@ test('failed session establishment clears the shared promise for a retry', async
   });
   await assert.rejects(ensureSession(), /temporary attestation failure/u);
   assert.equal(getState().sessionPromise, null);
+  assert.equal(lifecycleState(), 'error');
+  assert.equal(statusMessage().stage, null);
+  assert.match(statusMessage().error, /temporary attestation failure/u);
 
   setEstablishSession(async () => ({ id: 'session-b', createdAt: Date.now() }));
   assert.equal((await ensureSession()).id, 'session-b');
+});
+
+function diagnosticSession(fill, createdAt = Date.now()) {
+  return {
+    id: new Uint8Array(16).fill(fill),
+    transcriptHash: new Uint8Array(32).fill(fill + 1),
+    material: { secretMarker: 'derived-key-material-must-not-appear' },
+    createdAt,
+    confirmation: 'verified',
+    attestation: {
+      verified: true,
+      profile: 'aws-nitro',
+      trustAnchor: 'AWS Nitro root CA',
+      synthetic: false,
+      pcrs: { PCR0: 'reported-pcr' },
+      moduleId: 'test-module',
+      checks: {
+        certificateChain: 'verified',
+        nonceBinding: 'verified',
+        sessionBinding: 'verified',
+        keyConfirmation: 'verified',
+        expectedPcrPolicy: 'not-checked'
+      }
+    }
+  };
+}
+
+test('status reports an idle production verifier without claiming workload policy', () => {
+  const status = statusMessage();
+
+  assert.equal(status.state, 'idle');
+  assert.equal(status.stage, null);
+  assert.equal(status.initialized, false);
+  assert.equal(status.session, null);
+  assert.equal(status.attestation, null);
+  assert.deepEqual(status.protocol, {
+    id: 'STEVE-E2P-V2',
+    version: 2,
+    keyEstablishment: 'X25519',
+    keyDerivation: 'HKDF-SHA256',
+    recordProtection: 'AES-256-GCM'
+  });
+  assert.deepEqual(status.attestationVerifier, {
+    id: 'aws-nitro',
+    trustAnchor: 'AWS Nitro root CA',
+    synthetic: false
+  });
+  assert.equal(status.protocolVersion, 2);
+  assert.equal(status.lastKeyRotation, null);
+});
+
+test('status tracks eager establishment and exposes only safe session diagnostics', async () => {
+  let resolveSession;
+  const session = diagnosticSession(3);
+  const heldSession = new Promise(resolve => { resolveSession = resolve; });
+  setEstablishSession(() => heldSession);
+
+  const pending = ensureSession('explicit-initialize');
+  assert.equal(lifecycleState(), 'establishing');
+  assert.equal(statusMessage().stage, 'creating-session');
+
+  resolveSession(session);
+  await pending;
+  const status = statusMessage();
+  const serialized = JSON.stringify(status);
+
+  assert.equal(status.state, 'ready');
+  assert.equal(status.initialized, true);
+  assert.equal(status.session.trigger, 'explicit-initialize');
+  assert.equal(status.session.confirmation, 'verified');
+  assert.equal(typeof status.session.id, 'string');
+  assert.equal(typeof status.session.transcriptHash, 'string');
+  assert.equal(status.session.establishedAt, session.createdAt);
+  assert.equal(status.session.rotatesAt, session.createdAt + ROTATION_INTERVAL_MS);
+  assert.equal(status.attestation.checks.expectedPcrPolicy, 'not-checked');
+  assert.equal(status.lastKeyRotation, session.createdAt);
+  assert.equal(serialized.includes('derived-key-material-must-not-appear'), false);
+  assert.equal(serialized.includes('secretMarker'), false);
+  assert.equal('material' in status.session, false);
+});
+
+test('status distinguishes lazy establishment and session rotation triggers', async () => {
+  setEstablishSession(async () => diagnosticSession(5));
+  await ensureSession();
+  assert.equal(statusMessage().session.trigger, 'protected-request');
+
+  setEstablishSession(async () => diagnosticSession(7));
+  const rotation = rotateSession();
+  assert.equal(lifecycleState(), 'rotating');
+  assert.equal(statusMessage().stage, 'creating-session');
+  await rotation;
+
+  assert.equal(statusMessage().state, 'ready');
+  assert.equal(statusMessage().session.trigger, 'rotation');
 });
 
 async function installFakeSession() {
@@ -347,6 +453,36 @@ async function validProtocolResponse(options, session, applicationStatus = 200) 
     { status: 200, headers: { 'Content-Type': 'application/cbor' } }
   );
 }
+
+test('opt-in wire traces expose encrypted envelopes but not application plaintext', async () => {
+  const session = await installFakeSession();
+  configure({ emitEncryptedPayloads: true });
+  captureClientMessages = true;
+  clientMessages.length = 0;
+  globalThis.fetch = (url, options) => validProtocolResponse(options, session);
+
+  const response = await handleProtectedRequest(new Request('https://example.test/echo', {
+    method: 'POST',
+    body: 'manual-debug-secret'
+  }));
+
+  assert.equal(response.status, 200);
+  const wireEvents = clientMessages.filter(message =>
+    ['enclave:encrypted-request', 'enclave:encrypted-response'].includes(message.type)
+  );
+  assert.equal(wireEvents.length, 2);
+  for (const event of wireEvents) {
+    assert.equal(event.endpoint, '/e2p/v2/request');
+    assert.equal(event.sessionId.length, 22);
+    assert.equal(event.sequence, '1');
+    assert.equal(decodeBase64Url(event.envelope).length, event.size);
+    assert.doesNotMatch(JSON.stringify(event), /manual-debug-secret/u);
+  }
+  assert.equal(
+    decodeEnvelope(decodeBase64Url(wireEvents[0].envelope)).sequenceValue,
+    1n
+  );
+});
 
 test('a transient request failure does not poison a concurrent sibling', async () => {
   const session = await installFakeSession();
