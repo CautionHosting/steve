@@ -9,16 +9,16 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 use attestation::{AttestationProvider, NitroAttestationProvider};
 use axum::{
     Router,
-    body::{Body, Bytes},
+    body::{Body, Bytes, to_bytes},
     extract::{DefaultBodyLimit, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::post,
 };
 use protocol::{
-    AttestedBinding, CONTEXT_HASH_LEN, Envelope, KEY_LEN, NONCE_LEN, ProtocolError, SESSION_ID_LEN,
-    SessionRequest, SessionResponse, VERSION, build_transcript, decode_cbor, derive_secrets,
-    encode_cbor, fixed, transcript_hash,
+    AttestedBinding, CONTEXT_HASH_LEN, Envelope, KeyExchangeSuite, NONCE_LEN, ProtocolError,
+    SESSION_ID_LEN, SessionRequest, SessionResponse, VERSION, X25519_KEY_MATERIAL_LEN,
+    build_transcript, decode_cbor, derive_secrets, encode_cbor, fixed, transcript_hash,
 };
 use rand::{RngCore, rngs::OsRng};
 use reqwest::Client;
@@ -27,15 +27,18 @@ use sessions::{CLEANUP_INTERVAL, PENDING_TTL, Session, SessionError, SessionStor
 use tokio::{sync::Semaphore, task};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, error, warn};
+use x_wing::{Encapsulate, EncapsulationKey};
 use x25519_dalek::{EphemeralSecret, PublicKey};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const DEFAULT_APP_UPSTREAM: &str = "http://127.0.0.1:8083";
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:49500";
 const MAX_ENVELOPE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PROTECTED_RESPONSE_BODY_BYTES: usize = MAX_ENVELOPE_BYTES;
 const MAX_UNENCRYPTED_BODY_BYTES: usize = 1024 * 1024;
+const MAX_SESSION_BODY_BYTES: usize = 4_096;
 const MAX_CONCURRENT_ATTESTATIONS: usize = 8;
+const MAX_CONCURRENT_KEY_EXCHANGES: usize = 8;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -44,6 +47,7 @@ pub struct ServerConfig {
     pub listen_addr: String,
     pub upstream_url: url::Url,
     pub cors_origins: Option<String>,
+    pub key_exchange: KeyExchangeSuite,
 }
 
 /// Enclave metadata surfaced by bootproofd as attestation `user_data`.
@@ -52,8 +56,18 @@ pub struct ServerConfig {
 /// `verifying_key` anymore; the protocol version tells consumers the v1 key
 /// channel is intentionally gone.
 #[derive(Debug, Serialize)]
-struct MetadataOutput {
+struct StaticMetadataOutput {
     e2p_protocol_version: u32,
+    e2p_key_exchange: KeyExchangeSuite,
+}
+
+impl StaticMetadataOutput {
+    fn new(key_exchange: KeyExchangeSuite) -> Self {
+        Self {
+            e2p_protocol_version: VERSION.into(),
+            e2p_key_exchange: key_exchange,
+        }
+    }
 }
 
 /// Write enclave metadata to `E2P_METADATA_FILE` (default `/metadata.json`)
@@ -61,13 +75,11 @@ struct MetadataOutput {
 pub fn write_metadata() -> Result<(), BoxError> {
     let metadata_path =
         std::env::var("E2P_METADATA_FILE").unwrap_or_else(|_| String::from("/metadata.json"));
-    write_metadata_to(&metadata_path)
+    write_metadata_to(&metadata_path, configured_key_exchange()?)
 }
 
-fn write_metadata_to(metadata_path: &str) -> Result<(), BoxError> {
-    let metadata = MetadataOutput {
-        e2p_protocol_version: 2,
-    };
+fn write_metadata_to(metadata_path: &str, key_exchange: KeyExchangeSuite) -> Result<(), BoxError> {
+    let metadata = StaticMetadataOutput::new(key_exchange);
     debug!(?metadata, %metadata_path, "writing enclave metadata");
     let metadata_file = std::fs::File::create_new(metadata_path)?;
     serde_json::to_writer(metadata_file, &metadata)?;
@@ -83,14 +95,36 @@ impl ServerConfig {
                 .unwrap_or_else(|_| DEFAULT_LISTEN_ADDR.to_string()),
             upstream_url: url::Url::parse(&upstream)?,
             cors_origins: std::env::var("STEVE_CORS_ORIGINS").ok(),
+            key_exchange: configured_key_exchange()?,
         })
+    }
+}
+
+fn configured_key_exchange() -> Result<KeyExchangeSuite, BoxError> {
+    parse_configured_key_exchange(std::env::var("STEVE_KEY_EXCHANGE"))
+}
+
+fn parse_configured_key_exchange(
+    configured: Result<String, std::env::VarError>,
+) -> Result<KeyExchangeSuite, BoxError> {
+    match configured {
+        Ok(value) => value.parse().map_err(|_| {
+            format!("invalid STEVE_KEY_EXCHANGE value {value:?}; expected X25519 or XWING-DRAFT10")
+                .into()
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(KeyExchangeSuite::X25519),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("STEVE_KEY_EXCHANGE must be valid Unicode".into())
+        }
     }
 }
 
 struct AppState {
     attestation: Arc<dyn AttestationProvider>,
     attestation_slots: Arc<Semaphore>,
+    kem_slots: Arc<Semaphore>,
     sessions: Arc<SessionStore>,
+    key_exchange: KeyExchangeSuite,
     http_client: Client,
     upstream_url: url::Url,
     protected_upstream: Arc<dyn ProtectedUpstream>,
@@ -165,7 +199,9 @@ fn build_router_with_components_and_store(
     let state = Arc::new(AppState {
         attestation,
         attestation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ATTESTATIONS)),
+        kem_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_KEY_EXCHANGES)),
         sessions,
+        key_exchange: config.key_exchange,
         http_client: enclave_http_client()?,
         upstream_url: config.upstream_url,
         protected_upstream,
@@ -231,47 +267,60 @@ fn enclave_http_client() -> Result<Client, reqwest::Error> {
 
 async fn create_session(
     State(state): State<Arc<AppState>>,
-    body: Bytes,
+    request: Request,
 ) -> Result<Response, ApiError> {
-    if body.len() > MAX_ENVELOPE_BYTES {
-        return Err(ApiError::Malformed);
-    }
+    let body = to_bytes(request.into_body(), MAX_SESSION_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::Malformed)?;
     let request: SessionRequest = decode_cbor(&body).map_err(ApiError::from)?;
-    if request.version != VERSION {
+    if request.version != VERSION || request.key_exchange != state.key_exchange {
         return Err(ApiError::Malformed);
     }
     let client_nonce = fixed::<NONCE_LEN>(&request.client_nonce).map_err(ApiError::from)?;
-    let client_public_key = fixed::<KEY_LEN>(&request.client_public_key).map_err(ApiError::from)?;
     let context_hash = fixed::<CONTEXT_HASH_LEN>(&request.context_hash).map_err(ApiError::from)?;
-
-    let client_public_key = PublicKey::from(client_public_key);
-    let server_secret = EphemeralSecret::random_from_rng(OsRng);
-    let server_public_key = PublicKey::from(&server_secret).to_bytes();
-    let shared_secret = server_secret.diffie_hellman(&client_public_key);
-    if !shared_secret.was_contributory() {
+    if request.client_key_material.len() != state.key_exchange.client_key_material_len() {
         return Err(ApiError::Malformed);
     }
-    let shared_secret = Zeroizing::new(shared_secret.to_bytes());
+
+    // Reserve bounded session capacity before entering either potentially
+    // expensive KEM. A failed handshake drops the reservation automatically.
+    let reservation = state.sessions.reserve().map_err(ApiError::from)?;
+    let kem_slot = Arc::clone(&state.kem_slots)
+        .try_acquire_owned()
+        .map_err(|_| ApiError::Capacity)?;
+    let key_exchange = state.key_exchange;
+    let client_key_material = request.client_key_material;
+    let kem_client_key_material = client_key_material.clone();
+    let (server_key_material, shared_secret) = task::spawn_blocking(move || {
+        let _kem_slot = kem_slot;
+        perform_key_exchange(key_exchange, &kem_client_key_material)
+    })
+    .await
+    .map_err(|_| ApiError::Internal)?
+    .map_err(ApiError::from)?;
+
     let mut session_id = [0u8; SESSION_ID_LEN];
     OsRng.fill_bytes(&mut session_id);
 
     let transcript = build_transcript(
+        key_exchange,
         &client_nonce,
-        client_public_key.as_bytes(),
-        &server_public_key,
+        &client_key_material,
+        &server_key_material,
         &session_id,
         &context_hash,
-    );
+    )
+    .map_err(ApiError::from)?;
     let transcript_hash = transcript_hash(&transcript);
     let secrets = derive_secrets(&shared_secret, &transcript_hash).map_err(ApiError::from)?;
     let user_data = serde_json::to_vec(&AttestedBinding::new(
+        key_exchange,
         &session_id,
         &transcript_hash,
         secrets.binder(),
     ))
     .map_err(|_| ApiError::Internal)?;
 
-    let reservation = state.sessions.reserve().map_err(ApiError::from)?;
     let attestation_slot = Arc::clone(&state.attestation_slots)
         .try_acquire_owned()
         .map_err(|_| ApiError::Capacity)?;
@@ -294,11 +343,45 @@ async fn create_session(
 
     cbor_response(&SessionResponse {
         version: VERSION,
+        key_exchange,
         session_id: session_id.to_vec(),
-        server_public_key: server_public_key.to_vec(),
+        server_key_material,
         attestation_document,
         expires_in_seconds: PENDING_TTL.as_secs() as u32,
     })
+}
+
+fn perform_key_exchange(
+    key_exchange: KeyExchangeSuite,
+    client_key_material: &[u8],
+) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), ProtocolError> {
+    match key_exchange {
+        KeyExchangeSuite::X25519 => {
+            let client_public_key =
+                PublicKey::from(fixed::<X25519_KEY_MATERIAL_LEN>(client_key_material)?);
+            let server_secret = EphemeralSecret::random_from_rng(OsRng);
+            let server_public_key = PublicKey::from(&server_secret).to_bytes();
+            let shared_secret = server_secret.diffie_hellman(&client_public_key);
+            if !shared_secret.was_contributory() {
+                return Err(ProtocolError::Authentication);
+            }
+            Ok((
+                server_public_key.to_vec(),
+                Zeroizing::new(shared_secret.to_bytes()),
+            ))
+        }
+        KeyExchangeSuite::XWingDraft10 => {
+            let client_public_key = EncapsulationKey::try_from(client_key_material)
+                .map_err(|_| ProtocolError::InvalidLength)?;
+            let (ciphertext, mut shared_secret) = client_public_key.encapsulate();
+            let shared_secret_bytes = Zeroizing::new(
+                <[u8; 32]>::try_from(shared_secret.as_slice())
+                    .map_err(|_| ProtocolError::KeyDerivation)?,
+            );
+            shared_secret.zeroize();
+            Ok((ciphertext.to_vec(), shared_secret_bytes))
+        }
+    }
 }
 
 async fn confirm_session(
@@ -646,6 +729,7 @@ mod tests {
     use axum::body::to_bytes;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
+    use x_wing::{Ciphertext, Decapsulate, Kem, KeyExport, XWingKem};
     use x25519_dalek::{EphemeralSecret, PublicKey};
 
     struct CountingUpstream {
@@ -720,6 +804,7 @@ mod tests {
                 listen_addr: "127.0.0.1:0".to_string(),
                 upstream_url: url::Url::parse("http://127.0.0.1:8083").unwrap(),
                 cors_origins: None,
+                key_exchange: KeyExchangeSuite::X25519,
             },
             provider,
             protected_upstream,
@@ -734,8 +819,9 @@ mod tests {
             "/e2p/v2/session",
             &SessionRequest {
                 version: VERSION,
+                key_exchange: KeyExchangeSuite::X25519,
                 client_nonce: vec![7; 32],
-                client_public_key: vec![0; 32],
+                client_key_material: vec![0; 32],
                 context_hash: vec![8; 32],
             },
         )
@@ -752,8 +838,9 @@ mod tests {
             "/e2p/v2/session",
             &SessionRequest {
                 version: VERSION,
+                key_exchange: KeyExchangeSuite::X25519,
                 client_nonce: client_nonce.to_vec(),
-                client_public_key: client_public.to_vec(),
+                client_key_material: client_public.to_vec(),
                 context_hash: context_hash.to_vec(),
             },
         )
@@ -764,16 +851,19 @@ mod tests {
             session_response.attestation_document,
             b"fake-nitro-attestation-document"
         );
+        assert_eq!(session_response.key_exchange, KeyExchangeSuite::X25519);
 
         let session_id = fixed::<16>(&session_response.session_id).unwrap();
-        let server_public = fixed::<32>(&session_response.server_public_key).unwrap();
+        let server_public = fixed::<32>(&session_response.server_key_material).unwrap();
         let transcript = build_transcript(
+            KeyExchangeSuite::X25519,
             &client_nonce,
             &client_public,
             &server_public,
             &session_id,
             &context_hash,
-        );
+        )
+        .unwrap();
         let transcript_hash = transcript_hash(&transcript);
         let shared = client_secret
             .diffie_hellman(&PublicKey::from(server_public))
@@ -783,9 +873,14 @@ mod tests {
         let (attested_nonce, user_data) = fake.last_call().unwrap();
         assert_eq!(attested_nonce, client_nonce);
         let binding: AttestedBinding = serde_json::from_slice(&user_data).unwrap();
-        let expected_binding =
-            AttestedBinding::new(&session_id, &transcript_hash, secrets.binder());
+        let expected_binding = AttestedBinding::new(
+            KeyExchangeSuite::X25519,
+            &session_id,
+            &transcript_hash,
+            secrets.binder(),
+        );
         assert_eq!(binding.protocol, expected_binding.protocol);
+        assert_eq!(binding.key_exchange, expected_binding.key_exchange);
         assert_eq!(binding.session_id, expected_binding.session_id);
         assert_eq!(binding.transcript_hash, expected_binding.transcript_hash);
         assert_eq!(binding.binder, expected_binding.binder);
@@ -891,7 +986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_session_store_rejects_before_attestation() {
+    async fn full_session_store_rejects_before_key_exchange_or_attestation() {
         let fake = Arc::new(FakeAttestationProvider::default());
         let provider: Arc<dyn AttestationProvider> = fake.clone();
         let app = build_router_with_components_and_store(
@@ -899,6 +994,7 @@ mod tests {
                 listen_addr: "127.0.0.1:0".to_string(),
                 upstream_url: url::Url::parse("http://127.0.0.1:8083").unwrap(),
                 cors_origins: None,
+                key_exchange: KeyExchangeSuite::X25519,
             },
             provider,
             Arc::new(CountingUpstream {
@@ -907,16 +1003,17 @@ mod tests {
             Arc::new(SessionStore::new(0)),
         )
         .unwrap();
-        let client_secret = EphemeralSecret::random_from_rng(OsRng);
-        let client_public = PublicKey::from(&client_secret).to_bytes();
 
         let response = send_cbor(
             &app,
             "/e2p/v2/session",
             &SessionRequest {
                 version: VERSION,
+                key_exchange: KeyExchangeSuite::X25519,
                 client_nonce: vec![7; NONCE_LEN],
-                client_public_key: client_public.to_vec(),
+                // Non-contributory, so BAD_REQUEST would prove the KEM ran
+                // before the zero-capacity SessionStore rejected admission.
+                client_key_material: vec![0; X25519_KEY_MATERIAL_LEN],
                 context_hash: vec![8; CONTEXT_HASH_LEN],
             },
         )
@@ -926,12 +1023,284 @@ mod tests {
         assert!(fake.last_call().is_none());
     }
 
+    #[tokio::test]
+    async fn ninth_concurrent_key_exchange_gets_capacity_without_losing_reservations() {
+        let fake = Arc::new(FakeAttestationProvider::default());
+        let sessions = Arc::new(SessionStore::new(9));
+        let existing_reservations = (0..MAX_CONCURRENT_KEY_EXCHANGES)
+            .map(|_| sessions.reserve().unwrap())
+            .collect::<Vec<_>>();
+        let kem_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_KEY_EXCHANGES));
+        let _active_kems = (0..MAX_CONCURRENT_KEY_EXCHANGES)
+            .map(|_| Arc::clone(&kem_slots).try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        let state = Arc::new(AppState {
+            attestation: fake.clone(),
+            attestation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ATTESTATIONS)),
+            kem_slots,
+            sessions: Arc::clone(&sessions),
+            key_exchange: KeyExchangeSuite::X25519,
+            http_client: enclave_http_client().unwrap(),
+            upstream_url: url::Url::parse("http://127.0.0.1:8083").unwrap(),
+            protected_upstream: Arc::new(CountingUpstream {
+                executions: Arc::new(AtomicUsize::new(0)),
+            }),
+        });
+        let client_secret = EphemeralSecret::random_from_rng(OsRng);
+        let request_body = encode_cbor(&SessionRequest {
+            version: VERSION,
+            key_exchange: KeyExchangeSuite::X25519,
+            client_nonce: vec![7; NONCE_LEN],
+            client_key_material: PublicKey::from(&client_secret).to_bytes().to_vec(),
+            context_hash: vec![8; CONTEXT_HASH_LEN],
+        })
+        .unwrap();
+        let request = Request::builder().body(Body::from(request_body)).unwrap();
+
+        assert!(matches!(
+            create_session(State(state), request).await,
+            Err(ApiError::Capacity)
+        ));
+        assert!(fake.last_call().is_none());
+
+        // The failed ninth request released only its own store reservation.
+        let replacement_ninth = sessions.reserve().unwrap();
+        assert!(matches!(sessions.reserve(), Err(SessionError::Capacity)));
+        drop(replacement_ninth);
+        drop(existing_reservations);
+    }
+
+    #[tokio::test]
+    async fn xwing_session_interoperates_and_binds_the_selected_suite() {
+        let fake = Arc::new(FakeAttestationProvider::default());
+        let provider: Arc<dyn AttestationProvider> = fake.clone();
+        let app = build_router_with_components(
+            ServerConfig {
+                listen_addr: "127.0.0.1:0".to_string(),
+                upstream_url: url::Url::parse("http://127.0.0.1:8083").unwrap(),
+                cors_origins: None,
+                key_exchange: KeyExchangeSuite::XWingDraft10,
+            },
+            provider,
+            Arc::new(CountingUpstream {
+                executions: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+        .unwrap();
+        let (client_secret, client_public) = XWingKem::generate_keypair();
+        let client_key_material = client_public.to_bytes();
+        let client_nonce = [7u8; NONCE_LEN];
+        let context_hash = [8u8; CONTEXT_HASH_LEN];
+
+        let response = send_cbor(
+            &app,
+            "/e2p/v2/session",
+            &SessionRequest {
+                version: VERSION,
+                key_exchange: KeyExchangeSuite::XWingDraft10,
+                client_nonce: client_nonce.to_vec(),
+                client_key_material: client_key_material.to_vec(),
+                context_hash: context_hash.to_vec(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_response: SessionResponse = decode_response(response).await;
+        assert_eq!(
+            session_response.key_exchange,
+            KeyExchangeSuite::XWingDraft10
+        );
+        assert_eq!(
+            client_key_material.len(),
+            KeyExchangeSuite::XWingDraft10.client_key_material_len()
+        );
+        assert_eq!(
+            session_response.server_key_material.len(),
+            KeyExchangeSuite::XWingDraft10.server_key_material_len()
+        );
+
+        let ciphertext: Ciphertext = session_response
+            .server_key_material
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let mut shared_secret = client_secret.decapsulate(&ciphertext);
+        let session_id = fixed::<SESSION_ID_LEN>(&session_response.session_id).unwrap();
+        let transcript = build_transcript(
+            KeyExchangeSuite::XWingDraft10,
+            &client_nonce,
+            &client_key_material,
+            &session_response.server_key_material,
+            &session_id,
+            &context_hash,
+        )
+        .unwrap();
+        let transcript_hash = transcript_hash(&transcript);
+        let secrets = derive_secrets(shared_secret.as_ref(), &transcript_hash).unwrap();
+        shared_secret.zeroize();
+
+        let (attested_nonce, user_data) = fake.last_call().unwrap();
+        assert_eq!(attested_nonce, client_nonce);
+        let binding: AttestedBinding = serde_json::from_slice(&user_data).unwrap();
+        assert_eq!(binding.key_exchange, KeyExchangeSuite::XWingDraft10);
+        assert_eq!(
+            binding.transcript_hash,
+            AttestedBinding::new(
+                KeyExchangeSuite::XWingDraft10,
+                &session_id,
+                &transcript_hash,
+                secrets.binder(),
+            )
+            .transcript_hash
+        );
+
+        let confirmation = secrets
+            .seal(
+                Direction::ClientToServer,
+                MessageType::Confirmation,
+                &session_id,
+                0,
+                &transcript_hash,
+            )
+            .unwrap();
+        let response = send_cbor(
+            &app,
+            "/e2p/v2/confirm",
+            &Envelope {
+                version: VERSION,
+                session_id: session_id.to_vec(),
+                sequence: 0u64.to_be_bytes().to_vec(),
+                ciphertext: confirmation,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[derive(Serialize)]
+    struct RequestWithStringSuite {
+        version: u8,
+        key_exchange: String,
+        #[serde(with = "serde_bytes")]
+        client_nonce: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        client_key_material: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        context_hash: Vec<u8>,
+    }
+
+    #[tokio::test]
+    async fn session_rejects_downgrades_malformed_inputs_and_oversized_bodies_uniformly() {
+        let fake = Arc::new(FakeAttestationProvider::default());
+        let app = build_router_with_components(
+            ServerConfig {
+                listen_addr: "127.0.0.1:0".to_string(),
+                upstream_url: url::Url::parse("http://127.0.0.1:8083").unwrap(),
+                cors_origins: None,
+                key_exchange: KeyExchangeSuite::XWingDraft10,
+            },
+            fake.clone(),
+            Arc::new(CountingUpstream {
+                executions: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+        .unwrap();
+
+        let downgrade = send_cbor(
+            &app,
+            "/e2p/v2/session",
+            &SessionRequest {
+                version: VERSION,
+                key_exchange: KeyExchangeSuite::X25519,
+                client_nonce: vec![1; NONCE_LEN],
+                client_key_material: vec![2; X25519_KEY_MATERIAL_LEN],
+                context_hash: vec![3; CONTEXT_HASH_LEN],
+            },
+        )
+        .await;
+        let unknown_suite = send_cbor(
+            &app,
+            "/e2p/v2/session",
+            &RequestWithStringSuite {
+                version: VERSION,
+                key_exchange: "XWING-DRAFT11".to_string(),
+                client_nonce: vec![1; NONCE_LEN],
+                client_key_material: vec![
+                    2;
+                    KeyExchangeSuite::XWingDraft10.client_key_material_len()
+                ],
+                context_hash: vec![3; CONTEXT_HASH_LEN],
+            },
+        )
+        .await;
+        let wrong_size = send_cbor(
+            &app,
+            "/e2p/v2/session",
+            &SessionRequest {
+                version: VERSION,
+                key_exchange: KeyExchangeSuite::XWingDraft10,
+                client_nonce: vec![1; NONCE_LEN],
+                client_key_material: vec![
+                    2;
+                    KeyExchangeSuite::XWingDraft10.client_key_material_len()
+                        - 1
+                ],
+                context_hash: vec![3; CONTEXT_HASH_LEN],
+            },
+        )
+        .await;
+        let invalid_ml_kem_key = send_cbor(
+            &app,
+            "/e2p/v2/session",
+            &SessionRequest {
+                version: VERSION,
+                key_exchange: KeyExchangeSuite::XWingDraft10,
+                client_nonce: vec![1; NONCE_LEN],
+                // 12-bit ML-KEM coefficients of 0xfff are non-canonical.
+                client_key_material: vec![
+                    0xff;
+                    KeyExchangeSuite::XWingDraft10.client_key_material_len()
+                ],
+                context_hash: vec![3; CONTEXT_HASH_LEN],
+            },
+        )
+        .await;
+        let oversized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/e2p/v2/session")
+                    .header(header::CONTENT_TYPE, "application/cbor")
+                    .body(Body::from(vec![0u8; MAX_SESSION_BODY_BYTES + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        for response in [
+            downgrade,
+            unknown_suite,
+            wrong_size,
+            invalid_ml_kem_key,
+            oversized,
+        ] {
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(response.into_body(), MAX_SESSION_BODY_BYTES)
+                .await
+                .unwrap();
+            assert_eq!(body, r#"{"error":"protocol_error"}"#);
+        }
+        assert!(fake.last_call().is_none());
+    }
+
     fn try_test_router(cors_origins: Option<String>) -> Result<Router, BoxError> {
         build_router_with_components(
             ServerConfig {
                 listen_addr: "127.0.0.1:0".to_string(),
                 upstream_url: url::Url::parse("http://127.0.0.1:8083").unwrap(),
                 cors_origins,
+                key_exchange: KeyExchangeSuite::X25519,
             },
             Arc::new(FakeAttestationProvider::default()),
             Arc::new(CountingUpstream {
@@ -944,8 +1313,22 @@ mod tests {
         try_test_router(cors_origins).unwrap()
     }
 
+    #[test]
+    fn key_exchange_configuration_defaults_to_x25519_and_rejects_unknown_values() {
+        assert_eq!(
+            parse_configured_key_exchange(Err(std::env::VarError::NotPresent)).unwrap(),
+            KeyExchangeSuite::X25519
+        );
+        assert_eq!(
+            parse_configured_key_exchange(Ok("XWING-DRAFT10".to_string())).unwrap(),
+            KeyExchangeSuite::XWingDraft10
+        );
+        assert!(parse_configured_key_exchange(Ok("x25519".to_string())).is_err());
+        assert!(parse_configured_key_exchange(Ok(String::new())).is_err());
+    }
+
     #[tokio::test]
-    async fn cors_is_scoped_to_v2_post_endpoints() {
+    async fn cors_is_scoped_to_v2_endpoints() {
         let app = test_router(Some("https://app.example".to_string()));
         for endpoint in ["/e2p/v2/session", "/e2p/v2/confirm", "/e2p/v2/request"] {
             let response = app
@@ -1059,6 +1442,7 @@ mod tests {
                 listen_addr: "127.0.0.1:0".to_string(),
                 upstream_url: url::Url::parse(&format!("http://{address}")).unwrap(),
                 cors_origins: Some("https://app.example".to_string()),
+                key_exchange: KeyExchangeSuite::X25519,
             },
             Arc::new(FakeAttestationProvider::default()),
             Arc::new(CountingUpstream {
@@ -1150,13 +1534,15 @@ mod tests {
                 .as_nanos()
         ));
         let path_str = path.to_str().unwrap();
-        write_metadata_to(path_str).unwrap();
+        write_metadata_to(path_str, KeyExchangeSuite::XWingDraft10).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["e2p_protocol_version"], 2);
+        assert_eq!(value["e2p_key_exchange"], "XWING-DRAFT10");
+        assert_eq!(value.as_object().unwrap().len(), 2);
         assert!(value.get("verifying_key").is_none());
         // create_new must refuse to clobber an existing file
-        assert!(write_metadata_to(path_str).is_err());
+        assert!(write_metadata_to(path_str, KeyExchangeSuite::XWingDraft10).is_err());
         std::fs::remove_file(&path).unwrap();
     }
 

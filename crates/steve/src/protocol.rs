@@ -16,6 +16,9 @@ pub const NONCE_LEN: usize = 32;
 pub const KEY_LEN: usize = 32;
 pub const CONTEXT_HASH_LEN: usize = 32;
 pub const SEQUENCE_LEN: usize = 8;
+pub const X25519_KEY_MATERIAL_LEN: usize = 32;
+pub const XWING_CLIENT_KEY_MATERIAL_LEN: usize = 1_216;
+pub const XWING_SERVER_KEY_MATERIAL_LEN: usize = 1_120;
 
 const LABEL_C2S_KEY: &[u8] = b"steve-e2p-v2/c2s-key";
 const LABEL_S2C_KEY: &[u8] = b"steve-e2p-v2/s2c-key";
@@ -29,6 +32,8 @@ pub enum ProtocolError {
     InvalidLength,
     #[error("unsupported protocol version")]
     UnsupportedVersion,
+    #[error("unsupported key exchange suite")]
+    UnsupportedKeyExchange,
     #[error("invalid CBOR")]
     InvalidCbor,
     #[error("key derivation failed")]
@@ -37,13 +42,76 @@ pub enum ProtocolError {
     Authentication,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum KeyExchangeSuite {
+    #[serde(rename = "X25519")]
+    X25519,
+    #[serde(rename = "XWING-DRAFT10")]
+    XWingDraft10,
+}
+
+impl KeyExchangeSuite {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::X25519 => "X25519",
+            Self::XWingDraft10 => "XWING-DRAFT10",
+        }
+    }
+
+    pub const fn client_key_material_len(self) -> usize {
+        match self {
+            Self::X25519 => X25519_KEY_MATERIAL_LEN,
+            Self::XWingDraft10 => XWING_CLIENT_KEY_MATERIAL_LEN,
+        }
+    }
+
+    pub const fn server_key_material_len(self) -> usize {
+        match self {
+            Self::X25519 => X25519_KEY_MATERIAL_LEN,
+            Self::XWingDraft10 => XWING_SERVER_KEY_MATERIAL_LEN,
+        }
+    }
+
+    pub fn validate_key_material(
+        self,
+        client_key_material: &[u8],
+        server_key_material: &[u8],
+    ) -> Result<(), ProtocolError> {
+        if client_key_material.len() != self.client_key_material_len()
+            || server_key_material.len() != self.server_key_material_len()
+        {
+            return Err(ProtocolError::InvalidLength);
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for KeyExchangeSuite {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for KeyExchangeSuite {
+    type Err = ProtocolError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "X25519" => Ok(Self::X25519),
+            "XWING-DRAFT10" => Ok(Self::XWingDraft10),
+            _ => Err(ProtocolError::UnsupportedKeyExchange),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionRequest {
     pub version: u8,
+    pub key_exchange: KeyExchangeSuite,
     #[serde(with = "serde_bytes")]
     pub client_nonce: Vec<u8>,
     #[serde(with = "serde_bytes")]
-    pub client_public_key: Vec<u8>,
+    pub client_key_material: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub context_hash: Vec<u8>,
 }
@@ -51,10 +119,11 @@ pub struct SessionRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionResponse {
     pub version: u8,
+    pub key_exchange: KeyExchangeSuite,
     #[serde(with = "serde_bytes")]
     pub session_id: Vec<u8>,
     #[serde(with = "serde_bytes")]
-    pub server_public_key: Vec<u8>,
+    pub server_key_material: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub attestation_document: Vec<u8>,
     pub expires_in_seconds: u32,
@@ -85,6 +154,7 @@ impl Envelope {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AttestedBinding {
     pub protocol: String,
+    pub key_exchange: KeyExchangeSuite,
     pub session_id: String,
     pub transcript_hash: String,
     pub binder: String,
@@ -92,12 +162,14 @@ pub struct AttestedBinding {
 
 impl AttestedBinding {
     pub fn new(
+        key_exchange: KeyExchangeSuite,
         session_id: &[u8; SESSION_ID_LEN],
         transcript_hash: &[u8; 32],
         binder: &[u8; 32],
     ) -> Self {
         Self {
             protocol: PROTOCOL_ID.to_string(),
+            key_exchange,
             session_id: URL_SAFE_NO_PAD.encode(session_id),
             transcript_hash: URL_SAFE_NO_PAD.encode(transcript_hash),
             binder: URL_SAFE_NO_PAD.encode(binder),
@@ -187,22 +259,34 @@ pub enum MessageType {
 }
 
 pub fn build_transcript(
+    key_exchange: KeyExchangeSuite,
     client_nonce: &[u8; NONCE_LEN],
-    client_public_key: &[u8; KEY_LEN],
-    server_public_key: &[u8; KEY_LEN],
+    client_key_material: &[u8],
+    server_key_material: &[u8],
     session_id: &[u8; SESSION_ID_LEN],
     context_hash: &[u8; CONTEXT_HASH_LEN],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, ProtocolError> {
+    key_exchange.validate_key_material(client_key_material, server_key_material)?;
+    let suite = key_exchange.as_str().as_bytes();
     let mut transcript = Vec::with_capacity(
-        PROTOCOL_MAGIC.len() + NONCE_LEN + KEY_LEN + KEY_LEN + SESSION_ID_LEN + CONTEXT_HASH_LEN,
+        PROTOCOL_MAGIC.len()
+            + suite.len()
+            + 1
+            + NONCE_LEN
+            + client_key_material.len()
+            + server_key_material.len()
+            + SESSION_ID_LEN
+            + CONTEXT_HASH_LEN,
     );
     transcript.extend_from_slice(PROTOCOL_MAGIC);
+    transcript.extend_from_slice(suite);
+    transcript.push(0);
     transcript.extend_from_slice(client_nonce);
-    transcript.extend_from_slice(client_public_key);
-    transcript.extend_from_slice(server_public_key);
+    transcript.extend_from_slice(client_key_material);
+    transcript.extend_from_slice(server_key_material);
     transcript.extend_from_slice(session_id);
     transcript.extend_from_slice(context_hash);
-    transcript
+    Ok(transcript)
 }
 
 pub fn transcript_hash(transcript: &[u8]) -> [u8; 32] {
@@ -292,6 +376,101 @@ mod tests {
     }
 
     #[test]
+    fn key_exchange_suite_has_exact_wire_names_and_lengths() {
+        assert_eq!(
+            serde_json::to_string(&KeyExchangeSuite::X25519).unwrap(),
+            "\"X25519\""
+        );
+        assert_eq!(
+            serde_json::to_string(&KeyExchangeSuite::XWingDraft10).unwrap(),
+            "\"XWING-DRAFT10\""
+        );
+        assert_eq!(
+            "X25519".parse::<KeyExchangeSuite>().unwrap(),
+            KeyExchangeSuite::X25519
+        );
+        assert_eq!(
+            "XWING-DRAFT10".parse::<KeyExchangeSuite>().unwrap(),
+            KeyExchangeSuite::XWingDraft10
+        );
+        assert!("x25519".parse::<KeyExchangeSuite>().is_err());
+        assert_eq!(
+            KeyExchangeSuite::X25519.client_key_material_len(),
+            X25519_KEY_MATERIAL_LEN
+        );
+        assert_eq!(
+            KeyExchangeSuite::XWingDraft10.client_key_material_len(),
+            XWING_CLIENT_KEY_MATERIAL_LEN
+        );
+        assert_eq!(
+            KeyExchangeSuite::XWingDraft10.server_key_material_len(),
+            XWING_SERVER_KEY_MATERIAL_LEN
+        );
+    }
+
+    #[test]
+    fn transcript_binds_suite_and_rejects_wrong_material_lengths() {
+        let client_nonce = [1u8; NONCE_LEN];
+        let client_key_material = [2u8; X25519_KEY_MATERIAL_LEN];
+        let server_key_material = [3u8; X25519_KEY_MATERIAL_LEN];
+        let session_id = [4u8; SESSION_ID_LEN];
+        let context_hash = [5u8; CONTEXT_HASH_LEN];
+        let transcript = build_transcript(
+            KeyExchangeSuite::X25519,
+            &client_nonce,
+            &client_key_material,
+            &server_key_material,
+            &session_id,
+            &context_hash,
+        )
+        .unwrap();
+        let suite_offset = PROTOCOL_MAGIC.len();
+        assert_eq!(
+            &transcript[suite_offset..suite_offset + "X25519\0".len()],
+            b"X25519\0"
+        );
+        assert!(
+            build_transcript(
+                KeyExchangeSuite::XWingDraft10,
+                &client_nonce,
+                &client_key_material,
+                &server_key_material,
+                &session_id,
+                &context_hash,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn session_cbor_uses_suite_agnostic_key_material_field_names() {
+        let request = SessionRequest {
+            version: VERSION,
+            key_exchange: KeyExchangeSuite::X25519,
+            client_nonce: vec![1; NONCE_LEN],
+            client_key_material: vec![2; X25519_KEY_MATERIAL_LEN],
+            context_hash: vec![3; CONTEXT_HASH_LEN],
+        };
+        let response = SessionResponse {
+            version: VERSION,
+            key_exchange: KeyExchangeSuite::X25519,
+            session_id: vec![4; SESSION_ID_LEN],
+            server_key_material: vec![5; X25519_KEY_MATERIAL_LEN],
+            attestation_document: vec![6],
+            expires_in_seconds: 30,
+        };
+        let request_fields = cbor_map_keys(&encode_cbor(&request).unwrap());
+        let response_fields = cbor_map_keys(&encode_cbor(&response).unwrap());
+
+        assert!(request_fields.contains("key_exchange"));
+        assert!(request_fields.contains("client_key_material"));
+        assert!(!request_fields.contains("client_public_key"));
+        assert!(response_fields.contains("key_exchange"));
+        assert!(response_fields.contains("server_key_material"));
+        assert!(!response_fields.contains("server_public_key"));
+    }
+
+    #[test]
     fn traffic_keys_cannot_cross_directions() {
         let session_id = [9u8; SESSION_ID_LEN];
         let secrets = derive_secrets(&[3u8; 32], &[4u8; 32]).unwrap();
@@ -319,41 +498,89 @@ mod tests {
 
     #[derive(Deserialize)]
     struct TestVector {
+        key_exchange: KeyExchangeSuite,
         client_nonce: String,
-        client_public_key: String,
-        server_public_key: String,
+        client_key_material: String,
+        server_key_material: String,
         session_id: String,
         context_hash: String,
         shared_secret: String,
+        session_request_cbor: String,
+        session_response_cbor: String,
+        transcript: String,
         transcript_hash: String,
         c2s_key: String,
         s2c_key: String,
         c2s_iv_prefix: String,
         s2c_iv_prefix: String,
         binder: String,
-        sequence: String,
-        c2s_application_iv: String,
-        c2s_application_aad: String,
+        confirmation_plaintext: String,
+        confirmation_ciphertext: String,
+        confirmation_record_cbor: String,
+        sequence: Option<String>,
+        c2s_application_iv: Option<String>,
+        c2s_application_aad: Option<String>,
     }
 
     #[test]
-    fn shared_v2_vector_matches_browser_implementation() {
-        let vector: TestVector =
-            serde_json::from_str(include_str!("../../../test-vectors/e2p-v2.json")).unwrap();
+    fn shared_v2_vectors_cover_both_suites_and_full_handshake_records() {
+        assert_shared_vector(
+            include_str!("../../../test-vectors/e2p-v2.json"),
+            KeyExchangeSuite::X25519,
+        );
+        assert_shared_vector(
+            include_str!("../../../test-vectors/e2p-v2-xwing.json"),
+            KeyExchangeSuite::XWingDraft10,
+        );
+    }
+
+    fn assert_shared_vector(json: &str, expected_suite: KeyExchangeSuite) {
+        let vector: TestVector = serde_json::from_str(json).unwrap();
+        assert_eq!(vector.key_exchange, expected_suite);
         let client_nonce = hex_fixed(&vector.client_nonce);
-        let client_public_key = hex_fixed(&vector.client_public_key);
-        let server_public_key = hex_fixed(&vector.server_public_key);
+        let client_key_material = hex_bytes(&vector.client_key_material);
+        let server_key_material = hex_bytes(&vector.server_key_material);
+        vector
+            .key_exchange
+            .validate_key_material(&client_key_material, &server_key_material)
+            .unwrap();
         let session_id = hex_fixed(&vector.session_id);
         let context_hash = hex_fixed(&vector.context_hash);
         let shared_secret = hex_fixed(&vector.shared_secret);
         let expected_hash = hex_fixed(&vector.transcript_hash);
+        let request = SessionRequest {
+            version: VERSION,
+            key_exchange: vector.key_exchange,
+            client_nonce: client_nonce.to_vec(),
+            client_key_material: client_key_material.clone(),
+            context_hash: context_hash.to_vec(),
+        };
+        assert_eq!(
+            encode_cbor(&request).unwrap(),
+            hex_bytes(&vector.session_request_cbor)
+        );
+        let response = SessionResponse {
+            version: VERSION,
+            key_exchange: vector.key_exchange,
+            session_id: session_id.to_vec(),
+            server_key_material: server_key_material.clone(),
+            attestation_document: vec![0xaa, 0xbb, 0xcc],
+            expires_in_seconds: 30,
+        };
+        assert_eq!(
+            encode_cbor(&response).unwrap(),
+            hex_bytes(&vector.session_response_cbor)
+        );
         let transcript = build_transcript(
+            vector.key_exchange,
             &client_nonce,
-            &client_public_key,
-            &server_public_key,
+            &client_key_material,
+            &server_key_material,
             &session_id,
             &context_hash,
-        );
+        )
+        .unwrap();
+        assert_eq!(transcript, hex_bytes(&vector.transcript));
         assert_eq!(transcript_hash(&transcript), expected_hash);
 
         let secrets = derive_secrets(&shared_secret, &expected_hash).unwrap();
@@ -368,21 +595,50 @@ mod tests {
             hex_bytes(&vector.s2c_iv_prefix)
         );
         assert_eq!(secrets.binder.as_ref(), hex_bytes(&vector.binder));
-
-        let sequence = vector.sequence.parse().unwrap();
         assert_eq!(
-            message_nonce(&secrets.c2s_iv_prefix, sequence).as_slice(),
-            hex_bytes(&vector.c2s_application_iv)
+            expected_hash.as_slice(),
+            hex_bytes(&vector.confirmation_plaintext)
         );
-        assert_eq!(
-            associated_data(
-                MessageType::Application,
+        let confirmation_ciphertext = secrets
+            .seal(
                 Direction::ClientToServer,
+                MessageType::Confirmation,
                 &session_id,
-                sequence,
-            ),
-            hex_bytes(&vector.c2s_application_aad)
+                0,
+                &expected_hash,
+            )
+            .unwrap();
+        assert_eq!(
+            confirmation_ciphertext,
+            hex_bytes(&vector.confirmation_ciphertext)
         );
+        assert_eq!(
+            encode_cbor(&Envelope {
+                version: VERSION,
+                session_id: session_id.to_vec(),
+                sequence: 0u64.to_be_bytes().to_vec(),
+                ciphertext: confirmation_ciphertext,
+            })
+            .unwrap(),
+            hex_bytes(&vector.confirmation_record_cbor)
+        );
+
+        if let Some(sequence) = vector.sequence {
+            let sequence = sequence.parse().unwrap();
+            assert_eq!(
+                message_nonce(&secrets.c2s_iv_prefix, sequence).as_slice(),
+                hex_bytes(vector.c2s_application_iv.as_deref().unwrap())
+            );
+            assert_eq!(
+                associated_data(
+                    MessageType::Application,
+                    Direction::ClientToServer,
+                    &session_id,
+                    sequence,
+                ),
+                hex_bytes(vector.c2s_application_aad.as_deref().unwrap())
+            );
+        }
     }
 
     fn hex_fixed<const N: usize>(value: &str) -> [u8; N] {
@@ -396,6 +652,20 @@ mod tests {
             .map(|pair| {
                 let pair = std::str::from_utf8(pair).unwrap();
                 u8::from_str_radix(pair, 16).unwrap()
+            })
+            .collect()
+    }
+
+    fn cbor_map_keys(bytes: &[u8]) -> std::collections::BTreeSet<String> {
+        let value: ciborium::Value = ciborium::from_reader(bytes).unwrap();
+        let ciborium::Value::Map(fields) = value else {
+            panic!("expected a CBOR map");
+        };
+        fields
+            .into_iter()
+            .filter_map(|(key, _)| match key {
+                ciborium::Value::Text(key) => Some(key),
+                _ => None,
             })
             .collect()
     }
