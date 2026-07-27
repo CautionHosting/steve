@@ -6,7 +6,10 @@ async function registerEnclaveServiceWorker(options = {}) {
   }
   const swPath = options.swPath || "/enclave-sw.js";
   const scope = options.scope || "/";
-  const registration = await navigator.serviceWorker.register(swPath, { scope });
+  const registration = await navigator.serviceWorker.register(swPath, {
+    scope,
+    type: "module"
+  });
   const worker = registration.installing || registration.waiting || registration.active;
   if (!worker) throw new Error("Service worker registration has no worker");
   await waitForActivation(worker);

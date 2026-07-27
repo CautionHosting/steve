@@ -464,7 +464,9 @@ function verifyAttestation(document, options) {
 // src/protocol-v2.js
 var VERSION = 2;
 var PROTOCOL_ID = "STEVE-E2P-V2";
-var KEY_ESTABLISHMENT_SUITE = "X25519";
+var X25519_KEY_EXCHANGE = "X25519";
+var XWING_KEY_EXCHANGE = "XWING-DRAFT10";
+var DEFAULT_KEY_EXCHANGE = X25519_KEY_EXCHANGE;
 var KEY_DERIVATION = "HKDF-SHA256";
 var RECORD_PROTECTION = "AES-256-GCM";
 var SESSION_ENDPOINT = "/e2p/v2/session";
@@ -472,6 +474,10 @@ var CONFIRM_ENDPOINT = "/e2p/v2/confirm";
 var REQUEST_ENDPOINT = "/e2p/v2/request";
 var encoder = new TextEncoder();
 var MAGIC = encoder.encode("STEVE-E2P-V2\0");
+var KEY_MATERIAL_LENGTHS = Object.freeze({
+  [X25519_KEY_EXCHANGE]: Object.freeze({ client: 32, server: 32 }),
+  [XWING_KEY_EXCHANGE]: Object.freeze({ client: 1216, server: 1120 })
+});
 var REPLAY_WINDOW_SIZE = 64n;
 var LABELS = {
   c2sKey: encoder.encode("steve-e2p-v2/c2s-key"),
@@ -552,13 +558,23 @@ function equalBytes(left, right) {
   }
   return difference === 0;
 }
-function buildTranscript(clientNonce, clientKey, serverKey, sessionId, contextHash) {
+function buildTranscript(keyExchange, clientNonce, clientKeyMaterial, serverKeyMaterial, sessionId, contextHash) {
+  requireKeyExchange(keyExchange);
   requireLength("client nonce", clientNonce, 32);
-  requireLength("client public key", clientKey, 32);
-  requireLength("server public key", serverKey, 32);
+  requireKeyMaterial(keyExchange, "client", clientKeyMaterial);
+  requireKeyMaterial(keyExchange, "server", serverKeyMaterial);
   requireLength("session ID", sessionId, 16);
   requireLength("context hash", contextHash, 32);
-  return concatBytes(MAGIC, clientNonce, clientKey, serverKey, sessionId, contextHash);
+  return concatBytes(
+    MAGIC,
+    encoder.encode(keyExchange),
+    new Uint8Array([0]),
+    clientNonce,
+    clientKeyMaterial,
+    serverKeyMaterial,
+    sessionId,
+    contextHash
+  );
 }
 async function sha256(bytes) {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
@@ -567,9 +583,14 @@ async function hashOrigin(origin) {
   return sha256(encoder.encode(origin));
 }
 async function deriveMaterial(sharedSecret, transcriptHash) {
-  requireLength("X25519 shared secret", sharedSecret, 32);
+  requireLength("key-exchange shared secret", sharedSecret, 32);
   requireLength("transcript hash", transcriptHash, 32);
-  const hkdfKey = await crypto.subtle.importKey("raw", sharedSecret, "HKDF", false, ["deriveBits"]);
+  let hkdfKey;
+  try {
+    hkdfKey = await crypto.subtle.importKey("raw", sharedSecret, "HKDF", false, ["deriveBits"]);
+  } finally {
+    sharedSecret.fill(0);
+  }
   const derive = async (label, bits) => new Uint8Array(await crypto.subtle.deriveBits({
     name: "HKDF",
     hash: "SHA-256",
@@ -635,19 +656,28 @@ async function open(material, direction, messageType, sessionId, sequence, ciphe
   }, key, ciphertext);
   return new Uint8Array(plaintext);
 }
-function encodeSessionRequest(clientNonce, clientPublicKey, contextHash) {
+function encodeSessionRequest(keyExchange, clientNonce, clientKeyMaterial, contextHash) {
+  requireKeyExchange(keyExchange);
+  requireLength("client nonce", clientNonce, 32);
+  requireKeyMaterial(keyExchange, "client", clientKeyMaterial);
+  requireLength("context hash", contextHash, 32);
   return encode({
     version: VERSION,
+    key_exchange: keyExchange,
     client_nonce: clientNonce,
-    client_public_key: clientPublicKey,
+    client_key_material: clientKeyMaterial,
     context_hash: contextHash
   });
 }
-function decodeSessionResponse(bytes) {
+function decodeSessionResponse(bytes, expectedKeyExchange) {
+  requireKeyExchange(expectedKeyExchange);
   const response = decode(bytes);
   if (response.version !== VERSION) throw new Error("unsupported session response version");
+  if (response.key_exchange !== expectedKeyExchange) {
+    throw new Error("session key exchange mismatch");
+  }
   requireLength("session ID", response.session_id, 16);
-  requireLength("server public key", response.server_public_key, 32);
+  requireKeyMaterial(expectedKeyExchange, "server", response.server_key_material);
   if (!(response.attestation_document instanceof Uint8Array)) {
     throw new Error("invalid attestation document");
   }
@@ -673,8 +703,9 @@ function decodeEnvelope(bytes) {
   if (!(envelope.ciphertext instanceof Uint8Array)) throw new Error("invalid envelope ciphertext");
   return { ...envelope, sequenceValue: parseSequence(envelope.sequence) };
 }
-function verifyBinding(userData, sessionId, transcriptHash, binder) {
-  if (!userData || userData.protocol !== PROTOCOL_ID) {
+function verifyBinding(userData, keyExchange, sessionId, transcriptHash, binder) {
+  requireKeyExchange(keyExchange);
+  if (!userData || userData.protocol !== PROTOCOL_ID || userData.key_exchange !== keyExchange) {
     throw new Error("attestation protocol binding mismatch");
   }
   const expected = {
@@ -687,11 +718,11 @@ function verifyBinding(userData, sessionId, transcriptHash, binder) {
     if (!equalBytes(actual, bytes)) throw new Error(`attestation ${field} mismatch`);
   }
 }
-function validateAttestationResult(result, sessionId, transcriptHash, binder) {
+function validateAttestationResult(result, keyExchange, sessionId, transcriptHash, binder) {
   if (!result?.verified) {
     throw new Error(`Nitro attestation verification failed: ${result?.error || "unknown error"}`);
   }
-  verifyBinding(result.userData, sessionId, transcriptHash, binder);
+  verifyBinding(result.userData, keyExchange, sessionId, transcriptHash, binder);
 }
 function encodeBase64Url(bytes) {
   let binary = "";
@@ -711,9 +742,357 @@ function requireLength(name, value, length) {
     throw new Error(`invalid ${name}`);
   }
 }
+function requireKeyExchange(keyExchange) {
+  if (!Object.prototype.hasOwnProperty.call(KEY_MATERIAL_LENGTHS, keyExchange)) {
+    throw new Error(`unsupported key exchange: ${keyExchange}`);
+  }
+}
+function requireKeyMaterial(keyExchange, side, value) {
+  requireLength(
+    `${side} key material`,
+    value,
+    KEY_MATERIAL_LENGTHS[keyExchange][side]
+  );
+}
+
+// wasm-pkg/steve_xwing_wasm.js
+var wasm;
+function addToExternrefTable0(obj) {
+  const idx = wasm.__externref_table_alloc();
+  wasm.__wbindgen_externrefs.set(idx, obj);
+  return idx;
+}
+function getArrayU8FromWasm0(ptr, len) {
+  ptr = ptr >>> 0;
+  return getUint8ArrayMemory0().subarray(ptr / 1, ptr / 1 + len);
+}
+function getStringFromWasm0(ptr, len) {
+  ptr = ptr >>> 0;
+  return decodeText(ptr, len);
+}
+var cachedUint8ArrayMemory0 = null;
+function getUint8ArrayMemory0() {
+  if (cachedUint8ArrayMemory0 === null || cachedUint8ArrayMemory0.byteLength === 0) {
+    cachedUint8ArrayMemory0 = new Uint8Array(wasm.memory.buffer);
+  }
+  return cachedUint8ArrayMemory0;
+}
+function handleError(f, args) {
+  try {
+    return f.apply(this, args);
+  } catch (e) {
+    const idx = addToExternrefTable0(e);
+    wasm.__wbindgen_exn_store(idx);
+  }
+}
+function passArray8ToWasm0(arg, malloc) {
+  const ptr = malloc(arg.length * 1, 1) >>> 0;
+  getUint8ArrayMemory0().set(arg, ptr / 1);
+  WASM_VECTOR_LEN = arg.length;
+  return ptr;
+}
+function takeFromExternrefTable0(idx) {
+  const value = wasm.__wbindgen_externrefs.get(idx);
+  wasm.__externref_table_dealloc(idx);
+  return value;
+}
+var cachedTextDecoder = new TextDecoder("utf-8", { ignoreBOM: true, fatal: true });
+cachedTextDecoder.decode();
+var MAX_SAFARI_DECODE_BYTES = 2146435072;
+var numBytesDecoded = 0;
+function decodeText(ptr, len) {
+  numBytesDecoded += len;
+  if (numBytesDecoded >= MAX_SAFARI_DECODE_BYTES) {
+    cachedTextDecoder = new TextDecoder("utf-8", { ignoreBOM: true, fatal: true });
+    cachedTextDecoder.decode();
+    numBytesDecoded = len;
+  }
+  return cachedTextDecoder.decode(getUint8ArrayMemory0().subarray(ptr, ptr + len));
+}
+var WASM_VECTOR_LEN = 0;
+var XWingClientFinalization = typeof FinalizationRegistry === "undefined" ? { register: () => {
+}, unregister: () => {
+} } : new FinalizationRegistry((ptr) => wasm.__wbg_xwingclient_free(ptr >>> 0, 1));
+var XWingClient = class {
+  __destroy_into_raw() {
+    const ptr = this.__wbg_ptr;
+    this.__wbg_ptr = 0;
+    XWingClientFinalization.unregister(this);
+    return ptr;
+  }
+  free() {
+    const ptr = this.__destroy_into_raw();
+    wasm.__wbg_xwingclient_free(ptr, 0);
+  }
+  /**
+   * Return only the public encapsulation key.
+   * @returns {Uint8Array}
+   */
+  public_key() {
+    const ret = wasm.xwingclient_public_key(this.__wbg_ptr);
+    if (ret[3]) {
+      throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+  }
+  /**
+   * Decapsulate once, destroy the private key, and return the shared secret.
+   * @param {Uint8Array} ciphertext
+   * @returns {Uint8Array}
+   */
+  decapsulate_and_destroy(ciphertext) {
+    const ptr0 = passArray8ToWasm0(ciphertext, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.xwingclient_decapsulate_and_destroy(this.__wbg_ptr, ptr0, len0);
+    if (ret[2]) {
+      throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+  }
+  /**
+   * Generate a fresh X-Wing key pair using the browser's CSPRNG.
+   */
+  constructor() {
+    const ret = wasm.xwingclient_new();
+    if (ret[2]) {
+      throw takeFromExternrefTable0(ret[1]);
+    }
+    this.__wbg_ptr = ret[0] >>> 0;
+    XWingClientFinalization.register(this, this.__wbg_ptr, this);
+    return this;
+  }
+};
+if (Symbol.dispose) XWingClient.prototype[Symbol.dispose] = XWingClient.prototype.free;
+var EXPECTED_RESPONSE_TYPES = /* @__PURE__ */ new Set(["basic", "cors", "default"]);
+async function __wbg_load(module, imports) {
+  if (typeof Response === "function" && module instanceof Response) {
+    if (typeof WebAssembly.instantiateStreaming === "function") {
+      try {
+        return await WebAssembly.instantiateStreaming(module, imports);
+      } catch (e) {
+        const validResponse = module.ok && EXPECTED_RESPONSE_TYPES.has(module.type);
+        if (validResponse && module.headers.get("Content-Type") !== "application/wasm") {
+          console.warn("`WebAssembly.instantiateStreaming` failed because your server does not serve Wasm with `application/wasm` MIME type. Falling back to `WebAssembly.instantiate` which is slower. Original error:\n", e);
+        } else {
+          throw e;
+        }
+      }
+    }
+    const bytes = await module.arrayBuffer();
+    return await WebAssembly.instantiate(bytes, imports);
+  } else {
+    const instance = await WebAssembly.instantiate(module, imports);
+    if (instance instanceof WebAssembly.Instance) {
+      return { instance, module };
+    } else {
+      return instance;
+    }
+  }
+}
+function __wbg_get_imports() {
+  const imports = {};
+  imports.wbg = {};
+  imports.wbg.__wbg_Error_52673b7de5a0ca89 = function(arg0, arg1) {
+    const ret = Error(getStringFromWasm0(arg0, arg1));
+    return ret;
+  };
+  imports.wbg.__wbg___wbindgen_throw_dd24417ed36fc46e = function(arg0, arg1) {
+    throw new Error(getStringFromWasm0(arg0, arg1));
+  };
+  imports.wbg.__wbg_getRandomValues_a8ddca022803a145 = function() {
+    return handleError(function(arg0, arg1) {
+      globalThis.crypto.getRandomValues(getArrayU8FromWasm0(arg0, arg1));
+    }, arguments);
+  };
+  imports.wbg.__wbg_new_from_slice_f9c22b9153b26992 = function(arg0, arg1) {
+    const ret = new Uint8Array(getArrayU8FromWasm0(arg0, arg1));
+    return ret;
+  };
+  imports.wbg.__wbindgen_init_externref_table = function() {
+    const table = wasm.__wbindgen_externrefs;
+    const offset = table.grow(4);
+    table.set(0, void 0);
+    table.set(offset + 0, void 0);
+    table.set(offset + 1, null);
+    table.set(offset + 2, true);
+    table.set(offset + 3, false);
+  };
+  return imports;
+}
+function __wbg_finalize_init(instance, module) {
+  wasm = instance.exports;
+  __wbg_init.__wbindgen_wasm_module = module;
+  cachedUint8ArrayMemory0 = null;
+  wasm.__wbindgen_start();
+  return wasm;
+}
+async function __wbg_init(module_or_path) {
+  if (wasm !== void 0) return wasm;
+  if (typeof module_or_path !== "undefined") {
+    if (Object.getPrototypeOf(module_or_path) === Object.prototype) {
+      ({ module_or_path } = module_or_path);
+    } else {
+      console.warn("using deprecated parameters for the initialization function; pass a single object instead");
+    }
+  }
+  if (typeof module_or_path === "undefined") {
+    module_or_path = new URL("steve_xwing_wasm_bg.wasm", import.meta.url);
+  }
+  const imports = __wbg_get_imports();
+  if (typeof module_or_path === "string" || typeof Request === "function" && module_or_path instanceof Request || typeof URL === "function" && module_or_path instanceof URL) {
+    module_or_path = fetch(module_or_path);
+  }
+  const { instance, module } = await __wbg_load(await module_or_path, imports);
+  return __wbg_finalize_init(instance, module);
+}
+var steve_xwing_wasm_default = __wbg_init;
+
+// src/key-exchange.js
+var XWING_WASM_PATH = "./xwing/steve_xwing_wasm_bg.wasm";
+var XWING_WASM_SHA256 = false ? null : "959d5a21407349e5cd841349b8329dc499eaf465b23b06e27938284cff0173f9";
+var verifiedXWingModule;
+function loadVerifiedXWingModule() {
+  if (!verifiedXWingModule) {
+    verifiedXWingModule = initializeVerifiedXWingModule({
+      initialize: steve_xwing_wasm_default,
+      XWingClient
+    });
+  }
+  return verifiedXWingModule;
+}
+async function initializeVerifiedXWingModule({
+  initialize,
+  XWingClient: XWingClient2,
+  fetchImpl = globalThis.fetch,
+  expectedDigest = XWING_WASM_SHA256,
+  wasmUrl = new URL(XWING_WASM_PATH, import.meta.url)
+}) {
+  if (typeof initialize !== "function" || typeof XWingClient2 !== "function") {
+    throw new Error("invalid self-hosted X-Wing WASM bindings");
+  }
+  if (!/^[0-9a-f]{64}$/u.test(expectedDigest || "")) {
+    throw new Error("X-Wing WASM build digest is unavailable");
+  }
+  const response = await fetchImpl(wasmUrl, {
+    cache: "no-store",
+    credentials: "same-origin",
+    redirect: "error"
+  });
+  if (!response.ok) {
+    throw new Error(`X-Wing WASM asset fetch failed with HTTP ${response.status}`);
+  }
+  const wasmBytes = new Uint8Array(await response.arrayBuffer());
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", wasmBytes));
+  const actualDigest = Array.from(
+    digest,
+    (byte) => byte.toString(16).padStart(2, "0")
+  ).join("");
+  if (actualDigest !== expectedDigest) {
+    throw new Error("X-Wing WASM asset integrity check failed");
+  }
+  await initialize({ module_or_path: wasmBytes });
+  return { XWingClient: XWingClient2 };
+}
+async function createClientKeyExchange(keyExchange, xwingModuleLoader) {
+  requireKeyExchange(keyExchange);
+  if (keyExchange === X25519_KEY_EXCHANGE) return createX25519Client();
+  if (keyExchange === XWING_KEY_EXCHANGE) {
+    if (typeof xwingModuleLoader !== "function") {
+      throw new Error("X-Wing WASM loader is unavailable");
+    }
+    return createXWingClient(xwingModuleLoader);
+  }
+  throw new Error(`unsupported key exchange: ${keyExchange}`);
+}
+async function createX25519Client() {
+  let keyPair = await crypto.subtle.generateKey(
+    { name: "X25519" },
+    true,
+    ["deriveBits"]
+  );
+  const publicKey = new Uint8Array(
+    await crypto.subtle.exportKey("raw", keyPair.publicKey)
+  );
+  let consumed = false;
+  return {
+    keyExchange: X25519_KEY_EXCHANGE,
+    publicKey,
+    async decapsulate(serverKeyMaterial) {
+      if (consumed) throw new Error("X25519 client already consumed");
+      consumed = true;
+      const privateKey = keyPair.privateKey;
+      keyPair = null;
+      const serverPublicKey = await crypto.subtle.importKey(
+        "raw",
+        serverKeyMaterial,
+        { name: "X25519" },
+        false,
+        []
+      );
+      return new Uint8Array(await crypto.subtle.deriveBits(
+        { name: "X25519", public: serverPublicKey },
+        privateKey,
+        256
+      ));
+    },
+    destroy() {
+      consumed = true;
+      keyPair = null;
+    }
+  };
+}
+async function createXWingClient(moduleLoader) {
+  const module = await moduleLoader();
+  if (typeof module?.XWingClient !== "function") {
+    throw new Error("invalid self-hosted X-Wing WASM module");
+  }
+  const client = new module.XWingClient();
+  const publicKey = client.public_key();
+  if (!(publicKey instanceof Uint8Array) || publicKey.length !== 1216) {
+    client.free?.();
+    throw new Error("invalid X-Wing client key material");
+  }
+  let consumed = false;
+  let freed = false;
+  const destroy = () => {
+    if (!freed) {
+      freed = true;
+      client.free?.();
+    }
+  };
+  return {
+    keyExchange: XWING_KEY_EXCHANGE,
+    publicKey,
+    async decapsulate(serverKeyMaterial) {
+      if (consumed) throw new Error("X-Wing client already consumed");
+      consumed = true;
+      try {
+        const sharedSecret = client.decapsulate_and_destroy(serverKeyMaterial);
+        if (!(sharedSecret instanceof Uint8Array) || sharedSecret.length !== 32) {
+          sharedSecret?.fill?.(0);
+          throw new Error("invalid X-Wing shared secret");
+        }
+        return sharedSecret;
+      } finally {
+        destroy();
+      }
+    },
+    destroy() {
+      consumed = true;
+      destroy();
+    }
+  };
+}
 
 // src/enclave-sw.js
-var DEFAULT_BOOTSTRAP_PATHS = ["/enclave-sw.js", "/register.js", "/attestation-widget.js"];
+var DEFAULT_BOOTSTRAP_PATHS = [
+  "/enclave-sw.js",
+  "/register.js",
+  "/attestation-widget.js",
+  "/xwing/steve_xwing_wasm_bg.wasm"
+];
 var SAFE_BOOTSTRAP_METHODS = /* @__PURE__ */ new Set(["GET", "HEAD"]);
 var ROTATION_INTERVAL_MS = 25 * 60 * 1e3;
 var PROTOCOL_EXCLUDE_PREFIXES = ["/e2p/"];
@@ -731,7 +1110,8 @@ function defaultConfig() {
     passthroughPaths: [...DEFAULT_BOOTSTRAP_PATHS],
     excludePrefixes: ["/attestation", "/e2p/"],
     emitEncryptedPayloads: false,
-    requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+    requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+    expectedKeyExchange: DEFAULT_KEY_EXCHANGE
   };
 }
 var config = defaultConfig();
@@ -957,118 +1337,125 @@ async function establishSession(_trigger, targetState) {
   );
 }
 async function establishSessionWithinDeadline(signal, targetState) {
+  const keyExchange = config.expectedKeyExchange;
   updateStage(targetState, "creating-session");
   const clientNonce = crypto.getRandomValues(new Uint8Array(32));
-  const clientKeyPair = await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"]);
-  throwIfAborted(signal);
-  const clientPublicKey = new Uint8Array(await crypto.subtle.exportKey("raw", clientKeyPair.publicKey));
-  throwIfAborted(signal);
-  const contextHash = await hashOrigin(self.location.origin);
-  throwIfAborted(signal);
-  const response = await protocolFetch(
-    SESSION_ENDPOINT,
-    encodeSessionRequest(clientNonce, clientPublicKey, contextHash),
-    signal
+  const clientKeyExchange = await createClientKeyExchange(
+    keyExchange,
+    loadVerifiedXWingModule
   );
-  if (!response.ok) throw new ProtocolHttpError(response.status, "session creation");
-  const sessionResponse = decodeSessionResponse(new Uint8Array(await response.arrayBuffer()));
-  throwIfAborted(signal);
-  const transcript = buildTranscript(
-    clientNonce,
-    clientPublicKey,
-    sessionResponse.server_public_key,
-    sessionResponse.session_id,
-    contextHash
-  );
-  const transcriptHash = await sha256(transcript);
-  throwIfAborted(signal);
-  const serverPublicKey = await crypto.subtle.importKey(
-    "raw",
-    sessionResponse.server_public_key,
-    { name: "X25519" },
-    false,
-    []
-  );
-  throwIfAborted(signal);
-  const sharedSecret = new Uint8Array(await crypto.subtle.deriveBits(
-    { name: "X25519", public: serverPublicKey },
-    clientKeyPair.privateKey,
-    256
-  ));
-  throwIfAborted(signal);
-  const material = await deriveMaterial(sharedSecret, transcriptHash);
-  throwIfAborted(signal);
-  updateStage(targetState, "verifying-attestation");
-  const attestation = await verifyAttestation(
-    sessionResponse.attestation_document,
-    { nonce: clientNonce }
-  );
-  throwIfAborted(signal);
-  validateAttestationResult(
-    attestation,
-    sessionResponse.session_id,
-    transcriptHash,
-    material.binder
-  );
-  updateStage(targetState, "confirming-session");
-  const confirmationCiphertext = await seal(
-    material,
-    Direction.CLIENT_TO_SERVER,
-    MessageType.CONFIRMATION,
-    sessionResponse.session_id,
-    0n,
-    transcriptHash
-  );
-  throwIfAborted(signal);
-  const confirmationResponse = await protocolFetch(
-    CONFIRM_ENDPOINT,
-    encodeEnvelope(sessionResponse.session_id, 0n, confirmationCiphertext),
-    signal
-  );
-  if (!confirmationResponse.ok) {
-    throw new ProtocolHttpError(confirmationResponse.status, "session confirmation");
-  }
-  const confirmationEnvelope = decodeEnvelope(
-    new Uint8Array(await confirmationResponse.arrayBuffer())
-  );
-  throwIfAborted(signal);
-  if (confirmationEnvelope.sequenceValue !== 0n || !equalBytes(confirmationEnvelope.session_id, sessionResponse.session_id)) {
-    throw new Error("unexpected confirmation response");
-  }
-  const confirmedHash = await open(
-    material,
-    Direction.SERVER_TO_CLIENT,
-    MessageType.CONFIRMATION,
-    sessionResponse.session_id,
-    0n,
-    confirmationEnvelope.ciphertext
-  );
-  throwIfAborted(signal);
-  if (!equalBytes(confirmedHash, transcriptHash)) throw new Error("session confirmation mismatch");
-  const session = {
-    id: sessionResponse.session_id,
-    material,
-    sequences: new SequenceTracker(),
-    createdAt: Date.now(),
-    transcriptHash,
-    confirmation: "verified",
-    attestation: {
-      verified: true,
-      profile: ATTESTATION_PROFILE.id,
-      trustAnchor: ATTESTATION_PROFILE.trustAnchor,
-      synthetic: ATTESTATION_PROFILE.synthetic,
-      pcrs: attestation.pcrs,
-      moduleId: attestation.moduleId,
-      checks: {
-        certificateChain: "verified",
-        nonceBinding: "verified",
-        sessionBinding: "verified",
-        keyConfirmation: "verified",
-        expectedPcrPolicy: "not-checked"
-      }
+  try {
+    throwIfAborted(signal);
+    const clientKeyMaterial = clientKeyExchange.publicKey;
+    const contextHash = await hashOrigin(self.location.origin);
+    throwIfAborted(signal);
+    const response = await protocolFetch(
+      SESSION_ENDPOINT,
+      encodeSessionRequest(
+        keyExchange,
+        clientNonce,
+        clientKeyMaterial,
+        contextHash
+      ),
+      signal
+    );
+    if (!response.ok) throw new ProtocolHttpError(response.status, "session creation");
+    const sessionResponse = decodeSessionResponse(
+      new Uint8Array(await response.arrayBuffer()),
+      keyExchange
+    );
+    throwIfAborted(signal);
+    const transcript = buildTranscript(
+      keyExchange,
+      clientNonce,
+      clientKeyMaterial,
+      sessionResponse.server_key_material,
+      sessionResponse.session_id,
+      contextHash
+    );
+    const transcriptHash = await sha256(transcript);
+    throwIfAborted(signal);
+    const sharedSecret = await clientKeyExchange.decapsulate(
+      sessionResponse.server_key_material
+    );
+    const material = await deriveMaterial(sharedSecret, transcriptHash);
+    throwIfAborted(signal);
+    updateStage(targetState, "verifying-attestation");
+    const attestation = await verifyAttestation(
+      sessionResponse.attestation_document,
+      { nonce: clientNonce }
+    );
+    throwIfAborted(signal);
+    validateAttestationResult(
+      attestation,
+      keyExchange,
+      sessionResponse.session_id,
+      transcriptHash,
+      material.binder
+    );
+    updateStage(targetState, "confirming-session");
+    const confirmationCiphertext = await seal(
+      material,
+      Direction.CLIENT_TO_SERVER,
+      MessageType.CONFIRMATION,
+      sessionResponse.session_id,
+      0n,
+      transcriptHash
+    );
+    throwIfAborted(signal);
+    const confirmationResponse = await protocolFetch(
+      CONFIRM_ENDPOINT,
+      encodeEnvelope(sessionResponse.session_id, 0n, confirmationCiphertext),
+      signal
+    );
+    if (!confirmationResponse.ok) {
+      throw new ProtocolHttpError(confirmationResponse.status, "session confirmation");
     }
-  };
-  return session;
+    const confirmationEnvelope = decodeEnvelope(
+      new Uint8Array(await confirmationResponse.arrayBuffer())
+    );
+    throwIfAborted(signal);
+    if (confirmationEnvelope.sequenceValue !== 0n || !equalBytes(confirmationEnvelope.session_id, sessionResponse.session_id)) {
+      throw new Error("unexpected confirmation response");
+    }
+    const confirmedHash = await open(
+      material,
+      Direction.SERVER_TO_CLIENT,
+      MessageType.CONFIRMATION,
+      sessionResponse.session_id,
+      0n,
+      confirmationEnvelope.ciphertext
+    );
+    throwIfAborted(signal);
+    if (!equalBytes(confirmedHash, transcriptHash)) throw new Error("session confirmation mismatch");
+    const session = {
+      id: sessionResponse.session_id,
+      keyExchange,
+      material,
+      sequences: new SequenceTracker(),
+      createdAt: Date.now(),
+      transcriptHash,
+      confirmation: "verified",
+      attestation: {
+        verified: true,
+        profile: ATTESTATION_PROFILE.id,
+        trustAnchor: ATTESTATION_PROFILE.trustAnchor,
+        synthetic: ATTESTATION_PROFILE.synthetic,
+        pcrs: attestation.pcrs,
+        moduleId: attestation.moduleId,
+        checks: {
+          certificateChain: "verified",
+          nonceBinding: "verified",
+          sessionBinding: "verified",
+          keyConfirmation: "verified",
+          expectedPcrPolicy: "not-checked"
+        }
+      }
+    };
+    return session;
+  } finally {
+    clientKeyExchange.destroy();
+  }
 }
 async function protocolFetch(path, body, signal) {
   try {
@@ -1191,7 +1578,8 @@ function configure(update) {
     "passthroughPaths",
     "excludePrefixes",
     "emitEncryptedPayloads",
-    "requestTimeoutMs"
+    "requestTimeoutMs",
+    "expectedKeyExchange"
   ];
   for (const key of Object.keys(update)) {
     if (!allowed.includes(key)) throw new Error(`unsupported configuration key: ${key}`);
@@ -1199,6 +1587,9 @@ function configure(update) {
   if ("passthroughPaths" in update) validatePathList(update.passthroughPaths);
   if ("excludePrefixes" in update) validatePathList(update.excludePrefixes);
   if ("requestTimeoutMs" in update) validateRequestTimeout(update.requestTimeoutMs);
+  if ("expectedKeyExchange" in update) {
+    requireKeyExchange(update.expectedKeyExchange);
+  }
   const next = { ...config, ...update };
   if ("enclaveOrigin" in update) {
     next.enclaveOrigin = normalizeEnclaveOrigin(update.enclaveOrigin);
@@ -1210,7 +1601,8 @@ function configure(update) {
     .../* @__PURE__ */ new Set([...PROTOCOL_EXCLUDE_PREFIXES, ...next.excludePrefixes])
   ];
   const enclaveChanged = next.enclaveOrigin !== config.enclaveOrigin;
-  if (enclaveChanged) resetState();
+  const keyExchangeChanged = next.expectedKeyExchange !== config.expectedKeyExchange;
+  if (enclaveChanged || keyExchangeChanged) resetState();
   config = next;
 }
 async function initializeConfig() {
@@ -1295,7 +1687,7 @@ function statusMessage() {
     protocol: {
       id: PROTOCOL_ID,
       version: VERSION,
-      keyEstablishment: KEY_ESTABLISHMENT_SUITE,
+      keyEstablishment: session?.keyExchange || config.expectedKeyExchange,
       keyDerivation: KEY_DERIVATION,
       recordProtection: RECORD_PROTECTION
     },
