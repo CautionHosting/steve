@@ -1,4 +1,10 @@
-FROM --platform=linux/amd64 stagex/pallet-rust@sha256:9c38bf1066dd9ad1b6a6b584974dd798c2bf798985bf82e58024fbe0515592ca AS steve-builder
+FROM stagex/core-git@sha256:6b3e0055f6aeaa8465f207a871db2c63a939cd7406113e9d769ff3b37239f3d0 AS git
+FROM stagex/core-ca-certificates@sha256:d135f1189e9b232eb7316626bf7858534c5540b2fc53dced80a4c9a95f26493e AS ca-certificates
+
+FROM --platform=linux/amd64 stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS steve-builder
+
+COPY --from=git . /
+COPY --from=ca-certificates . /
 
 ENV SOURCE_DATE_EPOCH=1
 ENV CARGO_INCREMENTAL=0
@@ -11,7 +17,8 @@ COPY crates/ ./crates/
 COPY test-vectors/ ./test-vectors/
 COPY tests/e2e/fixtures/ ./tests/e2e/fixtures/
 
-RUN cargo build --release --locked --target x86_64-unknown-linux-musl \
+RUN cargo fetch --locked --target x86_64-unknown-linux-musl && \
+    cargo build --release --locked --offline --target x86_64-unknown-linux-musl \
     -p steve --features eval-attestation --bin steve-eval && \
     install -Dm755 \
       /tmp/cargo-target/x86_64-unknown-linux-musl/release/steve-eval \

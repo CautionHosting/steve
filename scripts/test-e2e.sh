@@ -5,6 +5,16 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 COMPOSE_FILE="$ROOT_DIR/tests/e2e/compose.yaml"
 PROJECT_NAME=steve-e2e
 ACTION=${1:-test}
+STEVE_KEY_EXCHANGE=${STEVE_KEY_EXCHANGE:-X25519}
+
+case "$STEVE_KEY_EXCHANGE" in
+  X25519|XWING-DRAFT10) ;;
+  *)
+    echo "STEVE_KEY_EXCHANGE must be exactly X25519 or XWING-DRAFT10" >&2
+    exit 2
+    ;;
+esac
+export STEVE_KEY_EXCHANGE
 
 compose() {
   docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" "$@"

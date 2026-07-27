@@ -1,10 +1,19 @@
 import { expect, test } from '@playwright/test';
 
+const keyExchange = process.env.STEVE_KEY_EXCHANGE || 'X25519';
+if (!['X25519', 'XWING-DRAFT10'].includes(keyExchange)) {
+  throw new Error('STEVE_KEY_EXCHANGE must be exactly X25519 or XWING-DRAFT10');
+}
+
 async function openDemo(page, url = '/') {
   await page.goto(url);
   await page.waitForFunction(() => Boolean(window.steveDemo));
   await expect(page.locator('#system-status')).toContainText('Service worker active');
-  return page.evaluate(() => window.steveDemo.status());
+  return page.evaluate(async expectedKeyExchange => {
+    const client = await window.steveDemo.ready;
+    await client.configure({ expectedKeyExchange });
+    return client.getStatus();
+  }, keyExchange);
 }
 
 async function initialize(page) {
@@ -22,7 +31,7 @@ test('starts with an honest idle state and synthetic verifier profile', async ({
   expect(status.protocol).toEqual({
     id: 'STEVE-E2P-V2',
     version: 2,
-    keyEstablishment: 'X25519',
+    keyEstablishment: keyExchange,
     keyDerivation: 'HKDF-SHA256',
     recordProtection: 'AES-256-GCM'
   });
@@ -145,10 +154,13 @@ test('serves bootstrap scripts through a controlling worker even when the enclav
   // worker treats same-origin traffic as protected. The bootstrap scripts must
   // still pass through untouched, or the page can never load the code that
   // configures the worker — the self-perpetuating deadlock this guards against.
-  await page.evaluate(async () => {
+  await page.evaluate(async expectedKeyExchange => {
     const client = await window.steveDemo.ready;
-    await client.configure({ enclaveOrigin: location.origin });
-  });
+    await client.configure({
+      enclaveOrigin: location.origin,
+      expectedKeyExchange
+    });
+  }, keyExchange);
 
   const fetched = await page.evaluate(async () => {
     const read = async path => {
@@ -158,7 +170,12 @@ test('serves bootstrap scripts through a controlling worker even when the enclav
     return {
       bootstrap: Object.fromEntries(
         await Promise.all(
-          ['/attestation-widget.js', '/register.js', '/enclave-sw.js'].map(
+          [
+            '/attestation-widget.js',
+            '/register.js',
+            '/enclave-sw.js',
+            '/xwing/steve_xwing_wasm_bg.wasm'
+          ].map(
             async path => [path, await read(path)]
           )
         )
@@ -176,7 +193,12 @@ test('serves bootstrap scripts through a controlling worker even when the enclav
     };
   });
 
-  for (const path of ['/attestation-widget.js', '/register.js', '/enclave-sw.js']) {
+  for (const path of [
+    '/attestation-widget.js',
+    '/register.js',
+    '/enclave-sw.js',
+    '/xwing/steve_xwing_wasm_bg.wasm'
+  ]) {
     expect(fetched.bootstrap[path].status).toBe(200);
     expect(fetched.bootstrap[path].body).not.toContain('secure channel failed');
   }
@@ -230,7 +252,11 @@ test('restores routing configuration after the service worker is restarted', asy
   await cdp.send('ServiceWorker.enable');
   await cdp.send('ServiceWorker.stopAllWorkers');
 
-  const status = await page.evaluate(() => window.steveDemo.initialize());
+  const status = await page.evaluate(async expectedKeyExchange => {
+    const client = await window.steveDemo.ready;
+    await client.configure({ expectedKeyExchange });
+    return window.steveDemo.initialize();
+  }, keyExchange);
   const echo = await page.evaluate(() => window.steveDemo.echo('after-worker-restart'));
   expect(status.initialized).toBe(true);
   expect(echo).toEqual({ status: 200, body: 'after-worker-restart' });
@@ -251,7 +277,11 @@ test('reconfigures after persisted routing configuration is lost', async ({
 
   await page.waitForFunction(() => Boolean(window.steveDemo));
   await expect(page.locator('#system-status')).toContainText('Service worker active');
-  const status = await page.evaluate(() => window.steveDemo.initialize());
+  const status = await page.evaluate(async expectedKeyExchange => {
+    const client = await window.steveDemo.ready;
+    await client.configure({ expectedKeyExchange });
+    return window.steveDemo.initialize();
+  }, keyExchange);
   const echo = await page.evaluate(() => window.steveDemo.echo('after-config-loss'));
 
   expect(status.initialized).toBe(true);
