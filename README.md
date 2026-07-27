@@ -168,8 +168,23 @@ and a test upstream using pinned StageX `linux/amd64` images. It uses signed
 synthetic Nitro-shaped evidence rooted in public test keys; it validates the
 protocol and attestation bindings, not Nitro hardware authenticity or isolation.
 
+Install the local build dependencies once:
+
 ```bash
 npm --prefix steve-js-sdk ci --ignore-scripts
+rustup target add wasm32-unknown-unknown
+cargo install --locked wasm-bindgen-cli --version 0.2.106
+cargo fetch --locked
+```
+
+Here `npm ci` means a clean, lockfile-exact dependency install; it does not
+configure a CI service. The SDK's project-scoped npm policy permits only Git
+dependencies declared directly in its `package.json`. The E2E build itself
+remains locked and offline.
+
+Run the default Chromium/X25519 suite:
+
+```bash
 ./scripts/test-e2e.sh
 ```
 
@@ -199,6 +214,9 @@ For the manual demo:
 ./scripts/test-e2e.sh logs
 ./scripts/test-e2e.sh down
 ```
+
+The demo uses the same local build dependencies listed above, but does not
+require Playwright or its browser downloads.
 
 The demo accepts an application request body and shows the exact encrypted
 request/response envelopes alongside the plaintext visible to the browser

@@ -130,4 +130,8 @@ locked Cargo graph, and builds the application offline. A digest-pinned StageX N
 WASM digest, and copies the fixed WASM asset into `dist/xwing/`.
 
 For local non-container builds, install the `wasm32-unknown-unknown` target and
-exact `wasm-bindgen-cli` 0.2.106, then run `npm run build`.
+exact `wasm-bindgen-cli` 0.2.106. Install JavaScript dependencies with
+`npm ci --ignore-scripts`; this is a clean, lockfile-exact install, not CI
+service configuration. The project `.npmrc` permits only Git dependencies
+declared directly in this package. Cache the locked Rust dependencies with
+`cargo fetch --locked`, then run `npm run build`; the build itself is offline.
