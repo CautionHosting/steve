@@ -3,10 +3,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const WASM_BINDGEN_VERSION = '0.2.106';
-const cargo = process.env.CARGO || 'cargo';
-const wasmBindgen = process.env.WASM_BINDGEN || 'wasm-bindgen';
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const repository = path.resolve(directory, '..');
+const cargoOverride = process.env.CARGO;
+const cargo = cargoOverride || rustupTool('cargo');
+const rustc = process.env.RUSTC || (cargoOverride ? 'rustc' : rustupTool('rustc'));
+const wasmBindgen = process.env.WASM_BINDGEN || 'wasm-bindgen';
 const targetWasm = path.join(
   repository,
   'target/wasm32-unknown-unknown/release/steve_xwing_wasm.wasm'
@@ -22,7 +24,7 @@ run(cargo, [
   'steve-xwing-wasm',
   '--target',
   'wasm32-unknown-unknown'
-], repository);
+], repository, false, { RUSTC: rustc });
 
 const version = run(wasmBindgen, ['--version'], repository, true).trim();
 if (version !== `wasm-bindgen ${WASM_BINDGEN_VERSION}`) {
@@ -42,9 +44,10 @@ run(wasmBindgen, [
   '--no-typescript'
 ], repository);
 
-function run(command, args, cwd, capture = false) {
+function run(command, args, cwd, capture = false, environment = {}) {
   const result = spawnSync(command, args, {
     cwd,
+    env: { ...process.env, ...environment },
     encoding: 'utf8',
     stdio: capture ? ['ignore', 'pipe', 'inherit'] : 'inherit'
   });
@@ -56,4 +59,8 @@ function run(command, args, cwd, capture = false) {
     throw new Error(`${command} exited with status ${result.status}`);
   }
   return result.stdout || '';
+}
+
+function rustupTool(tool) {
+  return run('rustup', ['which', tool], repository, true).trim();
 }
