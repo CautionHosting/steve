@@ -1,17 +1,22 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import { decode as decodeCBOR, encode as encodeCBOR } from 'tee-attestation-js/lib/cbor';
 
 import {
   Direction,
   MessageType,
   SequenceTracker,
+  X25519_KEY_EXCHANGE,
+  XWING_KEY_EXCHANGE,
   associatedData,
   buildTranscript,
   decodeEnvelope,
+  decodeSessionResponse,
   deriveMaterial,
   encodeBase64Url,
   encodeEnvelope,
+  encodeSessionRequest,
   messageNonce,
   open,
   seal,
@@ -24,27 +29,86 @@ const vectors = JSON.parse(await readFile(
   new URL('../../test-vectors/e2p-v2.json', import.meta.url),
   'utf8'
 ));
+const xwingVectors = JSON.parse(await readFile(
+  new URL('../../test-vectors/e2p-v2-xwing.json', import.meta.url),
+  'utf8'
+));
 const bytes = value => Uint8Array.from(Buffer.from(value, 'hex'));
 const hex = value => Buffer.from(value).toString('hex');
 
-test('shared transcript and HKDF vector matches Rust', async () => {
-  const transcript = buildTranscript(
-    bytes(vectors.client_nonce),
-    bytes(vectors.client_public_key),
-    bytes(vectors.server_public_key),
-    bytes(vectors.session_id),
-    bytes(vectors.context_hash)
+for (const sharedVectors of [vectors, xwingVectors]) {
+  test(`${sharedVectors.key_exchange} shared wire, transcript, HKDF, and confirmation vectors match Rust`, async () => {
+    const clientNonce = bytes(sharedVectors.client_nonce);
+    const clientKeyMaterial = bytes(sharedVectors.client_key_material);
+    const serverKeyMaterial = bytes(sharedVectors.server_key_material);
+    const sessionId = bytes(sharedVectors.session_id);
+    const contextHash = bytes(sharedVectors.context_hash);
+
+    assert.equal(
+      hex(encodeSessionRequest(
+        sharedVectors.key_exchange,
+        clientNonce,
+        clientKeyMaterial,
+        contextHash
+      )),
+      sharedVectors.session_request_cbor
+    );
+    const response = decodeSessionResponse(
+      bytes(sharedVectors.session_response_cbor),
+      sharedVectors.key_exchange
+    );
+    assert.deepEqual(response.session_id, sessionId);
+    assert.deepEqual(response.server_key_material, serverKeyMaterial);
+
+    const transcript = buildTranscript(
+      sharedVectors.key_exchange,
+      clientNonce,
+      clientKeyMaterial,
+      serverKeyMaterial,
+      sessionId,
+      contextHash
+    );
+    assert.equal(hex(transcript), sharedVectors.transcript);
+    const transcriptHash = await sha256(transcript);
+    assert.equal(hex(transcriptHash), sharedVectors.transcript_hash);
+
+    const sharedSecret = bytes(sharedVectors.shared_secret);
+    const material = await deriveMaterial(sharedSecret, transcriptHash);
+    assert.deepEqual(
+      sharedSecret,
+      new Uint8Array(32),
+      'raw shared secret must be overwritten'
+    );
+    assert.equal(hex(material.c2sKey), sharedVectors.c2s_key);
+    assert.equal(hex(material.s2cKey), sharedVectors.s2c_key);
+    assert.equal(hex(material.c2sIvPrefix), sharedVectors.c2s_iv_prefix);
+    assert.equal(hex(material.s2cIvPrefix), sharedVectors.s2c_iv_prefix);
+    assert.equal(hex(material.binder), sharedVectors.binder);
+
+    const confirmationCiphertext = await seal(
+      material,
+      Direction.CLIENT_TO_SERVER,
+      MessageType.CONFIRMATION,
+      sessionId,
+      0n,
+      bytes(sharedVectors.confirmation_plaintext)
+    );
+    assert.equal(
+      hex(confirmationCiphertext),
+      sharedVectors.confirmation_ciphertext
+    );
+    assert.equal(
+      hex(encodeEnvelope(sessionId, 0n, confirmationCiphertext)),
+      sharedVectors.confirmation_record_cbor
+    );
+  });
+}
+
+test('X25519 application nonce and AAD match the shared vector', async () => {
+  const material = await deriveMaterial(
+    bytes(vectors.shared_secret),
+    bytes(vectors.transcript_hash)
   );
-  const transcriptHash = await sha256(transcript);
-  assert.equal(hex(transcriptHash), vectors.transcript_hash);
-
-  const material = await deriveMaterial(bytes(vectors.shared_secret), transcriptHash);
-  assert.equal(hex(material.c2sKey), vectors.c2s_key);
-  assert.equal(hex(material.s2cKey), vectors.s2c_key);
-  assert.equal(hex(material.c2sIvPrefix), vectors.c2s_iv_prefix);
-  assert.equal(hex(material.s2cIvPrefix), vectors.s2c_iv_prefix);
-  assert.equal(hex(material.binder), vectors.binder);
-
   const sequence = BigInt(vectors.sequence);
   assert.equal(hex(messageNonce(material.c2sIvPrefix, sequence)), vectors.c2s_application_iv);
   assert.equal(
@@ -77,23 +141,108 @@ test('envelope is strict and response direction is authenticated', async () => {
 });
 
 test('attested binder requires exact transcript values', () => {
+  const keyExchange = vectors.key_exchange;
   const sessionId = bytes(vectors.session_id);
   const transcriptHash = bytes(vectors.transcript_hash);
   const binder = bytes(vectors.binder);
   const userData = {
     protocol: 'STEVE-E2P-V2',
+    key_exchange: keyExchange,
     session_id: encodeBase64Url(sessionId),
     transcript_hash: encodeBase64Url(transcriptHash),
     binder: encodeBase64Url(binder)
   };
-  verifyBinding(userData, sessionId, transcriptHash, binder);
-  validateAttestationResult({ verified: true, userData }, sessionId, transcriptHash, binder);
+  verifyBinding(userData, keyExchange, sessionId, transcriptHash, binder);
+  validateAttestationResult(
+    { verified: true, userData },
+    keyExchange,
+    sessionId,
+    transcriptHash,
+    binder
+  );
   assert.throws(
-    () => validateAttestationResult({ verified: false, error: 'bad chain' }, sessionId, transcriptHash, binder),
+    () => validateAttestationResult(
+      { verified: false, error: 'bad chain' },
+      keyExchange,
+      sessionId,
+      transcriptHash,
+      binder
+    ),
     /bad chain/u
   );
   const tampered = { ...userData, binder: encodeBase64Url(new Uint8Array(32)) };
-  assert.throws(() => verifyBinding(tampered, sessionId, transcriptHash, binder), /binder mismatch/u);
+  assert.throws(
+    () => verifyBinding(tampered, keyExchange, sessionId, transcriptHash, binder),
+    /binder mismatch/u
+  );
+  assert.throws(
+    () => verifyBinding(
+      { ...userData, key_exchange: XWING_KEY_EXCHANGE },
+      keyExchange,
+      sessionId,
+      transcriptHash,
+      binder
+    ),
+    /protocol binding mismatch/u
+  );
+});
+
+test('session wire uses generic key material fields and exact suite', () => {
+  const clientNonce = new Uint8Array(32).fill(1);
+  const clientKeyMaterial = new Uint8Array(32).fill(2);
+  const contextHash = new Uint8Array(32).fill(3);
+  const request = decodeCBOR(encodeSessionRequest(
+    X25519_KEY_EXCHANGE,
+    clientNonce,
+    clientKeyMaterial,
+    contextHash
+  ));
+
+  assert.equal(request.key_exchange, X25519_KEY_EXCHANGE);
+  assert.deepEqual(request.client_key_material, clientKeyMaterial);
+  assert.equal('client_public_key' in request, false);
+
+  const response = decodeSessionResponse(encodeCBOR({
+    version: 2,
+    key_exchange: X25519_KEY_EXCHANGE,
+    session_id: new Uint8Array(16),
+    server_key_material: new Uint8Array(32),
+    attestation_document: new Uint8Array([1]),
+    expires_in_seconds: 30
+  }), X25519_KEY_EXCHANGE);
+  assert.equal(response.key_exchange, X25519_KEY_EXCHANGE);
+  assert.equal('server_public_key' in response, false);
+
+  assert.throws(
+    () => decodeSessionResponse(encodeCBOR({
+      ...response,
+      key_exchange: XWING_KEY_EXCHANGE
+    }), X25519_KEY_EXCHANGE),
+    /key exchange mismatch/u
+  );
+});
+
+test('X-Wing transcript binds the suite and exact 1216/1120-byte material', () => {
+  const transcript = buildTranscript(
+    XWING_KEY_EXCHANGE,
+    new Uint8Array(32).fill(1),
+    new Uint8Array(1216).fill(2),
+    new Uint8Array(1120).fill(3),
+    new Uint8Array(16).fill(4),
+    new Uint8Array(32).fill(5)
+  );
+  const prefix = new TextEncoder().encode('STEVE-E2P-V2\0XWING-DRAFT10\0');
+
+  assert.deepEqual(transcript.slice(0, prefix.length), prefix);
+  assert.equal(transcript.length, prefix.length + 32 + 1216 + 1120 + 16 + 32);
+  assert.throws(() => buildTranscript(
+    XWING_KEY_EXCHANGE,
+    new Uint8Array(32),
+    new Uint8Array(32),
+    new Uint8Array(1120),
+    new Uint8Array(16),
+    new Uint8Array(32)
+  ), /invalid client key material/u);
 });
 
 test('concurrent sequence allocation is unique and duplicate responses fail', async () => {

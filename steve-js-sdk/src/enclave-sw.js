@@ -1,10 +1,11 @@
 import { encode as encodeCBOR, decode as decodeCBOR } from 'tee-attestation-js/lib/cbor';
 import { ATTESTATION_PROFILE, verifyAttestation } from './attestation-verifier.js';
+import { createClientKeyExchange, loadVerifiedXWingModule } from './key-exchange.js';
 import {
   CONFIRM_ENDPOINT,
+  DEFAULT_KEY_EXCHANGE,
   Direction,
   KEY_DERIVATION,
-  KEY_ESTABLISHMENT_SUITE,
   MessageType,
   PROTOCOL_ID,
   REQUEST_ENDPOINT,
@@ -22,12 +23,18 @@ import {
   equalBytes,
   hashOrigin,
   open,
+  requireKeyExchange,
   seal,
   sha256,
   validateAttestationResult
 } from './protocol-v2.js';
 
-const DEFAULT_BOOTSTRAP_PATHS = ['/enclave-sw.js', '/register.js', '/attestation-widget.js'];
+const DEFAULT_BOOTSTRAP_PATHS = [
+  '/enclave-sw.js',
+  '/register.js',
+  '/attestation-widget.js',
+  '/xwing/steve_xwing_wasm_bg.wasm'
+];
 const SAFE_BOOTSTRAP_METHODS = new Set(['GET', 'HEAD']);
 const ROTATION_INTERVAL_MS = 25 * 60 * 1000;
 const PROTOCOL_EXCLUDE_PREFIXES = ['/e2p/'];
@@ -46,7 +53,8 @@ function defaultConfig() {
     passthroughPaths: [...DEFAULT_BOOTSTRAP_PATHS],
     excludePrefixes: ['/attestation', '/e2p/'],
     emitEncryptedPayloads: false,
-    requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+    requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+    expectedKeyExchange: DEFAULT_KEY_EXCHANGE
   };
 }
 
@@ -303,122 +311,129 @@ async function establishSession(_trigger, targetState) {
 }
 
 async function establishSessionWithinDeadline(signal, targetState) {
+  const keyExchange = config.expectedKeyExchange;
   updateStage(targetState, 'creating-session');
   const clientNonce = crypto.getRandomValues(new Uint8Array(32));
-  const clientKeyPair = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
-  throwIfAborted(signal);
-  const clientPublicKey = new Uint8Array(await crypto.subtle.exportKey('raw', clientKeyPair.publicKey));
-  throwIfAborted(signal);
-  const contextHash = await hashOrigin(self.location.origin);
-  throwIfAborted(signal);
-  const response = await protocolFetch(
-    SESSION_ENDPOINT,
-    encodeSessionRequest(clientNonce, clientPublicKey, contextHash),
-    signal
+  const clientKeyExchange = await createClientKeyExchange(
+    keyExchange,
+    loadVerifiedXWingModule
   );
-  if (!response.ok) throw new ProtocolHttpError(response.status, 'session creation');
-  const sessionResponse = decodeSessionResponse(new Uint8Array(await response.arrayBuffer()));
-  throwIfAborted(signal);
-  const transcript = buildTranscript(
-    clientNonce,
-    clientPublicKey,
-    sessionResponse.server_public_key,
-    sessionResponse.session_id,
-    contextHash
-  );
-  const transcriptHash = await sha256(transcript);
-  throwIfAborted(signal);
-  const serverPublicKey = await crypto.subtle.importKey(
-    'raw',
-    sessionResponse.server_public_key,
-    { name: 'X25519' },
-    false,
-    []
-  );
-  throwIfAborted(signal);
-  const sharedSecret = new Uint8Array(await crypto.subtle.deriveBits(
-    { name: 'X25519', public: serverPublicKey },
-    clientKeyPair.privateKey,
-    256
-  ));
-  throwIfAborted(signal);
-  const material = await deriveMaterial(sharedSecret, transcriptHash);
-  throwIfAborted(signal);
+  try {
+    throwIfAborted(signal);
+    const clientKeyMaterial = clientKeyExchange.publicKey;
+    const contextHash = await hashOrigin(self.location.origin);
+    throwIfAborted(signal);
+    const response = await protocolFetch(
+      SESSION_ENDPOINT,
+      encodeSessionRequest(
+        keyExchange,
+        clientNonce,
+        clientKeyMaterial,
+        contextHash
+      ),
+      signal
+    );
+    if (!response.ok) throw new ProtocolHttpError(response.status, 'session creation');
+    const sessionResponse = decodeSessionResponse(
+      new Uint8Array(await response.arrayBuffer()),
+      keyExchange
+    );
+    throwIfAborted(signal);
+    const transcript = buildTranscript(
+      keyExchange,
+      clientNonce,
+      clientKeyMaterial,
+      sessionResponse.server_key_material,
+      sessionResponse.session_id,
+      contextHash
+    );
+    const transcriptHash = await sha256(transcript);
+    throwIfAborted(signal);
+    const sharedSecret = await clientKeyExchange.decapsulate(
+      sessionResponse.server_key_material
+    );
+    const material = await deriveMaterial(sharedSecret, transcriptHash);
+    throwIfAborted(signal);
 
-  updateStage(targetState, 'verifying-attestation');
-  const attestation = await verifyAttestation(
-    sessionResponse.attestation_document,
-    { nonce: clientNonce }
-  );
-  throwIfAborted(signal);
-  validateAttestationResult(
-    attestation,
-    sessionResponse.session_id,
-    transcriptHash,
-    material.binder
-  );
+    updateStage(targetState, 'verifying-attestation');
+    const attestation = await verifyAttestation(
+      sessionResponse.attestation_document,
+      { nonce: clientNonce }
+    );
+    throwIfAborted(signal);
+    validateAttestationResult(
+      attestation,
+      keyExchange,
+      sessionResponse.session_id,
+      transcriptHash,
+      material.binder
+    );
 
-  updateStage(targetState, 'confirming-session');
-  const confirmationCiphertext = await seal(
-    material,
-    Direction.CLIENT_TO_SERVER,
-    MessageType.CONFIRMATION,
-    sessionResponse.session_id,
-    0n,
-    transcriptHash
-  );
-  throwIfAborted(signal);
-  const confirmationResponse = await protocolFetch(
-    CONFIRM_ENDPOINT,
-    encodeEnvelope(sessionResponse.session_id, 0n, confirmationCiphertext),
-    signal
-  );
-  if (!confirmationResponse.ok) {
-    throw new ProtocolHttpError(confirmationResponse.status, 'session confirmation');
-  }
-  const confirmationEnvelope = decodeEnvelope(
-    new Uint8Array(await confirmationResponse.arrayBuffer())
-  );
-  throwIfAborted(signal);
-  if (confirmationEnvelope.sequenceValue !== 0n
-      || !equalBytes(confirmationEnvelope.session_id, sessionResponse.session_id)) {
-    throw new Error('unexpected confirmation response');
-  }
-  const confirmedHash = await open(
-    material,
-    Direction.SERVER_TO_CLIENT,
-    MessageType.CONFIRMATION,
-    sessionResponse.session_id,
-    0n,
-    confirmationEnvelope.ciphertext
-  );
-  throwIfAborted(signal);
-  if (!equalBytes(confirmedHash, transcriptHash)) throw new Error('session confirmation mismatch');
-
-  const session = {
-    id: sessionResponse.session_id,
-    material,
-    sequences: new SequenceTracker(),
-    createdAt: Date.now(),
-    transcriptHash,
-    confirmation: 'verified',
-    attestation: {
-      verified: true,
-      profile: ATTESTATION_PROFILE.id,
-      trustAnchor: ATTESTATION_PROFILE.trustAnchor,
-      synthetic: ATTESTATION_PROFILE.synthetic,
-      pcrs: attestation.pcrs,
-      moduleId: attestation.moduleId,
-      checks: {
-        certificateChain: 'verified',
-        nonceBinding: 'verified',
-        sessionBinding: 'verified',
-        keyConfirmation: 'verified',
-        expectedPcrPolicy: 'not-checked'
-      }
+    updateStage(targetState, 'confirming-session');
+    const confirmationCiphertext = await seal(
+      material,
+      Direction.CLIENT_TO_SERVER,
+      MessageType.CONFIRMATION,
+      sessionResponse.session_id,
+      0n,
+      transcriptHash
+    );
+    throwIfAborted(signal);
+    const confirmationResponse = await protocolFetch(
+      CONFIRM_ENDPOINT,
+      encodeEnvelope(sessionResponse.session_id, 0n, confirmationCiphertext),
+      signal
+    );
+    if (!confirmationResponse.ok) {
+      throw new ProtocolHttpError(confirmationResponse.status, 'session confirmation');
     }
-  };
-  return session;
+    const confirmationEnvelope = decodeEnvelope(
+      new Uint8Array(await confirmationResponse.arrayBuffer())
+    );
+    throwIfAborted(signal);
+    if (confirmationEnvelope.sequenceValue !== 0n
+        || !equalBytes(confirmationEnvelope.session_id, sessionResponse.session_id)) {
+      throw new Error('unexpected confirmation response');
+    }
+    const confirmedHash = await open(
+      material,
+      Direction.SERVER_TO_CLIENT,
+      MessageType.CONFIRMATION,
+      sessionResponse.session_id,
+      0n,
+      confirmationEnvelope.ciphertext
+    );
+    throwIfAborted(signal);
+    if (!equalBytes(confirmedHash, transcriptHash)) throw new Error('session confirmation mismatch');
+
+    const session = {
+      id: sessionResponse.session_id,
+      keyExchange,
+      material,
+      sequences: new SequenceTracker(),
+      createdAt: Date.now(),
+      transcriptHash,
+      confirmation: 'verified',
+      attestation: {
+        verified: true,
+        profile: ATTESTATION_PROFILE.id,
+        trustAnchor: ATTESTATION_PROFILE.trustAnchor,
+        synthetic: ATTESTATION_PROFILE.synthetic,
+        pcrs: attestation.pcrs,
+        moduleId: attestation.moduleId,
+        checks: {
+          certificateChain: 'verified',
+          nonceBinding: 'verified',
+          sessionBinding: 'verified',
+          keyConfirmation: 'verified',
+          expectedPcrPolicy: 'not-checked'
+        }
+      }
+    };
+    return session;
+  } finally {
+    clientKeyExchange.destroy();
+  }
 }
 
 async function protocolFetch(path, body, signal) {
@@ -569,7 +584,8 @@ function configure(update) {
     'passthroughPaths',
     'excludePrefixes',
     'emitEncryptedPayloads',
-    'requestTimeoutMs'
+    'requestTimeoutMs',
+    'expectedKeyExchange'
   ];
   for (const key of Object.keys(update)) {
     if (!allowed.includes(key)) throw new Error(`unsupported configuration key: ${key}`);
@@ -577,6 +593,9 @@ function configure(update) {
   if ('passthroughPaths' in update) validatePathList(update.passthroughPaths);
   if ('excludePrefixes' in update) validatePathList(update.excludePrefixes);
   if ('requestTimeoutMs' in update) validateRequestTimeout(update.requestTimeoutMs);
+  if ('expectedKeyExchange' in update) {
+    requireKeyExchange(update.expectedKeyExchange);
+  }
 
   const next = { ...config, ...update };
   if ('enclaveOrigin' in update) {
@@ -589,7 +608,8 @@ function configure(update) {
     ...new Set([...PROTOCOL_EXCLUDE_PREFIXES, ...next.excludePrefixes])
   ];
   const enclaveChanged = next.enclaveOrigin !== config.enclaveOrigin;
-  if (enclaveChanged) resetState();
+  const keyExchangeChanged = next.expectedKeyExchange !== config.expectedKeyExchange;
+  if (enclaveChanged || keyExchangeChanged) resetState();
   config = next;
 }
 
@@ -688,7 +708,7 @@ function statusMessage() {
     protocol: {
       id: PROTOCOL_ID,
       version: VERSION,
-      keyEstablishment: KEY_ESTABLISHMENT_SUITE,
+      keyEstablishment: session?.keyExchange || config.expectedKeyExchange,
       keyDerivation: KEY_DERIVATION,
       recordProtection: RECORD_PROTECTION
     },
@@ -771,14 +791,7 @@ function updateStage(targetState, stage) {
   notifyStatus();
 }
 
-// Test-only surface, attached as a plain global rather than an ESM export.
-// This file is bundled by esbuild and shipped as dist/enclave-sw.js, which is
-// registered as a *classic* (non-module) service worker script (see
-// register.js: navigator.serviceWorker.register() with no `type: 'module'`).
-// A top-level `export` statement would survive bundling and throw a
-// SyntaxError when that classic script is parsed by the browser, so tests
-// reach internals via `self.__ENCLAVE_SW_TEST__` instead. Do not use outside
-// tests.
+// Test-only surface kept off the package exports.
 self.__ENCLAVE_SW_TEST__ = {
   configure,
   hasValidSession,

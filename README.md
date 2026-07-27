@@ -5,7 +5,11 @@
 End-to-end encryption for browser applications communicating with AWS Nitro Enclaves. With the v2 browser client active, application traffic is encrypted in the service worker and decrypted only inside the enclave.
 
 > [!IMPORTANT]
-> v2 binds fresh Nitro evidence to the exact X25519 session. It does not yet enforce expected PCRs, independently protect the service-worker bootstrap, or make STEVE fail closed when the service worker is absent. Those controls are separate work.
+> v2 supports process-pinned X25519 or X-Wing draft-10 sessions and binds the
+> selected suite into the transcript and Nitro evidence. X-Wing protects
+> session secrecy independently of expected-deployment identity, but does not
+> provide trusted first-load bootstrap, expected-PCR delivery, or fail-closed
+> plaintext routing.
 
 ## Architecture
 
@@ -48,9 +52,9 @@ For requests intercepted by the active v2 worker, the host terminates TLS but on
 
 ## How It Works
 
-1. **Session request**: The browser generates a nonce and ephemeral X25519 key, and commits to its origin.
-2. **Attested key exchange**: STEVE generates its own ephemeral key and asks Nitro to attest a transcript containing both keys, the nonce, session ID, origin context, and a key-derived binder.
-3. **Verification and confirmation**: The browser verifies the Nitro chain, nonce, transcript values, and binder, then confirms possession of the derived keys.
+1. **Session request**: The client generates a nonce and ephemeral X25519 or X-Wing key, sends its pinned suite, and commits to its origin.
+2. **Attested key exchange**: STEVE uses its process-fixed suite and asks Nitro to attest the suite, transcript, nonce, session ID, origin context, and key-derived binder.
+3. **Verification and confirmation**: The client verifies the expected suite in the response and Nitro binding, then confirms possession of the derived keys.
 4. **Request Flow**:
    - Application makes request through STEVE SDK
    - SDK encrypts payload with AES-256-GCM
@@ -69,14 +73,20 @@ For requests intercepted by the active v2 worker, the host terminates TLS but on
 
 At startup `steve` writes enclave metadata to `E2P_METADATA_FILE` (default
 `/metadata.json`), which bootproofd embeds as attestation `user_data`. In v2
-this carries `{"e2p_protocol_version": 2}` — the v1 persistent `verifying_key`
-is intentionally gone, since attestation is now bound per session.
+this carries `{"e2p_protocol_version":2,"e2p_key_exchange":"..."}` — the v1
+persistent `verifying_key` is intentionally gone, since attestation is now
+bound per session.
+
+`STEVE_KEY_EXCHANGE` accepts only `X25519` or `XWING-DRAFT10`. Omission selects
+X25519. The suite is fixed for the process lifetime; changing it requires a
+new enclave build/deployment.
 
 ## Security Properties
 
 - **E2E Encryption**: Data encrypted client ↔ enclave (AES-256-GCM)
 - **Attestation-Bound Keys**: Fresh Nitro evidence commits to the exact v2 session transcript and derived key binder
-- **Forward Secrecy**: Ephemeral X25519 keys per session
+- **Hybrid Session Secrecy**: X-Wing combines ML-KEM-768 and X25519; X25519 remains the compatibility default
+- **Downgrade Resistance**: Clients pin the suite and verify the wire response, transcript, and attestation binding without fallback
 - **Replay Resistance**: Directional keys, derived IVs, authenticated sequences, and a 64-entry server replay window
 - **Host Isolation**: On the v2 path, the host sees only ciphertext despite terminating TLS
 
@@ -85,7 +95,8 @@ Current limitations:
 - Expected PCR values are not enforced by the browser client.
 - Plaintext requests are still forwarded when the service worker is absent; fail-closed routing is deferred.
 - The first-load service-worker bootstrap is not independently trusted.
-- The Rust client SDK is skeletal; v2 is currently browser-first.
+- A host can route a client to another legitimate enclave using the same pinned suite unless expected deployment identity is supplied independently.
+- Browser WASM must not be described as inherently constant-time; its supported-browser side-channel posture requires independent review.
 
 ## Usage
 
@@ -108,6 +119,7 @@ origin and fetch it explicitly:
 const client = await registerEnclaveServiceWorker({
   config: {
     enclaveOrigin: 'https://secure.example',
+    expectedKeyExchange: 'XWING-DRAFT10',
     requestTimeoutMs: 30000
   }
 });
@@ -115,6 +127,10 @@ await client.initialize(); // Optional eager establishment
 
 const response = await fetch('https://secure.example/api/secret');
 ```
+
+`expectedKeyExchange` defaults to `X25519`; X-Wing deployments must set
+`XWING-DRAFT10` explicitly. Initialization, CSP, response, or
+attestation failures abort without X25519 fallback.
 
 `initialize()` eagerly establishes the session and is recommended when the
 application wants attestation failures before its first protected request. It
@@ -142,7 +158,8 @@ failures do not reset an otherwise valid secure session. The SDK does not
 automatically retry timed-out requests because the upstream operation may
 already have executed.
 
-The native Rust SDK does not yet implement the v2 client flow.
+The native Rust SDK remains separate follow-up work; this branch contains the
+server and browser/WASM implementation.
 
 ## Local E2E
 
@@ -152,7 +169,7 @@ synthetic Nitro-shaped evidence rooted in public test keys; it validates the
 protocol and attestation bindings, not Nitro hardware authenticity or isolation.
 
 ```bash
-npm --prefix steve-js-sdk install
+npm --prefix steve-js-sdk ci --ignore-scripts
 ./scripts/test-e2e.sh
 ```
 
@@ -163,6 +180,15 @@ To run the same suite with Playwright Firefox:
 ```bash
 npm --prefix steve-js-sdk exec playwright install firefox
 STEVE_E2E_BROWSER=firefox ./scripts/test-e2e.sh
+```
+
+Select `webkit` the same way. The E2E harness uses the server's fixed suite as
+the browser's configured expectation, so one variable selects both:
+
+```bash
+STEVE_KEY_EXCHANGE=XWING-DRAFT10 \
+STEVE_E2E_BROWSER=chromium \
+./scripts/test-e2e.sh
 ```
 
 For the manual demo:

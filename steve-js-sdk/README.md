@@ -4,7 +4,10 @@ JavaScript service worker for client side facilitation of steve.
 
 ## Quick Start
 
-1. Copy `dist/enclave-sw.js` and `dist/register.js` to your app's public directory
+1. Copy the complete `dist/` tree to your app's public directory. X-Wing needs
+   the fixed self-hosted `dist/xwing/steve_xwing_wasm_bg.wasm` asset beside the
+   module service worker. Its generated JavaScript bindings are statically
+   bundled into `enclave-sw.js`.
 
 2. Add to your app:
 
@@ -16,6 +19,25 @@ await client.initialize() // Optional eager establishment
 ```
 
 The worker establishes an attestation-bound v2 session and encrypts intercepted application requests through `/e2p/v2/request`.
+
+X25519 WebCrypto is the default. X-Wing is fail-closed and must be pinned
+explicitly; it never falls back to X25519:
+
+```javascript
+const client = await registerEnclaveServiceWorker({
+  config: { expectedKeyExchange: 'XWING-DRAFT10' }
+})
+```
+
+The configured suite is exact and client-pinned; the session response and
+attestation binding must both match it. The worker does not negotiate a suite
+or make a metadata preflight request.
+
+For X-Wing, the bundle contains the SHA-256 digest of the exact WASM emitted by
+the same build. The worker fetches that fixed same-origin asset without cache,
+verifies the digest, and only then instantiates it. This detects a bundle/asset
+mismatch; it does not establish first-load trust if an attacker can replace
+both `enclave-sw.js` and the WASM asset.
 
 `initialize()` is an idempotent eager warm-up. Use it when the application
 wants attestation failure to surface before its first protected request. It is
@@ -47,7 +69,8 @@ registerEnclaveServiceWorker({
     passthroughPaths: ['/enclave-sw.js', '/register.js', '/attestation-widget.js'],
     excludePrefixes: ['/attestation', '/e2p/'],
     emitEncryptedPayloads: false,
-    requestTimeoutMs: 30000
+    requestTimeoutMs: 30000,
+    expectedKeyExchange: 'X25519'
   }
 })
 ```
@@ -98,3 +121,13 @@ fallback routes retain the upstream application's CORS policy.
 ```bash
 make build
 ```
+
+The production build is self-contained: a digest-pinned StageX Rust 1.96.0
+stage builds the `wasm32-unknown-unknown` standard library from its matching
+bundled Rust source, installs exactly `wasm-bindgen-cli` 0.2.106, fetches the
+locked Cargo graph, and builds the application offline. A digest-pinned StageX Node stage then runs
+`npm ci --ignore-scripts`, statically bundles the generated bindings and their
+WASM digest, and copies the fixed WASM asset into `dist/xwing/`.
+
+For local non-container builds, install the `wasm32-unknown-unknown` target and
+exact `wasm-bindgen-cli` 0.2.106, then run `npm run build`.

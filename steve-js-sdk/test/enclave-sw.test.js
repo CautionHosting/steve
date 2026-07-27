@@ -5,6 +5,8 @@ import {
   Direction,
   MessageType,
   SequenceTracker,
+  X25519_KEY_EXCHANGE,
+  XWING_KEY_EXCHANGE,
   decodeBase64Url,
   decodeEnvelope,
   deriveMaterial,
@@ -92,7 +94,12 @@ test('configure() cannot drop capture-proof bootstrap paths', () => {
   configure({ passthroughPaths: ['/custom-bootstrap.js'] });
   const passthroughPaths = getConfig().passthroughPaths;
 
-  for (const path of ['/enclave-sw.js', '/register.js', '/attestation-widget.js']) {
+  for (const path of [
+    '/enclave-sw.js',
+    '/register.js',
+    '/attestation-widget.js',
+    '/xwing/steve_xwing_wasm_bg.wasm'
+  ]) {
     assert.ok(passthroughPaths.includes(path), `${path} must remain passthrough`);
     assert.equal(isProtected(`https://example.test${path}`), false);
   }
@@ -101,7 +108,12 @@ test('configure() cannot drop capture-proof bootstrap paths', () => {
 });
 
 test('built-in bootstrap passthrough is limited to safe methods', () => {
-  for (const path of ['/enclave-sw.js', '/register.js', '/attestation-widget.js']) {
+  for (const path of [
+    '/enclave-sw.js',
+    '/register.js',
+    '/attestation-widget.js',
+    '/xwing/steve_xwing_wasm_bg.wasm'
+  ]) {
     assert.equal(isProtected(`https://example.test${path}`), false);
     assert.equal(isProtected(`https://example.test${path}`, { method: 'HEAD' }), false);
     assert.equal(isProtected(`https://example.test${path}`, { method: 'POST' }), true);
@@ -219,6 +231,21 @@ test('requestTimeoutMs must be finite and bounded', () => {
   assert.equal(getConfig().requestTimeoutMs, 1000);
   configure({ requestTimeoutMs: 300000 });
   assert.equal(getConfig().requestTimeoutMs, 300000);
+});
+
+test('expectedKeyExchange defaults to X25519 and only accepts exact suites', () => {
+  assert.equal(getConfig().expectedKeyExchange, X25519_KEY_EXCHANGE);
+
+  configure({ expectedKeyExchange: XWING_KEY_EXCHANGE });
+  assert.equal(getConfig().expectedKeyExchange, XWING_KEY_EXCHANGE);
+  assert.equal(statusMessage().protocol.keyEstablishment, XWING_KEY_EXCHANGE);
+
+  for (const value of ['x25519', 'XWING', '', null]) {
+    assert.throws(
+      () => configure({ expectedKeyExchange: value }),
+      /unsupported key exchange/u
+    );
+  }
 });
 
 test('protocol requests use the configured enclave origin without credentials', async () => {
@@ -349,6 +376,7 @@ test('failed session establishment clears the shared promise for a retry', async
 function diagnosticSession(fill, createdAt = Date.now()) {
   return {
     id: new Uint8Array(16).fill(fill),
+    keyExchange: X25519_KEY_EXCHANGE,
     transcriptHash: new Uint8Array(32).fill(fill + 1),
     material: { secretMarker: 'derived-key-material-must-not-appear' },
     createdAt,
@@ -423,6 +451,21 @@ test('status tracks eager establishment and exposes only safe session diagnostic
   assert.equal(serialized.includes('derived-key-material-must-not-appear'), false);
   assert.equal(serialized.includes('secretMarker'), false);
   assert.equal('material' in status.session, false);
+});
+
+test('ready status reports the exact established X-Wing suite', async () => {
+  const session = {
+    ...diagnosticSession(9),
+    keyExchange: XWING_KEY_EXCHANGE
+  };
+  setEstablishSession(async () => session);
+
+  await ensureSession('explicit-initialize');
+
+  assert.equal(
+    statusMessage().protocol.keyEstablishment,
+    XWING_KEY_EXCHANGE
+  );
 });
 
 test('status distinguishes lazy establishment and session rotation triggers', async () => {

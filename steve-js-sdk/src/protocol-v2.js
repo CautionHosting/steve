@@ -2,7 +2,9 @@ import { encode as encodeCBOR, decode as decodeCBOR } from 'tee-attestation-js/l
 
 export const VERSION = 2;
 export const PROTOCOL_ID = 'STEVE-E2P-V2';
-export const KEY_ESTABLISHMENT_SUITE = 'X25519';
+export const X25519_KEY_EXCHANGE = 'X25519';
+export const XWING_KEY_EXCHANGE = 'XWING-DRAFT10';
+export const DEFAULT_KEY_EXCHANGE = X25519_KEY_EXCHANGE;
 export const KEY_DERIVATION = 'HKDF-SHA256';
 export const RECORD_PROTECTION = 'AES-256-GCM';
 export const SESSION_ENDPOINT = '/e2p/v2/session';
@@ -11,6 +13,10 @@ export const REQUEST_ENDPOINT = '/e2p/v2/request';
 
 const encoder = new TextEncoder();
 const MAGIC = encoder.encode('STEVE-E2P-V2\0');
+const KEY_MATERIAL_LENGTHS = Object.freeze({
+  [X25519_KEY_EXCHANGE]: Object.freeze({ client: 32, server: 32 }),
+  [XWING_KEY_EXCHANGE]: Object.freeze({ client: 1216, server: 1120 })
+});
 const REPLAY_WINDOW_SIZE = 64n;
 const LABELS = {
   c2sKey: encoder.encode('steve-e2p-v2/c2s-key'),
@@ -102,13 +108,30 @@ export function equalBytes(left, right) {
   return difference === 0;
 }
 
-export function buildTranscript(clientNonce, clientKey, serverKey, sessionId, contextHash) {
+export function buildTranscript(
+  keyExchange,
+  clientNonce,
+  clientKeyMaterial,
+  serverKeyMaterial,
+  sessionId,
+  contextHash
+) {
+  requireKeyExchange(keyExchange);
   requireLength('client nonce', clientNonce, 32);
-  requireLength('client public key', clientKey, 32);
-  requireLength('server public key', serverKey, 32);
+  requireKeyMaterial(keyExchange, 'client', clientKeyMaterial);
+  requireKeyMaterial(keyExchange, 'server', serverKeyMaterial);
   requireLength('session ID', sessionId, 16);
   requireLength('context hash', contextHash, 32);
-  return concatBytes(MAGIC, clientNonce, clientKey, serverKey, sessionId, contextHash);
+  return concatBytes(
+    MAGIC,
+    encoder.encode(keyExchange),
+    new Uint8Array([0]),
+    clientNonce,
+    clientKeyMaterial,
+    serverKeyMaterial,
+    sessionId,
+    contextHash
+  );
 }
 
 export async function sha256(bytes) {
@@ -120,9 +143,14 @@ export async function hashOrigin(origin) {
 }
 
 export async function deriveMaterial(sharedSecret, transcriptHash) {
-  requireLength('X25519 shared secret', sharedSecret, 32);
+  requireLength('key-exchange shared secret', sharedSecret, 32);
   requireLength('transcript hash', transcriptHash, 32);
-  const hkdfKey = await crypto.subtle.importKey('raw', sharedSecret, 'HKDF', false, ['deriveBits']);
+  let hkdfKey;
+  try {
+    hkdfKey = await crypto.subtle.importKey('raw', sharedSecret, 'HKDF', false, ['deriveBits']);
+  } finally {
+    sharedSecret.fill(0);
+  }
   const derive = async (label, bits) => new Uint8Array(await crypto.subtle.deriveBits({
     name: 'HKDF',
     hash: 'SHA-256',
@@ -199,20 +227,34 @@ export async function open(material, direction, messageType, sessionId, sequence
   return new Uint8Array(plaintext);
 }
 
-export function encodeSessionRequest(clientNonce, clientPublicKey, contextHash) {
+export function encodeSessionRequest(
+  keyExchange,
+  clientNonce,
+  clientKeyMaterial,
+  contextHash
+) {
+  requireKeyExchange(keyExchange);
+  requireLength('client nonce', clientNonce, 32);
+  requireKeyMaterial(keyExchange, 'client', clientKeyMaterial);
+  requireLength('context hash', contextHash, 32);
   return encodeCBOR({
     version: VERSION,
+    key_exchange: keyExchange,
     client_nonce: clientNonce,
-    client_public_key: clientPublicKey,
+    client_key_material: clientKeyMaterial,
     context_hash: contextHash
   });
 }
 
-export function decodeSessionResponse(bytes) {
+export function decodeSessionResponse(bytes, expectedKeyExchange) {
+  requireKeyExchange(expectedKeyExchange);
   const response = decodeCBOR(bytes);
   if (response.version !== VERSION) throw new Error('unsupported session response version');
+  if (response.key_exchange !== expectedKeyExchange) {
+    throw new Error('session key exchange mismatch');
+  }
   requireLength('session ID', response.session_id, 16);
-  requireLength('server public key', response.server_public_key, 32);
+  requireKeyMaterial(expectedKeyExchange, 'server', response.server_key_material);
   if (!(response.attestation_document instanceof Uint8Array)) {
     throw new Error('invalid attestation document');
   }
@@ -241,8 +283,11 @@ export function decodeEnvelope(bytes) {
   return { ...envelope, sequenceValue: parseSequence(envelope.sequence) };
 }
 
-export function verifyBinding(userData, sessionId, transcriptHash, binder) {
-  if (!userData || userData.protocol !== PROTOCOL_ID) {
+export function verifyBinding(userData, keyExchange, sessionId, transcriptHash, binder) {
+  requireKeyExchange(keyExchange);
+  if (!userData
+      || userData.protocol !== PROTOCOL_ID
+      || userData.key_exchange !== keyExchange) {
     throw new Error('attestation protocol binding mismatch');
   }
   const expected = {
@@ -256,11 +301,17 @@ export function verifyBinding(userData, sessionId, transcriptHash, binder) {
   }
 }
 
-export function validateAttestationResult(result, sessionId, transcriptHash, binder) {
+export function validateAttestationResult(
+  result,
+  keyExchange,
+  sessionId,
+  transcriptHash,
+  binder
+) {
   if (!result?.verified) {
     throw new Error(`Nitro attestation verification failed: ${result?.error || 'unknown error'}`);
   }
-  verifyBinding(result.userData, sessionId, transcriptHash, binder);
+  verifyBinding(result.userData, keyExchange, sessionId, transcriptHash, binder);
 }
 
 export function encodeBase64Url(bytes) {
@@ -283,4 +334,18 @@ function requireLength(name, value, length) {
   if (!(value instanceof Uint8Array) || value.length !== length) {
     throw new Error(`invalid ${name}`);
   }
+}
+
+export function requireKeyExchange(keyExchange) {
+  if (!Object.prototype.hasOwnProperty.call(KEY_MATERIAL_LENGTHS, keyExchange)) {
+    throw new Error(`unsupported key exchange: ${keyExchange}`);
+  }
+}
+
+function requireKeyMaterial(keyExchange, side, value) {
+  requireLength(
+    `${side} key material`,
+    value,
+    KEY_MATERIAL_LENGTHS[keyExchange][side]
+  );
 }

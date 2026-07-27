@@ -61,8 +61,12 @@ test('registration configures the newly activated controller, not its predecesso
     }
   };
   const registration = { active: newController, installing: null, waiting: null };
+  let registered;
   serviceWorker.controller = oldController;
-  serviceWorker.register = async () => registration;
+  serviceWorker.register = async (...args) => {
+    registered = args;
+    return registration;
+  };
 
   const registrationPromise = registerEnclaveServiceWorker({
     config: { enclaveOrigin: 'https://enclave.example' }
@@ -73,6 +77,10 @@ test('registration configures the newly activated controller, not its predecesso
   });
 
   await registrationPromise;
+  assert.deepEqual(registered, [
+    '/enclave-sw.js',
+    { scope: '/', type: 'module' }
+  ]);
   assert.deepEqual(oldController.messages, []);
   assert.deepEqual(newController.messages, [{
     type: 'configure',
