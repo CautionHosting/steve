@@ -2,14 +2,15 @@
 
 **S**ecure **T**ransport **E**ncryption **V**ia **E**nclave
 
-End-to-end encryption for browser applications communicating with AWS Nitro Enclaves. With the v2 browser client active, application traffic is encrypted in the service worker and decrypted only inside the enclave.
+End-to-end encryption for browser and native applications communicating with AWS Nitro Enclaves. With a v2 client active, application traffic is encrypted at the client and decrypted only inside the enclave.
 
 > [!IMPORTANT]
 > v2 supports process-pinned X25519 or X-Wing draft-10 sessions and binds the
 > selected suite into the transcript and Nitro evidence. X-Wing protects
 > session secrecy independently of expected-deployment identity, but does not
 > provide trusted first-load bootstrap, expected-PCR delivery, or fail-closed
-> plaintext routing.
+> plaintext routing. The native Rust SDK requires independently supplied
+> expected PCR0/1/2 values; the browser SDK does not yet enforce expected PCRs.
 
 ## Architecture
 
@@ -164,8 +165,35 @@ that permits the fixed same-origin WASM asset. Unsupported capabilities fail
 closed without a classic-worker or cryptographic fallback. See
 `steve-js-sdk/README.md` for the tested-browser policy.
 
-The native Rust SDK remains separate follow-up work; this branch contains the
-server and browser/WASM implementation.
+### Native (Rust)
+
+The native SDK requires reviewed, nonzero 48-byte PCR0/1/2 values and verifies
+them together with the Nitro certificate chain, fresh nonce, session transcript,
+selected suite, and derived-key binder.
+
+```rust
+use steve_sdk::{Client, ExpectedPcrs};
+
+let expected_pcrs = ExpectedPcrs::from([
+    (0, std::fs::read("pcr0.bin")?),
+    (1, std::fs::read("pcr1.bin")?),
+    (2, std::fs::read("pcr2.bin")?),
+]);
+let client = Client::new("https://secure.example", expected_pcrs).await?;
+let attestation = client.verify_attestation().await?;
+let response = client.get("/api/secret").send().await?;
+```
+
+X25519 is the default. A native X-Wing deployment must pin
+`KeyExchangeSuite::XWingDraft10` explicitly. The suite is checked in the
+session response, transcript, and attested binding; there is no negotiation,
+metadata preflight, or fallback.
+
+The default context is the normalized STEVE origin. Native applications may add
+their own binding with `Client::builder(...).application_context(...)`.
+Sessions rotate after 25 minutes. Requests have a 30-second deadline and are
+never automatically retried because an upstream operation may already have
+executed.
 
 ## Validation
 
@@ -187,9 +215,10 @@ the committed production assets, not before a production check.
 ## Local E2E
 
 The Docker harness runs the real browser SDK, STEVE protocol implementation,
-and a test upstream using pinned StageX `linux/amd64` images. It uses signed
-synthetic Nitro-shaped evidence rooted in public test keys; it validates the
-protocol and attestation bindings, not Nitro hardware authenticity or isolation.
+and a test upstream using pinned StageX `linux/amd64` images. The Rust SDK tests
+exercise the same server router. Both use signed synthetic Nitro-shaped
+evidence rooted in public test keys; they validate protocol and attestation
+bindings, not Nitro hardware authenticity or isolation.
 
 Install the local JavaScript dependencies once:
 
