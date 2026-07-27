@@ -1,6 +1,7 @@
 import { registerEnclaveServiceWorker } from '/register.js';
 
 const ENCLAVE_ORIGIN = `http://${location.hostname}:49500`;
+const KEY_EXCHANGE_META = 'meta[name="steve-key-exchange"]';
 const RECOVERY_PARAM = 'steve-sw-recovery';
 const MAX_EVENTS = 100;
 const elements = Object.fromEntries(
@@ -44,6 +45,14 @@ const elements = Object.fromEntries(
 );
 const actionButtons = [...document.querySelectorAll('button[data-action]')];
 const requestActions = new Set(['echo', 'unauthorized', 'timeout', 'concurrency']);
+
+function configuredKeyExchange() {
+  const keyExchange = document.querySelector(KEY_EXCHANGE_META)?.content;
+  if (!['X25519', 'XWING-DRAFT10'].includes(keyExchange)) {
+    throw new Error('local E2E key-exchange pin is missing or invalid');
+  }
+  return keyExchange;
+}
 
 const stateLabels = {
   idle: 'Idle',
@@ -405,7 +414,8 @@ const ready = (async () => {
       config: {
         enclaveOrigin: ENCLAVE_ORIGIN,
         emitEncryptedPayloads: true,
-        requestTimeoutMs: 1000
+        requestTimeoutMs: 1000,
+        expectedKeyExchange: configuredKeyExchange()
       }
     });
     activeClient = client;

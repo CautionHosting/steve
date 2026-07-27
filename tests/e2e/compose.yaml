@@ -5,6 +5,8 @@ services:
       context: ../..
       dockerfile: tests/e2e/Containerfile
       target: fixture
+    environment:
+      STEVE_KEY_EXCHANGE: ${STEVE_KEY_EXCHANGE:-X25519}
     ports:
       - "127.0.0.1:3000:3000"
 

@@ -6,6 +6,19 @@ import { fileURLToPath } from 'node:url';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const publicDirectory = path.join(directory, 'public');
+const keyExchange = process.env.STEVE_KEY_EXCHANGE || 'X25519';
+const keyExchangePlaceholder = '__STEVE_KEY_EXCHANGE__';
+const supportedKeyExchanges = new Set(['X25519', 'XWING-DRAFT10']);
+
+if (!supportedKeyExchanges.has(keyExchange)) {
+  throw new Error('STEVE_KEY_EXCHANGE must be exactly X25519 or XWING-DRAFT10');
+}
+
+const indexTemplate = await readFile(path.join(publicDirectory, 'index.html'), 'utf8');
+if (!indexTemplate.includes(keyExchangePlaceholder)) {
+  throw new Error('STEVE local E2E index is missing its key-exchange placeholder');
+}
+const index = indexTemplate.replaceAll(keyExchangePlaceholder, keyExchange);
 
 function readBody(request) {
   return new Promise((resolve, reject) => {
@@ -63,7 +76,11 @@ const upstream = createServer(async (request, response) => {
 const web = createServer(async (request, response) => {
   logRequest('web', request, response);
   const url = new URL(request.url, 'http://127.0.0.1:3000');
-  const relative = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
+  if (url.pathname === '/' || url.pathname === '/index.html') {
+    respond(response, 200, index, 'text/html; charset=utf-8');
+    return;
+  }
+  const relative = url.pathname.slice(1);
   const file = path.resolve(publicDirectory, relative);
   if (!file.startsWith(`${publicDirectory}${path.sep}`) && file !== publicDirectory) {
     respond(response, 404, 'not found');

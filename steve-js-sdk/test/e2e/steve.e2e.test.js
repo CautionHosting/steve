@@ -9,11 +9,12 @@ async function openDemo(page, url = '/') {
   await page.goto(url);
   await page.waitForFunction(() => Boolean(window.steveDemo));
   await expect(page.locator('#system-status')).toContainText('Service worker active');
-  return page.evaluate(async expectedKeyExchange => {
+  return page.evaluate(async () => {
+    // Do not repair the suite here: manual browser use must receive the same
+    // deployment-pinned configuration as the automated test.
     const client = await window.steveDemo.ready;
-    await client.configure({ expectedKeyExchange });
     return client.getStatus();
-  }, keyExchange);
+  });
 }
 
 async function initialize(page) {
@@ -25,6 +26,10 @@ async function initialize(page) {
 test('starts with an honest idle state and synthetic verifier profile', async ({ page }) => {
   const status = await openDemo(page);
 
+  await expect(page.locator('meta[name="steve-key-exchange"]')).toHaveAttribute(
+    'content',
+    keyExchange
+  );
   expect(status.state).toBe('idle');
   expect(status.initialized).toBe(false);
   expect(status.session).toBeNull();
