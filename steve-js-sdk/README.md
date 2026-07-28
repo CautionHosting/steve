@@ -136,7 +136,8 @@ targets also use the same StageX WASM builder and write only ignored test or
 inspection outputs:
 
 ```bash
-make build-wasm  # standalone bindings in ignored wasm-pkg/
+make build-wasm  # fresh WASM + JS glue in ignored wasm-pkg/
+cmp wasm-pkg/steve_xwing_wasm_bg.wasm dist/xwing/steve_xwing_wasm_bg.wasm
 make test-wasm   # RustCrypto/WASM interoperability tests inside StageX
 make build-e2e   # disposable assets in ../tests/e2e/public/
 ```

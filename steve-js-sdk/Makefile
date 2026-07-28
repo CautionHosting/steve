@@ -27,7 +27,7 @@ build-wasm:
 	rm -rf "$(STAGE_OUTPUT)/wasm"
 	mkdir -p "$(STAGE_OUTPUT)/wasm"
 	$(CONTAINER_ENGINE) build --platform "$(BUILD_PLATFORM)" -f Containerfile \
-		--target wasm-output -t "$(WASM_IMAGE)" "$(BUILD_CONTEXT)"
+		--target wasm-output -t "$(WASM_IMAGE)" "$(BUILD_CONTEXT)" --no-cache
 	container_id=$$($(CONTAINER_ENGINE) create "$(WASM_IMAGE)" true) && \
 		$(CONTAINER_ENGINE) cp "$$container_id:/build/wasm-pkg/." "$(STAGE_OUTPUT)/wasm/" && \
 		$(CONTAINER_ENGINE) rm "$$container_id" > /dev/null
