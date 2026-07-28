@@ -180,7 +180,7 @@ dependencies declared directly in its `package.json`. Docker builds all E2E
 JavaScript and WASM artifacts through the pinned StageX toolchain; no host Rust
 target or `wasm-bindgen` installation is used.
 
-Run the default Chromium/X25519 suite:
+Run both X25519 and X-Wing suites with Chromium:
 
 ```bash
 ./scripts/test-e2e.sh
@@ -188,15 +188,15 @@ Run the default Chromium/X25519 suite:
 
 On macOS the test uses installed Google Chrome. Elsewhere, install Playwright
 Chromium once with `npm --prefix steve-js-sdk exec playwright install chromium`.
-To run the same suite with Playwright Firefox:
+To run both suites with Playwright Firefox:
 
 ```bash
 npm --prefix steve-js-sdk exec playwright install firefox
 STEVE_E2E_BROWSER=firefox ./scripts/test-e2e.sh
 ```
 
-Select `webkit` the same way. The E2E harness uses the server's fixed suite as
-the browser's configured expectation, so one variable selects both:
+Select `webkit` the same way. To run only one suite, set the server's fixed
+suite and the browser's configured expectation with one variable:
 
 ```bash
 STEVE_KEY_EXCHANGE=XWING-DRAFT10 \

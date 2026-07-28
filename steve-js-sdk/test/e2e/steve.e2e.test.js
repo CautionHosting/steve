@@ -56,6 +56,7 @@ test('establishes a signed eval session and completes an encrypted echo', async 
 
   expect(status.state).toBe('ready');
   expect(status.initialized).toBe(true);
+  expect(status.protocol.keyEstablishment).toBe(keyExchange);
   expect(status.session.trigger).toBe('explicit-initialize');
   expect(status.session.confirmation).toBe('verified');
   expect(status.session.id).toHaveLength(22);
@@ -81,6 +82,29 @@ test('establishes a signed eval session and completes an encrypted echo', async 
     status: 200,
     body: 'browser-to-steve'
   });
+});
+
+test('fails closed when the browser and server key exchanges disagree', async ({ page }) => {
+  await openDemo(page);
+  const mismatchedKeyExchange = keyExchange === 'X25519'
+    ? 'XWING-DRAFT10'
+    : 'X25519';
+
+  const failed = await page.evaluate(async expectedKeyExchange => {
+    const client = await window.steveDemo.ready;
+    await client.configure({ expectedKeyExchange });
+    try {
+      await client.initialize();
+      return false;
+    } catch {
+      return true;
+    }
+  }, mismatchedKeyExchange);
+
+  expect(failed).toBe(true);
+  await expect(page.locator('#system-status')).toHaveAttribute('data-state', 'error');
+  await expect(page.locator('#session-id')).toHaveText('—');
+  await expect(page.locator('#key-establishment')).toHaveText(mismatchedKeyExchange);
 });
 
 test('reports lazy establishment by the first protected request', async ({ page }) => {

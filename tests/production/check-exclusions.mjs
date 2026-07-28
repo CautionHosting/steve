@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
@@ -61,6 +62,29 @@ if (!pack?.files) {
   throw new Error('npm pack did not return a package file list');
 }
 const packedFiles = pack.files.map(file => file.path);
+const requiredPackageFiles = [
+  'dist/enclave-sw.js',
+  'dist/register.js',
+  'dist/xwing/steve_xwing_wasm_bg.wasm'
+];
+const missingPackageFiles = requiredPackageFiles.filter(
+  file => !packedFiles.includes(file)
+);
+if (missingPackageFiles.length > 0) {
+  throw new Error(
+    `required production package files missing: ${missingPackageFiles.join(', ')}`
+  );
+}
+
+const worker = await readFile(path.join(sdk, 'dist/enclave-sw.js'), 'utf8');
+const wasm = await readFile(
+  path.join(sdk, 'dist/xwing/steve_xwing_wasm_bg.wasm')
+);
+const wasmDigest = createHash('sha256').update(wasm).digest('hex');
+if (!worker.includes(wasmDigest)) {
+  throw new Error('production service worker does not bind the packaged X-Wing WASM digest');
+}
+
 const forbiddenPaths = packedFiles.filter(file =>
   /(?:^|\/)(?:test\/e2e|tests\/e2e|steve-eval|generated)(?:\/|$)|\.pem$/u.test(file)
 );

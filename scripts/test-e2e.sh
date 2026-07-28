@@ -5,7 +5,17 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 COMPOSE_FILE="$ROOT_DIR/tests/e2e/compose.yaml"
 PROJECT_NAME=steve-e2e
 ACTION=${1:-test}
-STEVE_KEY_EXCHANGE=${STEVE_KEY_EXCHANGE:-X25519}
+REQUESTED_KEY_EXCHANGE=${STEVE_KEY_EXCHANGE:-}
+
+if [ "$ACTION" = "test" ] && [ -z "$REQUESTED_KEY_EXCHANGE" ]; then
+  for suite in X25519 XWING-DRAFT10; do
+    echo "Running STEVE E2E suite: $suite"
+    STEVE_KEY_EXCHANGE="$suite" "$ROOT_DIR/scripts/test-e2e.sh" test
+  done
+  exit 0
+fi
+
+STEVE_KEY_EXCHANGE=${REQUESTED_KEY_EXCHANGE:-X25519}
 
 case "$STEVE_KEY_EXCHANGE" in
   X25519|XWING-DRAFT10) ;;
