@@ -165,7 +165,14 @@ test('serves bootstrap scripts through a controlling worker even when the enclav
       ),
       // A same-origin path that is NOT a bootstrap script must be captured,
       // proving the worker really is protecting this origin.
-      protected: await read('/not-a-bootstrap-path.js')
+      protected: await read('/not-a-bootstrap-path.js'),
+      rootPost: await fetch('/', {
+        method: 'POST',
+        body: 'must-not-pass-through'
+      }).then(async response => ({
+        status: response.status,
+        body: await response.text()
+      }))
     };
   });
 
@@ -174,6 +181,7 @@ test('serves bootstrap scripts through a controlling worker even when the enclav
     expect(fetched.bootstrap[path].body).not.toContain('secure channel failed');
   }
   expect(fetched.protected.body).toContain('secure channel failed');
+  expect(fetched.rootPost.body).toContain('secure channel failed');
 });
 
 test('preserves the session across an encrypted application 401', async ({ page }) => {

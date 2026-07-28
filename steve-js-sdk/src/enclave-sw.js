@@ -27,7 +27,8 @@ import {
   validateAttestationResult
 } from './protocol-v2.js';
 
-const DEFAULT_BOOTSTRAP_PATHS = ['/', '/enclave-sw.js', '/register.js', '/attestation-widget.js'];
+const DEFAULT_BOOTSTRAP_PATHS = ['/enclave-sw.js', '/register.js', '/attestation-widget.js'];
+const SAFE_BOOTSTRAP_METHODS = new Set(['GET', 'HEAD']);
 const ROTATION_INTERVAL_MS = 25 * 60 * 1000;
 const PROTOCOL_EXCLUDE_PREFIXES = ['/e2p/'];
 const DEFAULT_REQUEST_TIMEOUT_MS = 30 * 1000;
@@ -98,8 +99,7 @@ async function handleMessage(event) {
 
 async function routeRequest(request) {
   await configReady;
-  const url = new URL(request.url);
-  if (!shouldProtectUrl(url)) return fetch(request);
+  if (!shouldProtectRequest(request)) return fetch(request);
   return handleProtectedRequest(request);
 }
 
@@ -538,15 +538,27 @@ function validateApplicationResponse(response) {
   }
 }
 
-function shouldProtectUrl(value) {
-  const url = value instanceof URL ? value : new URL(value);
+function shouldProtectRequest(request) {
+  const url = new URL(request.url);
   if (url.origin !== config.enclaveOrigin) return false;
-  return !isPassthrough(url);
+  return !isPassthrough(request, url);
 }
 
-function isPassthrough(url) {
-  const localBootstrap = url.origin === self.location.origin
-    && config.passthroughPaths.includes(url.pathname);
+function isPassthrough(request, url) {
+  const localOrigin = url.origin === self.location.origin;
+  const bootstrapNavigation = localOrigin
+    && url.pathname === '/'
+    && request.method === 'GET'
+    && request.mode === 'navigate'
+    && request.destination === 'document';
+  if (bootstrapNavigation) return true;
+
+  const builtInBootstrap = localOrigin
+    && DEFAULT_BOOTSTRAP_PATHS.includes(url.pathname);
+  if (builtInBootstrap) return SAFE_BOOTSTRAP_METHODS.has(request.method);
+
+  const configuredPassthrough = config.passthroughPaths.includes(url.pathname);
+  const localBootstrap = localOrigin && configuredPassthrough;
   return localBootstrap
     || config.excludePrefixes.some(prefix => url.pathname.startsWith(prefix));
 }
@@ -788,7 +800,7 @@ self.__ENCLAVE_SW_TEST__ = {
   persistConfig,
   restoreConfig,
   resolveProtocolUrl,
-  shouldProtectUrl,
+  shouldProtectRequest,
   getConfigRestoreError: () => configRestoreError,
   getState: () => state,
   getConfig: () => config,

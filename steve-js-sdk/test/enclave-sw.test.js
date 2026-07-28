@@ -45,7 +45,7 @@ globalThis.self = {
 
 await import('../src/enclave-sw.js');
 const { configure, hasValidSession, resetState, ensureSession, getState, getConfig,
-  protocolFetch, resolveProtocolUrl, shouldProtectUrl, resetConfig,
+  protocolFetch, resolveProtocolUrl, shouldProtectRequest, resetConfig,
   handleProtectedRequest, withDeadline, ProtocolHttpError, ProtocolTimeoutError,
   ProtocolTransportError,
   isRequestLocalFailure,
@@ -55,6 +55,10 @@ const { configure, hasValidSession, resetState, ensureSession, getState, getConf
 
 const ROTATION_INTERVAL_MS = 25 * 60 * 1000;
 const originalFetch = globalThis.fetch;
+
+function isProtected(url, init) {
+  return shouldProtectRequest(new Request(url, init));
+}
 
 test.afterEach(async () => {
   captureClientMessages = false;
@@ -88,30 +92,49 @@ test('configure() cannot drop capture-proof bootstrap paths', () => {
   configure({ passthroughPaths: ['/custom-bootstrap.js'] });
   const passthroughPaths = getConfig().passthroughPaths;
 
-  for (const path of ['/', '/enclave-sw.js', '/register.js', '/attestation-widget.js']) {
+  for (const path of ['/enclave-sw.js', '/register.js', '/attestation-widget.js']) {
     assert.ok(passthroughPaths.includes(path), `${path} must remain passthrough`);
-    assert.equal(shouldProtectUrl(`https://example.test${path}`), false);
+    assert.equal(isProtected(`https://example.test${path}`), false);
   }
+  assert.ok(!passthroughPaths.includes('/'));
   assert.ok(passthroughPaths.includes('/custom-bootstrap.js'));
+});
+
+test('built-in bootstrap passthrough is limited to safe methods', () => {
+  for (const path of ['/enclave-sw.js', '/register.js', '/attestation-widget.js']) {
+    assert.equal(isProtected(`https://example.test${path}`), false);
+    assert.equal(isProtected(`https://example.test${path}`, { method: 'HEAD' }), false);
+    assert.equal(isProtected(`https://example.test${path}`, { method: 'POST' }), true);
+  }
 });
 
 test('same-origin interception remains the default', () => {
   assert.equal(getConfig().enclaveOrigin, 'https://example.test');
-  assert.equal(shouldProtectUrl('https://example.test/data'), true);
-  assert.equal(shouldProtectUrl('https://example.test/'), false);
-  assert.equal(shouldProtectUrl('https://other.test/data'), false);
+  assert.equal(isProtected('https://example.test/data'), true);
+  assert.equal(isProtected('https://example.test/'), true);
+  assert.equal(isProtected('https://example.test/', { method: 'POST' }), true);
+  assert.equal(
+    shouldProtectRequest({
+      url: 'https://example.test/',
+      method: 'GET',
+      mode: 'navigate',
+      destination: 'document'
+    }),
+    false
+  );
+  assert.equal(isProtected('https://other.test/data'), false);
 });
 
 test('cross-origin enclave configuration protects only the enclave origin', () => {
   configure({ enclaveOrigin: 'https://secure.example/' });
 
   assert.equal(getConfig().enclaveOrigin, 'https://secure.example');
-  assert.equal(shouldProtectUrl('https://secure.example/'), true);
-  assert.equal(shouldProtectUrl('https://secure.example/data?q=1'), true);
-  assert.equal(shouldProtectUrl('https://secure.example/e2p/v2/request'), false);
-  assert.equal(shouldProtectUrl('https://secure.example/attestation'), false);
-  assert.equal(shouldProtectUrl('https://example.test/data'), false);
-  assert.equal(shouldProtectUrl('https://other.test/data'), false);
+  assert.equal(isProtected('https://secure.example/'), true);
+  assert.equal(isProtected('https://secure.example/data?q=1'), true);
+  assert.equal(isProtected('https://secure.example/e2p/v2/request'), false);
+  assert.equal(isProtected('https://secure.example/attestation'), false);
+  assert.equal(isProtected('https://example.test/data'), false);
+  assert.equal(isProtected('https://other.test/data'), false);
 });
 
 test('configuration survives a service-worker global restart', async () => {
@@ -155,8 +178,8 @@ test('a failed config restore leaves bootstrap available and can be repaired', a
   await initializeConfig();
 
   assert.match(getConfigRestoreError(), /config storage unavailable/u);
-  assert.equal(shouldProtectUrl('https://example.test/register.js'), false);
-  assert.equal(shouldProtectUrl('https://example.test/application-data'), true);
+  assert.equal(isProtected('https://example.test/register.js'), false);
+  assert.equal(isProtected('https://example.test/application-data'), true);
 
   cacheOpenError = null;
   await configureAndPersist({ enclaveOrigin: 'https://secure.example' });

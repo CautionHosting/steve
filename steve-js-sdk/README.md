@@ -44,7 +44,7 @@ binders, nonces, or application plaintext.
 registerEnclaveServiceWorker({
   config: {
     enclaveOrigin: 'https://secure.example',
-    passthroughPaths: ['/', '/enclave-sw.js', '/register.js', '/attestation-widget.js'],
+    passthroughPaths: ['/enclave-sw.js', '/register.js', '/attestation-widget.js'],
     excludePrefixes: ['/attestation', '/e2p/'],
     emitEncryptedPayloads: false,
     requestTimeoutMs: 30000
@@ -62,9 +62,13 @@ const response = await fetch('https://secure.example/hello')
 ```
 
 The worker encrypts requests only when their origin matches `enclaveOrigin`;
-unrelated cross-origin requests are left untouched. Default bootstrap paths
-apply only on the service worker's own origin, so `/` on a separately hosted
-enclave remains protected.
+unrelated cross-origin requests are left untouched. Default bootstrap scripts
+pass through only for `GET` and `HEAD` requests on the service worker's own
+origin. A top-level document `GET /` also passes through so the page can repair
+lost worker configuration; fetches and non-GET requests to `/` remain
+protected.
+STEVE rejects wildcard CORS configuration, so cross-origin deployments must
+list each allowed browser origin explicitly.
 
 `emitEncryptedPayloads` defaults to `false`. Debug tools may enable it to
 receive `encrypted-request` and `encrypted-response` events with the endpoint,

@@ -713,7 +713,8 @@ function requireLength(name, value, length) {
 }
 
 // src/enclave-sw.js
-var DEFAULT_BOOTSTRAP_PATHS = ["/", "/enclave-sw.js", "/register.js", "/attestation-widget.js"];
+var DEFAULT_BOOTSTRAP_PATHS = ["/enclave-sw.js", "/register.js", "/attestation-widget.js"];
+var SAFE_BOOTSTRAP_METHODS = /* @__PURE__ */ new Set(["GET", "HEAD"]);
 var ROTATION_INTERVAL_MS = 25 * 60 * 1e3;
 var PROTOCOL_EXCLUDE_PREFIXES = ["/e2p/"];
 var DEFAULT_REQUEST_TIMEOUT_MS = 30 * 1e3;
@@ -778,8 +779,7 @@ async function handleMessage(event) {
 }
 async function routeRequest(request) {
   await configReady;
-  const url = new URL(request.url);
-  if (!shouldProtectUrl(url)) return fetch(request);
+  if (!shouldProtectRequest(request)) return fetch(request);
   return handleProtectedRequest(request);
 }
 async function handleProtectedRequest(request) {
@@ -1170,13 +1170,19 @@ function validateApplicationResponse(response) {
     throw new Error("invalid protected application body");
   }
 }
-function shouldProtectUrl(value) {
-  const url = value instanceof URL ? value : new URL(value);
+function shouldProtectRequest(request) {
+  const url = new URL(request.url);
   if (url.origin !== config.enclaveOrigin) return false;
-  return !isPassthrough(url);
+  return !isPassthrough(request, url);
 }
-function isPassthrough(url) {
-  const localBootstrap = url.origin === self.location.origin && config.passthroughPaths.includes(url.pathname);
+function isPassthrough(request, url) {
+  const localOrigin = url.origin === self.location.origin;
+  const bootstrapNavigation = localOrigin && url.pathname === "/" && request.method === "GET" && request.mode === "navigate" && request.destination === "document";
+  if (bootstrapNavigation) return true;
+  const builtInBootstrap = localOrigin && DEFAULT_BOOTSTRAP_PATHS.includes(url.pathname);
+  if (builtInBootstrap) return SAFE_BOOTSTRAP_METHODS.has(request.method);
+  const configuredPassthrough = config.passthroughPaths.includes(url.pathname);
+  const localBootstrap = localOrigin && configuredPassthrough;
   return localBootstrap || config.excludePrefixes.some((prefix) => url.pathname.startsWith(prefix));
 }
 function configure(update) {
@@ -1380,7 +1386,7 @@ self.__ENCLAVE_SW_TEST__ = {
   persistConfig,
   restoreConfig,
   resolveProtocolUrl,
-  shouldProtectUrl,
+  shouldProtectRequest,
   getConfigRestoreError: () => configRestoreError,
   getState: () => state,
   getConfig: () => config,

@@ -193,37 +193,33 @@ fn cors_layer(origins: &str) -> Result<CorsLayer, BoxError> {
         return Err("STEVE_CORS_ORIGINS contains an empty origin entry".into());
     }
 
-    let allow_origin = if configured.contains(&"*") {
-        if configured.len() != 1 {
-            return Err("STEVE_CORS_ORIGINS cannot mix '*' with explicit origins".into());
+    if configured.contains(&"*") {
+        return Err("STEVE_CORS_ORIGINS requires explicit origins; '*' is not allowed".into());
+    }
+
+    let mut values = Vec::with_capacity(configured.len());
+    for configured_origin in configured {
+        let origin = url::Url::parse(configured_origin)
+            .map_err(|_| format!("invalid CORS origin: {configured_origin}"))?;
+        if !matches!(origin.scheme(), "http" | "https")
+            || origin.host().is_none()
+            || !origin.username().is_empty()
+            || origin.password().is_some()
+            || origin.path() != "/"
+            || origin.query().is_some()
+            || origin.fragment().is_some()
+        {
+            return Err(format!("invalid CORS origin: {configured_origin}").into());
         }
-        AllowOrigin::any()
-    } else {
-        let mut values = Vec::with_capacity(configured.len());
-        for configured_origin in configured {
-            let origin = url::Url::parse(configured_origin)
-                .map_err(|_| format!("invalid CORS origin: {configured_origin}"))?;
-            if !matches!(origin.scheme(), "http" | "https")
-                || origin.host().is_none()
-                || !origin.username().is_empty()
-                || origin.password().is_some()
-                || origin.path() != "/"
-                || origin.query().is_some()
-                || origin.fragment().is_some()
-            {
-                return Err(format!("invalid CORS origin: {configured_origin}").into());
-            }
-            let value = HeaderValue::from_str(&origin.origin().ascii_serialization())
-                .map_err(|_| format!("invalid CORS origin: {configured_origin}"))?;
-            if !values.contains(&value) {
-                values.push(value);
-            }
+        let value = HeaderValue::from_str(&origin.origin().ascii_serialization())
+            .map_err(|_| format!("invalid CORS origin: {configured_origin}"))?;
+        if !values.contains(&value) {
+            values.push(value);
         }
-        AllowOrigin::list(values)
-    };
+    }
 
     Ok(CorsLayer::new()
-        .allow_origin(allow_origin)
+        .allow_origin(AllowOrigin::list(values))
         .allow_methods([Method::POST])
         .allow_headers([header::CONTENT_TYPE]))
 }
@@ -1098,6 +1094,12 @@ mod tests {
             "STEVE_CORS_ORIGINS contains an empty origin entry"
         );
 
+        let wildcard_error = try_test_router(Some("*".to_string())).unwrap_err();
+        assert_eq!(
+            wildcard_error.to_string(),
+            "STEVE_CORS_ORIGINS requires explicit origins; '*' is not allowed"
+        );
+
         for invalid in [
             "",
             " ",
@@ -1119,7 +1121,6 @@ mod tests {
             ))
             .is_ok()
         );
-        assert!(try_test_router(Some("*".to_string())).is_ok());
     }
 
     #[tokio::test]

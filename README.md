@@ -133,6 +133,8 @@ application plaintext.
 Set `STEVE_CORS_ORIGINS` to the browser application's origin (for example,
 `http://localhost:3000`). STEVE applies that policy only to `/e2p/v2/*`;
 plaintext fallback routes retain the upstream application's CORS policy.
+Wildcard origins are rejected; production deployments must list each allowed
+browser origin explicitly.
 
 Protected application transactions default to a 30-second deadline
 (`requestTimeoutMs` accepts 1,000 through 300,000 milliseconds). Transport
