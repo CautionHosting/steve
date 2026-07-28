@@ -161,6 +161,15 @@ already have executed.
 The native Rust SDK remains separate follow-up work; this branch contains the
 server and browser/WASM implementation.
 
+## Validation
+
+```bash
+make test    # Fast Rust and JavaScript unit tests
+make verify  # Full StageX, packaging, and dual-suite browser gate
+```
+
+Focused targets are `test-wasm`, `test-production`, and `test-e2e`.
+
 ## Local E2E
 
 The Docker harness runs the real browser SDK, STEVE protocol implementation,
