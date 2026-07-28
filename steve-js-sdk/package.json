@@ -14,13 +14,11 @@
     "README.md"
   ],
   "scripts": {
-    "build": "node build-wasm.js && node build.js",
-    "build:js": "node build.js",
-    "build:e2e": "node build-wasm.js && node build.js --eval",
-    "watch": "node build.js --watch",
+    "build": "make build",
+    "build:wasm": "make build-wasm",
+    "build:e2e": "make build-e2e",
     "test": "node --test test/*.test.js",
-    "test:wasm": "node build-wasm.js && node --test test/wasm/*.test.js",
-    "test:wasm:built": "node --test test/wasm/*.test.js",
+    "test:wasm": "make test-wasm",
     "test:e2e": "playwright test --config test/e2e/playwright.config.js"
   },
   "keywords": [

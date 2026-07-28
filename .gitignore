@@ -1,6 +1,7 @@
 /target
 /steve-js-sdk/node_modules
 /steve-js-sdk/wasm-pkg
+/steve-js-sdk/.stagex-output
 /tests/e2e/public/generated
 /tests/e2e/public/enclave-sw.js
 /tests/e2e/public/register.js

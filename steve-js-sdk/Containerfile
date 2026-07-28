@@ -26,7 +26,9 @@ COPY crates/ ./crates/
 
 RUN cargo fetch --locked && \
     cargo fetch -Z build-std=std,panic_abort \
-      --locked --target wasm32-unknown-unknown && \
+      --locked --target wasm32-unknown-unknown
+
+RUN --network=none \
     cargo build -Z build-std=std,panic_abort \
       --locked --offline --release \
       --package steve-xwing-wasm \
@@ -44,6 +46,8 @@ COPY --from=git . /
 COPY --from=ca-certificates . /
 COPY --from=curl . /
 
+ENV SOURCE_DATE_EPOCH=1
+
 WORKDIR /build
 
 COPY steve-js-sdk/package.json steve-js-sdk/package-lock.json ./
@@ -55,15 +59,26 @@ COPY steve-js-sdk/src/ ./src/
 COPY steve-js-sdk/test/ ./test/
 COPY test-vectors/ /test-vectors/
 
-RUN npm test
+RUN --network=none npm test
 
-FROM node-deps AS builder
+FROM node-deps AS wasm-test
+
+COPY --from=wasm-builder /out/ ./wasm-pkg/
+COPY steve-js-sdk/test/wasm/ ./test/wasm/
+
+RUN --network=none node --test test/wasm/*.test.js
+
+FROM node-deps AS bundle-input
+
+ENV STEVE_STAGEX_BUILD=1
 
 COPY steve-js-sdk/build.js ./
 COPY steve-js-sdk/src/ ./src/
 COPY --from=wasm-builder /out/ ./wasm-pkg/
 
-RUN npm run build:js
+FROM bundle-input AS builder
+
+RUN --network=none node build.js --outdir dist
 
 FROM builder AS test
 
@@ -71,9 +86,28 @@ COPY steve-js-sdk/test/ ./test/
 COPY test-vectors/ /test-vectors/
 COPY steve-js-sdk/README.md ./
 
-RUN npm test && \
-    npm run test:wasm:built && \
+RUN --network=none npm test && \
+    node --test test/wasm/*.test.js && \
     npm pack --dry-run
+
+FROM bundle-input AS e2e-builder
+
+COPY steve-js-sdk/test/e2e/eval-attestation-verifier.js \
+  ./test/e2e/eval-attestation-verifier.js
+COPY tests/e2e/fixtures/eval-root-cert.pem \
+  /tests/e2e/fixtures/eval-root-cert.pem
+
+RUN --network=none node build.js --eval --outdir /build/e2e
+
+FROM scratch AS wasm-output
+
+COPY --from=wasm-builder /out/ /build/wasm-pkg/
+CMD ["true"]
+
+FROM scratch AS e2e-output
+
+COPY --from=e2e-builder /build/e2e/ /build/e2e/
+CMD ["true"]
 
 FROM scratch AS output
 

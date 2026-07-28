@@ -4,9 +4,21 @@ import { copyFile, mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const watch = process.argv.includes('--watch');
-const evalBuild = process.argv.includes('--eval');
 const directory = path.dirname(fileURLToPath(import.meta.url));
+const args = process.argv.slice(2);
+const evalBuild = args.includes('--eval');
+const outdirIndex = args.indexOf('--outdir');
+
+if (process.env.STEVE_STAGEX_BUILD !== '1') {
+  throw new Error(
+    'Browser artifacts must be built through the StageX Make targets'
+  );
+}
+if (outdirIndex === -1 || !args[outdirIndex + 1]) {
+  throw new Error('build.js requires --outdir <directory>');
+}
+
+const outdir = path.resolve(directory, args[outdirIndex + 1]);
 const xwingPackage = path.resolve(directory, 'wasm-pkg');
 const xwingGlue = path.join(xwingPackage, 'steve_xwing_wasm.js');
 const xwingWasm = path.join(xwingPackage, 'steve_xwing_wasm_bg.wasm');
@@ -40,7 +52,7 @@ const buildOptions = {
   entryPoints: ['src/enclave-sw.js', 'src/register.js'],
   bundle: true,
   format: 'esm',
-  outdir: evalBuild ? '../tests/e2e/public' : 'dist',
+  outdir,
   minify: false,
   target: 'es2020',
   logLevel: 'info',
@@ -53,16 +65,10 @@ const buildOptions = {
     : [xwingBindingsPlugin]
 };
 
-if (watch) {
-  const ctx = await esbuild.context(buildOptions);
-  await ctx.watch();
-  console.log('Watching for changes...');
-} else {
-  await esbuild.build(buildOptions);
-  const xwingOutput = path.resolve(directory, buildOptions.outdir, 'xwing');
-  await mkdir(xwingOutput, { recursive: true });
-  await copyFile(
-    xwingWasm,
-    path.join(xwingOutput, 'steve_xwing_wasm_bg.wasm')
-  );
-}
+await esbuild.build(buildOptions);
+const xwingOutput = path.join(outdir, 'xwing');
+await mkdir(xwingOutput, { recursive: true });
+await copyFile(
+  xwingWasm,
+  path.join(xwingOutput, 'steve_xwing_wasm_bg.wasm')
+);

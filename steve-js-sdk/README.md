@@ -120,18 +120,26 @@ fallback routes retain the upstream application's CORS policy.
 
 ```bash
 make build
+# Equivalent: npm run build
 ```
 
-The production build is self-contained: a digest-pinned StageX Rust 1.96.0
-stage builds the `wasm32-unknown-unknown` standard library from its matching
-bundled Rust source, installs exactly `wasm-bindgen-cli` 0.2.106, fetches the
-locked Cargo graph, and builds the application offline. A digest-pinned StageX Node stage then runs
-`npm ci --ignore-scripts`, statically bundles the generated bindings and their
-WASM digest, and copies the fixed WASM asset into `dist/xwing/`.
+`dist/` is a committed release artifact and only the digest-pinned StageX build
+may replace it. The Rust stage builds the matching
+`wasm32-unknown-unknown` standard library, installs exactly
+`wasm-bindgen-cli` 0.2.106, fetches the locked Cargo graph, and compiles with
+network access disabled. The Node stage runs `npm ci --ignore-scripts`,
+statically bundles the generated bindings and their WASM digest, runs the
+production package checks, and copies the fixed WASM asset into `dist/xwing/`.
 
-For local non-container builds, install the `wasm32-unknown-unknown` target and
-exact `wasm-bindgen-cli` 0.2.106. Install JavaScript dependencies with
-`npm ci --ignore-scripts`; this is a clean, lockfile-exact install, not CI
-service configuration. The project `.npmrc` permits only Git dependencies
-declared directly in this package. Cache the locked Rust dependencies with
-`cargo fetch --locked`, then run `npm run build`; the build itself is offline.
+There is no supported host build for browser artifacts. The other artifact
+targets also use the same StageX WASM builder and write only ignored test or
+inspection outputs:
+
+```bash
+make build-wasm  # standalone bindings in ignored wasm-pkg/
+make test-wasm   # RustCrypto/WASM interoperability tests inside StageX
+make build-e2e   # disposable assets in ../tests/e2e/public/
+```
+
+Local Node.js is still useful for `npm test` and Playwright, but local Rust,
+`wasm-bindgen`, or esbuild versions never produce browser artifacts.

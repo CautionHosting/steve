@@ -7,6 +7,29 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const sdk = path.join(root, 'steve-js-sdk');
 
+const packageJson = JSON.parse(
+  await readFile(path.join(sdk, 'package.json'), 'utf8')
+);
+const stageXArtifactScripts = {
+  build: 'make build',
+  'build:wasm': 'make build-wasm',
+  'build:e2e': 'make build-e2e',
+  'test:wasm': 'make test-wasm'
+};
+for (const [name, expected] of Object.entries(stageXArtifactScripts)) {
+  if (packageJson.scripts?.[name] !== expected) {
+    throw new Error(`${name} must delegate to ${expected}`);
+  }
+}
+const hostArtifactScript = Object.entries(packageJson.scripts || {}).find(
+  ([, command]) => /(?:build-wasm\.js|node\s+build\.js)/u.test(command)
+);
+if (hostArtifactScript) {
+  throw new Error(
+    `host artifact build is not allowed in npm script ${hostArtifactScript[0]}`
+  );
+}
+
 function run(command, args, cwd, env = process.env) {
   const result = spawnSync(command, args, {
     cwd,
