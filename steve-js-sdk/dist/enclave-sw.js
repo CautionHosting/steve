@@ -1,152 +1,279 @@
 // node_modules/tee-attestation-js/src/lib/cbor.js
-function decode(bytes) {
-  if (!(bytes instanceof Uint8Array)) {
-    bytes = new Uint8Array(bytes);
+var MAX_CBOR_BYTES = 32 * 1024 * 1024;
+var MAX_CBOR_DEPTH = 32;
+var MAX_CBOR_CONTAINER_ITEMS = 65536;
+var MAX_CBOR_NODES = MAX_CBOR_CONTAINER_ITEMS * 4;
+var textEncoder = new TextEncoder();
+var textDecoder = new TextDecoder("utf-8", { fatal: true });
+function encode(value) {
+  const chunks = [];
+  const activeContainers = /* @__PURE__ */ new WeakSet();
+  let encodedLength = 0;
+  function push(chunk) {
+    if (!(chunk instanceof Uint8Array)) {
+      chunk = new Uint8Array(chunk);
+    }
+    if (chunk.length > MAX_CBOR_BYTES - encodedLength) {
+      throw new Error("CBOR output exceeds size limit");
+    }
+    chunks.push(chunk);
+    encodedLength += chunk.length;
   }
+  function encodeArgument(majorType, value2) {
+    if (!Number.isSafeInteger(value2) || value2 < 0) {
+      throw new Error("CBOR integer is out of range");
+    }
+    if (value2 < 24) {
+      push(Uint8Array.of(majorType << 5 | value2));
+    } else if (value2 < 256) {
+      push(Uint8Array.of(majorType << 5 | 24, value2));
+    } else if (value2 < 65536) {
+      push(Uint8Array.of(
+        majorType << 5 | 25,
+        value2 >>> 8,
+        value2 & 255
+      ));
+    } else if (value2 <= 4294967295) {
+      push(Uint8Array.of(
+        majorType << 5 | 26,
+        value2 >>> 24 & 255,
+        value2 >>> 16 & 255,
+        value2 >>> 8 & 255,
+        value2 & 255
+      ));
+    } else {
+      const encoded = new Uint8Array(9);
+      encoded[0] = majorType << 5 | 27;
+      let remaining = BigInt(value2);
+      for (let index = 8; index > 0; index -= 1) {
+        encoded[index] = Number(remaining & 0xffn);
+        remaining >>= 8n;
+      }
+      push(encoded);
+    }
+  }
+  function encodeItem(item, depth) {
+    if (depth > MAX_CBOR_DEPTH) {
+      throw new Error("CBOR nesting exceeds depth limit");
+    }
+    if (item === null) {
+      push(Uint8Array.of(246));
+    } else if (item === void 0) {
+      push(Uint8Array.of(247));
+    } else if (typeof item === "boolean") {
+      push(Uint8Array.of(item ? 245 : 244));
+    } else if (typeof item === "number") {
+      if (!Number.isSafeInteger(item)) {
+        throw new Error("CBOR supports only safe integers");
+      }
+      if (item >= 0) {
+        encodeArgument(0, item);
+      } else {
+        encodeArgument(1, -1 - item);
+      }
+    } else if (typeof item === "string") {
+      const bytes = textEncoder.encode(item);
+      encodeArgument(3, bytes.length);
+      push(bytes);
+    } else if (item instanceof Uint8Array) {
+      encodeArgument(2, item.length);
+      push(item);
+    } else if (Array.isArray(item)) {
+      if (item.length > MAX_CBOR_CONTAINER_ITEMS) {
+        throw new Error("CBOR container exceeds item limit");
+      }
+      if (activeContainers.has(item)) {
+        throw new Error("CBOR cannot encode cyclic values");
+      }
+      activeContainers.add(item);
+      encodeArgument(4, item.length);
+      for (const value2 of item) {
+        encodeItem(value2, depth + 1);
+      }
+      activeContainers.delete(item);
+    } else if (typeof item === "object") {
+      const prototype = Object.getPrototypeOf(item);
+      if (prototype !== Object.prototype && prototype !== null) {
+        throw new Error("CBOR supports only plain objects");
+      }
+      const keys = Object.keys(item);
+      if (keys.length > MAX_CBOR_CONTAINER_ITEMS) {
+        throw new Error("CBOR container exceeds item limit");
+      }
+      if (activeContainers.has(item)) {
+        throw new Error("CBOR cannot encode cyclic values");
+      }
+      activeContainers.add(item);
+      encodeArgument(5, keys.length);
+      for (const key of keys) {
+        encodeItem(key, depth + 1);
+        encodeItem(item[key], depth + 1);
+      }
+      activeContainers.delete(item);
+    } else {
+      throw new Error(`unsupported CBOR value type: ${typeof item}`);
+    }
+  }
+  encodeItem(value, 0);
+  const output = new Uint8Array(encodedLength);
   let offset = 0;
-  function read() {
-    const initial = bytes[offset++];
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return output;
+}
+function decode(input, { allowedTags = [] } = {}) {
+  const bytes = input instanceof Uint8Array ? input : ArrayBuffer.isView(input) ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength) : input instanceof ArrayBuffer ? new Uint8Array(input) : null;
+  if (!bytes) throw new TypeError("CBOR input must be bytes");
+  if (bytes.length > MAX_CBOR_BYTES) {
+    throw new Error("CBOR input exceeds size limit");
+  }
+  const acceptedTags = new Set(allowedTags);
+  let decodedNodes = 0;
+  let offset = 0;
+  function requireBytes(length) {
+    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_CBOR_BYTES || length > bytes.length - offset) {
+      throw new Error("truncated or oversized CBOR value");
+    }
+  }
+  function readArgument(additionalInfo) {
+    if (additionalInfo < 24) return additionalInfo;
+    let width;
+    switch (additionalInfo) {
+      case 24:
+        width = 1;
+        break;
+      case 25:
+        width = 2;
+        break;
+      case 26:
+        width = 4;
+        break;
+      case 27:
+        width = 8;
+        break;
+      case 31:
+        throw new Error("indefinite-length CBOR is not supported");
+      default:
+        throw new Error(`unsupported CBOR additional info: ${additionalInfo}`);
+    }
+    requireBytes(width);
+    let value2 = 0n;
+    for (let index = 0; index < width; index += 1) {
+      value2 = value2 << 8n | BigInt(bytes[offset]);
+      offset += 1;
+    }
+    if (value2 > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error("CBOR integer exceeds safe integer range");
+    }
+    return Number(value2);
+  }
+  function read(depth) {
+    if (depth > MAX_CBOR_DEPTH) {
+      throw new Error("CBOR nesting exceeds depth limit");
+    }
+    requireBytes(1);
+    decodedNodes += 1;
+    if (decodedNodes > MAX_CBOR_NODES) {
+      throw new Error("CBOR exceeds node limit");
+    }
+    const initial = bytes[offset];
+    offset += 1;
     const majorType = initial >> 5;
     const additionalInfo = initial & 31;
-    let value;
-    if (additionalInfo < 24) {
-      value = additionalInfo;
-    } else if (additionalInfo === 24) {
-      value = bytes[offset++];
-    } else if (additionalInfo === 25) {
-      value = bytes[offset++] << 8 | bytes[offset++];
-    } else if (additionalInfo === 26) {
-      value = (bytes[offset++] << 24 >>> 0) + (bytes[offset++] << 16) + (bytes[offset++] << 8) + bytes[offset++];
-    } else if (additionalInfo === 27) {
-      value = 0;
-      for (let i = 0; i < 8; i++) {
-        value = value * 256 + bytes[offset++];
+    if (majorType === 7) {
+      switch (additionalInfo) {
+        case 20:
+          return false;
+        case 21:
+          return true;
+        case 22:
+          return null;
+        case 23:
+          return void 0;
+        case 31:
+          throw new Error("unexpected CBOR break marker");
+        default:
+          throw new Error(`unsupported CBOR simple value: ${additionalInfo}`);
       }
-    } else if (additionalInfo === 31) {
-      value = -1;
-    } else {
-      throw new Error(`Unsupported additional info: ${additionalInfo}`);
     }
+    const value2 = readArgument(additionalInfo);
     switch (majorType) {
       case 0:
-        return value;
-      case 1:
-        return -1 - value;
+        return value2;
+      case 1: {
+        const result = -1 - value2;
+        if (!Number.isSafeInteger(result)) {
+          throw new Error("CBOR integer exceeds safe integer range");
+        }
+        return result;
+      }
       case 2: {
-        const result = bytes.slice(offset, offset + value);
-        offset += value;
+        requireBytes(value2);
+        const result = bytes.slice(offset, offset + value2);
+        offset += value2;
         return result;
       }
       case 3: {
-        const strBytes = bytes.slice(offset, offset + value);
-        offset += value;
-        return new TextDecoder().decode(strBytes);
+        requireBytes(value2);
+        const encoded = bytes.subarray(offset, offset + value2);
+        offset += value2;
+        try {
+          return textDecoder.decode(encoded);
+        } catch {
+          throw new Error("invalid UTF-8 in CBOR text string");
+        }
       }
       case 4: {
-        const arr = [];
-        if (value < 0) {
-          while (bytes[offset] !== 255) {
-            arr.push(read());
-          }
-          offset++;
-        } else {
-          for (let i = 0; i < value; i++) {
-            arr.push(read());
-          }
+        if (value2 > MAX_CBOR_CONTAINER_ITEMS) {
+          throw new Error("CBOR container exceeds item limit");
         }
-        return arr;
+        const result = [];
+        for (let index = 0; index < value2; index += 1) {
+          result.push(read(depth + 1));
+        }
+        return result;
       }
       case 5: {
-        const obj = {};
-        if (value < 0) {
-          while (bytes[offset] !== 255) {
-            const key = read();
-            obj[key] = read();
-          }
-          offset++;
-        } else {
-          for (let i = 0; i < value; i++) {
-            const key = read();
-            obj[key] = read();
-          }
+        if (value2 > MAX_CBOR_CONTAINER_ITEMS) {
+          throw new Error("CBOR container exceeds item limit");
         }
-        return obj;
+        const result = {};
+        const keys = /* @__PURE__ */ new Set();
+        for (let index = 0; index < value2; index += 1) {
+          const key = read(depth + 1);
+          if (typeof key !== "string" && typeof key !== "number") {
+            throw new Error("CBOR map keys must be strings or integers");
+          }
+          const property = String(key);
+          if (keys.has(property)) {
+            throw new Error("duplicate CBOR map key");
+          }
+          keys.add(property);
+          Object.defineProperty(result, property, {
+            configurable: true,
+            enumerable: true,
+            value: read(depth + 1),
+            writable: true
+          });
+        }
+        return result;
       }
       case 6:
-        return read();
-      case 7: {
-        if (additionalInfo === 20) return false;
-        if (additionalInfo === 21) return true;
-        if (additionalInfo === 22) return null;
-        if (additionalInfo === 23) return void 0;
-        throw new Error(`Unsupported simple value: ${additionalInfo}`);
-      }
+        if (depth !== 0 || !acceptedTags.has(value2)) {
+          throw new Error(`unsupported CBOR tag: ${value2}`);
+        }
+        return read(depth + 1);
       default:
-        throw new Error(`Unknown major type: ${majorType}`);
+        throw new Error(`unsupported CBOR major type: ${majorType}`);
     }
   }
-  return read();
-}
-function encode(value) {
-  const chunks = [];
-  function encodeItem(val) {
-    if (val === null) {
-      chunks.push(new Uint8Array([246]));
-    } else if (val === void 0) {
-      chunks.push(new Uint8Array([247]));
-    } else if (typeof val === "boolean") {
-      chunks.push(new Uint8Array([val ? 245 : 244]));
-    } else if (typeof val === "number") {
-      if (Number.isInteger(val) && val >= 0 && val < 24) {
-        chunks.push(new Uint8Array([val]));
-      } else if (Number.isInteger(val) && val >= 0 && val < 256) {
-        chunks.push(new Uint8Array([24, val]));
-      } else if (Number.isInteger(val) && val >= 0 && val < 65536) {
-        chunks.push(new Uint8Array([25, val >> 8, val & 255]));
-      } else {
-        throw new Error("Complex number encoding not implemented");
-      }
-    } else if (typeof val === "string") {
-      const strBytes = new TextEncoder().encode(val);
-      encodeLength(3, strBytes.length);
-      chunks.push(strBytes);
-    } else if (val instanceof Uint8Array) {
-      encodeLength(2, val.length);
-      chunks.push(val);
-    } else if (Array.isArray(val)) {
-      encodeLength(4, val.length);
-      for (const item of val) {
-        encodeItem(item);
-      }
-    } else if (typeof val === "object") {
-      const keys = Object.keys(val);
-      encodeLength(5, keys.length);
-      for (const key of keys) {
-        encodeItem(key);
-        encodeItem(val[key]);
-      }
-    }
+  const value = read(0);
+  if (offset !== bytes.length) {
+    throw new Error("trailing bytes after CBOR value");
   }
-  function encodeLength(majorType, length) {
-    if (length < 24) {
-      chunks.push(new Uint8Array([majorType << 5 | length]));
-    } else if (length < 256) {
-      chunks.push(new Uint8Array([majorType << 5 | 24, length]));
-    } else if (length < 65536) {
-      chunks.push(new Uint8Array([majorType << 5 | 25, length >> 8, length & 255]));
-    } else {
-      throw new Error("Length too large");
-    }
-  }
-  encodeItem(value);
-  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const result = new Uint8Array(totalLength);
-  let off = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, off);
-    off += chunk.length;
-  }
-  return result;
+  return value;
 }
 
 // node_modules/tee-attestation-js/src/lib/x509.js
@@ -294,6 +421,7 @@ function arraysEqual(a, b) {
 }
 
 // node_modules/tee-attestation-js/src/tee/nitro.js
+var COSE_SIGN1_TAG = 18;
 var ROOT_CERT = `-----BEGIN CERTIFICATE-----
 MIICETCCAZagAwIBAgIRAPkxdWgbkK/hHUbMtOTn+FYwCgYIKoZIzj0EAwMwSTEL
 MAkGA1UEBhMCVVMxDzANBgNVBAoMBkFtYXpvbjEMMAoGA1UECwwDQVdTMRswGQYD
@@ -309,12 +437,18 @@ rfMCMQCi85sWBbJwKKXdS6BptQFuZbT73o/gBh1qUxl/nNr12UO8Yfwr6wPLb+6N
 IwLz3/Y=
 -----END CERTIFICATE-----`;
 function parse(document) {
-  const coseSign1 = decode(document);
+  const coseSign1 = decode(document, { allowedTags: [COSE_SIGN1_TAG] });
   if (!Array.isArray(coseSign1) || coseSign1.length !== 4) {
     throw new Error("Invalid COSE Sign1 structure");
   }
   const [protectedHeader, , payload, signature] = coseSign1;
+  if (!(protectedHeader instanceof Uint8Array) || !(payload instanceof Uint8Array) || !(signature instanceof Uint8Array)) {
+    throw new Error("Invalid COSE Sign1 structure");
+  }
   const decodedPayload = decode(payload);
+  if (!decodedPayload || typeof decodedPayload !== "object" || Array.isArray(decodedPayload)) {
+    throw new Error("Invalid Nitro attestation payload");
+  }
   const pcrs = {};
   if (decodedPayload.pcrs) {
     for (const [index, value] of Object.entries(decodedPayload.pcrs)) {
@@ -472,6 +606,7 @@ var RECORD_PROTECTION = "AES-256-GCM";
 var SESSION_ENDPOINT = "/e2p/v2/session";
 var CONFIRM_ENDPOINT = "/e2p/v2/confirm";
 var REQUEST_ENDPOINT = "/e2p/v2/request";
+var MAX_ENVELOPE_BYTES = MAX_CBOR_BYTES;
 var encoder = new TextEncoder();
 var MAGIC = encoder.encode("STEVE-E2P-V2\0");
 var KEY_MATERIAL_LENGTHS = Object.freeze({
@@ -688,12 +823,24 @@ function decodeSessionResponse(bytes, expectedKeyExchange) {
 }
 function encodeEnvelope(sessionId, sequence, ciphertext) {
   requireLength("session ID", sessionId, 16);
-  return encode({
-    version: VERSION,
-    session_id: sessionId,
-    sequence: sequenceBytes(sequence),
-    ciphertext
-  });
+  let envelope;
+  try {
+    envelope = encode({
+      version: VERSION,
+      session_id: sessionId,
+      sequence: sequenceBytes(sequence),
+      ciphertext
+    });
+  } catch (error) {
+    if (error?.message === "CBOR output exceeds size limit") {
+      throw new Error("v2 envelope exceeds size limit", { cause: error });
+    }
+    throw error;
+  }
+  if (envelope.length > MAX_ENVELOPE_BYTES) {
+    throw new Error("v2 envelope exceeds size limit");
+  }
+  return envelope;
 }
 function decodeEnvelope(bytes) {
   const envelope = decode(bytes);
@@ -951,17 +1098,30 @@ var steve_xwing_wasm_default = __wbg_init;
 
 // src/key-exchange.js
 var XWING_WASM_PATH = "./xwing/steve_xwing_wasm_bg.wasm";
-var XWING_WASM_SHA256 = false ? null : "959d5a21407349e5cd841349b8329dc499eaf465b23b06e27938284cff0173f9";
-var verifiedXWingModule;
-function loadVerifiedXWingModule() {
-  if (!verifiedXWingModule) {
-    verifiedXWingModule = initializeVerifiedXWingModule({
-      initialize: steve_xwing_wasm_default,
-      XWingClient
-    });
+var XWING_WASM_SHA256 = false ? null : "802131b0e84424760f3e2e37bcee0c76fb029aa3480d7742b839f60508cc0912";
+function createVerifiedXWingModuleLoader(initializer) {
+  if (typeof initializer !== "function") {
+    throw new TypeError("X-Wing module initializer must be a function");
   }
-  return verifiedXWingModule;
+  let cached;
+  return function loadModule() {
+    if (!cached) {
+      const attempt = Promise.resolve().then(initializer);
+      const guarded = attempt.catch((error) => {
+        if (cached === guarded) cached = void 0;
+        throw error;
+      });
+      cached = guarded;
+    }
+    return cached;
+  };
 }
+var loadVerifiedXWingModule = createVerifiedXWingModuleLoader(
+  () => initializeVerifiedXWingModule({
+    initialize: steve_xwing_wasm_default,
+    XWingClient
+  })
+);
 async function initializeVerifiedXWingModule({
   initialize,
   XWingClient: XWingClient2,
@@ -1570,7 +1730,7 @@ function isPassthrough(request, url) {
   if (builtInBootstrap) return SAFE_BOOTSTRAP_METHODS.has(request.method);
   const configuredPassthrough = config.passthroughPaths.includes(url.pathname);
   const localBootstrap = localOrigin && configuredPassthrough;
-  return localBootstrap || config.excludePrefixes.some((prefix) => url.pathname.startsWith(prefix));
+  return localBootstrap && SAFE_BOOTSTRAP_METHODS.has(request.method) || config.excludePrefixes.some((prefix) => url.pathname.startsWith(prefix));
 }
 function configure(update) {
   const allowed = [

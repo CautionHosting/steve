@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   XWING_WASM_PATH,
   createClientKeyExchange,
+  createVerifiedXWingModuleLoader,
   initializeVerifiedXWingModule
 } from '../src/key-exchange.js';
 import {
@@ -112,6 +113,36 @@ test('verified X-Wing loader hashes the exact fixed asset before initialization'
       redirect: 'error'
     }
   });
+});
+
+test('verified X-Wing loader retries a rejected attempt and caches success', async () => {
+  let attempts = 0;
+  let rejectFirst;
+  const firstAttempt = new Promise((resolve, reject) => {
+    rejectFirst = reject;
+  });
+  const expected = { XWingClient: class FakeXWingClient {} };
+  const loader = createVerifiedXWingModuleLoader(async () => {
+    attempts += 1;
+    if (attempts === 1) return firstAttempt;
+    return expected;
+  });
+
+  const first = loader();
+  const concurrent = loader();
+  assert.strictEqual(concurrent, first);
+  assert.equal(attempts, 0, 'initialization starts in a microtask');
+  await Promise.resolve();
+  assert.equal(attempts, 1);
+
+  rejectFirst(new Error('transient WASM fetch failure'));
+  await assert.rejects(first, /transient WASM fetch failure/u);
+  await assert.rejects(concurrent, /transient WASM fetch failure/u);
+
+  const retried = loader();
+  assert.deepEqual(await retried, expected);
+  assert.equal(attempts, 2);
+  assert.strictEqual(loader(), retried);
 });
 
 test('tampered X-Wing WASM aborts before initialization with no X25519 fallback', async () => {

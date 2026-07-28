@@ -11,6 +11,7 @@ COPY --from=curl . /
 ENV CARGO_HOME=/tmp/cargo-home
 ENV CARGO_INCREMENTAL=0
 ENV CARGO_TARGET_DIR=/tmp/cargo-target
+ENV RUSTFLAGS="-C codegen-units=1 --remap-path-prefix=/build=. --remap-path-prefix=/tmp/cargo-target=target"
 ENV RUSTC_BOOTSTRAP=1
 ENV SOURCE_DATE_EPOCH=1
 
@@ -30,7 +31,7 @@ RUN cargo fetch --locked && \
 
 RUN --network=none \
     cargo build -Z build-std=std,panic_abort \
-      --locked --offline --release \
+      --frozen --offline --release \
       --package steve-xwing-wasm \
       --target wasm32-unknown-unknown && \
     /opt/wasm-bindgen/bin/wasm-bindgen \

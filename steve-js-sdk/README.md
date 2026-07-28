@@ -33,6 +33,19 @@ The configured suite is exact and client-pinned; the session response and
 attestation binding must both match it. The worker does not negotiate a suite
 or make a metadata preflight request.
 
+## Browser support
+
+The SDK requires module service workers, ES2020, WebCrypto
+(SHA-256, HKDF, and AES-GCM), and WebAssembly. X25519 mode additionally
+requires WebCrypto X25519; X-Wing requires a CSP that permits instantiating the
+same-origin WASM asset. Missing capabilities fail closed; there is no classic
+service-worker or cryptographic fallback.
+
+The release E2E gate uses Chromium (installed Google Chrome on macOS).
+Playwright Firefox and WebKit are supported opt-in test engines, but are not a
+numeric minimum-version guarantee. Applications should test their supported
+browser versions explicitly before publishing a compatibility claim.
+
 For X-Wing, the bundle contains the SHA-256 digest of the exact WASM emitted by
 the same build. The worker fetches that fixed same-origin asset without cache,
 verifies the digest, and only then instantiates it. This detects a bundle/asset
@@ -89,7 +102,9 @@ unrelated cross-origin requests are left untouched. Default bootstrap scripts
 pass through only for `GET` and `HEAD` requests on the service worker's own
 origin. A top-level document `GET /` also passes through so the page can repair
 lost worker configuration; fetches and non-GET requests to `/` remain
-protected.
+protected. Exact paths added through `passthroughPaths` are also plaintext only
+for `GET` and `HEAD`. An intentionally plaintext POST route must instead use an
+`excludePrefixes` entry and accept the broader prefix-based exclusion.
 STEVE rejects wildcard CORS configuration, so cross-origin deployments must
 list each allowed browser origin explicitly.
 
@@ -127,7 +142,8 @@ make build
 may replace it. The Rust stage builds the matching
 `wasm32-unknown-unknown` standard library, installs exactly
 `wasm-bindgen-cli` 0.2.106, fetches the locked Cargo graph, and compiles with
-network access disabled. The Node stage runs `npm ci --ignore-scripts`,
+network access disabled, one codegen unit, and stable build-path remapping. The
+Node stage runs `npm ci --ignore-scripts`,
 statically bundles the generated bindings and their WASM digest, runs the
 production package checks, and copies the fixed WASM asset into `dist/xwing/`.
 
@@ -141,6 +157,13 @@ cmp wasm-pkg/steve_xwing_wasm_bg.wasm dist/xwing/steve_xwing_wasm_bg.wasm
 make test-wasm   # RustCrypto/WASM interoperability tests inside StageX
 make build-e2e   # disposable assets in ../tests/e2e/public/
 ```
+
+The repository `test-production` target compares committed `dist/` with a
+clean StageX build and then byte-compares a second no-cache build. This
+establishes same-builder temporal determinism; independent reproducibility
+still requires a second builder or operator. Dependency acquisition, including
+the exact-version locked `wasm-bindgen-cli` install, remains network-enabled,
+so this check is not a claim of fully offline input provenance.
 
 Local Node.js is still useful for `npm test` and Playwright, but local Rust,
 `wasm-bindgen`, or esbuild versions never produce browser artifacts.

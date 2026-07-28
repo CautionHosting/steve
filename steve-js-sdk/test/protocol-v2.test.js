@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { decode as decodeCBOR, encode as encodeCBOR } from 'tee-attestation-js/lib/cbor';
+import {
+  decode as decodeCBOR,
+  encode as encodeCBOR
+} from 'tee-attestation-js/lib/cbor';
 
 import {
   Direction,
+  MAX_ENVELOPE_BYTES,
   MessageType,
   SequenceTracker,
   X25519_KEY_EXCHANGE,
@@ -138,6 +142,17 @@ test('envelope is strict and response direction is authenticated', async () => {
     1n,
     envelope.ciphertext
   ));
+});
+
+test('envelope encoding fails locally above the server size limit', () => {
+  assert.throws(
+    () => encodeEnvelope(
+      new Uint8Array(16),
+      0n,
+      new Uint8Array(MAX_ENVELOPE_BYTES)
+    ),
+    /v2 envelope exceeds size limit/u
+  );
 });
 
 test('attested binder requires exact transcript values', () => {

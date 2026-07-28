@@ -525,6 +525,19 @@ async function timeout() {
   return result;
 }
 
+async function compressed() {
+  const response = await fetch(`${ENCLAVE_ORIGIN}/compressed`);
+  const result = {
+    status: response.status,
+    body: await response.text(),
+    contentEncoding: response.headers.get('content-encoding'),
+    contentLength: response.headers.get('content-length'),
+    upstreamAcceptEncoding: response.headers.get('x-upstream-accept-encoding')
+  };
+  await refreshStatus();
+  return result;
+}
+
 async function concurrency() {
   const slow = timeoutRequest(false);
   await new Promise(resolve => setTimeout(resolve, 25));
@@ -583,6 +596,7 @@ window.steveDemo = {
   rotate,
   reset,
   echo,
+  compressed,
   unauthorized,
   timeout,
   concurrency

@@ -36,7 +36,7 @@
     "url": "https://codeberg.org/caution/transport-security-service-worker.git"
   },
   "dependencies": {
-    "tee-attestation-js": "git+https://git.distrust.co/public/tee-attestation-js.git#bca7b2ab0b819f66148dd58cd397958554dd1ad4"
+    "tee-attestation-js": "git+https://git.distrust.co/vincent/tee-attestation-js.git#eb3bdc0cc0f3d8ff0bc95e79b94f0b3e8104e204"
   },
   "devDependencies": {
     "@noble/post-quantum": "0.6.1",

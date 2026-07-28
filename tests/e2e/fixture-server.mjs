@@ -3,6 +3,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gzipSync } from 'node:zlib';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const publicDirectory = path.join(directory, 'public');
@@ -68,6 +69,22 @@ const upstream = createServer(async (request, response) => {
   if (url.pathname === '/echo') {
     const body = await readBody(request);
     respond(response, 200, body, request.headers['content-type'] || 'application/octet-stream');
+    return;
+  }
+  if (url.pathname === '/compressed') {
+    const acceptEncoding = request.headers['accept-encoding'] || 'missing';
+    const identity = acceptEncoding === 'identity';
+    const body = identity
+      ? Buffer.from('identity-through-steve')
+      : gzipSync(Buffer.from('compressed-through-steve'));
+    response.writeHead(200, {
+      'Content-Type': 'text/plain; charset=utf-8',
+      ...(!identity && { 'Content-Encoding': 'gzip' }),
+      'Content-Length': body.length,
+      'Cache-Control': 'no-store',
+      'X-Upstream-Accept-Encoding': acceptEncoding
+    });
+    response.end(body);
     return;
   }
   respond(response, 404, 'not found');

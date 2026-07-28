@@ -84,6 +84,25 @@ test('establishes a signed eval session and completes an encrypted echo', async 
   });
 });
 
+test('protects a 100 KiB application body and requests identity responses', async ({
+  page
+}) => {
+  await initialize(page);
+  const payload = 'x'.repeat(100 * 1024);
+
+  expect(await page.evaluate(value => window.steveDemo.echo(value), payload)).toEqual({
+    status: 200,
+    body: payload
+  });
+  expect(await page.evaluate(() => window.steveDemo.compressed())).toEqual({
+    status: 200,
+    body: 'identity-through-steve',
+    contentEncoding: null,
+    contentLength: null,
+    upstreamAcceptEncoding: 'identity'
+  });
+});
+
 test('fails closed when the browser and server key exchanges disagree', async ({ page }) => {
   await openDemo(page);
   const mismatchedKeyExchange = keyExchange === 'X25519'

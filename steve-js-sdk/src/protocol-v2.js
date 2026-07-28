@@ -1,4 +1,8 @@
-import { encode as encodeCBOR, decode as decodeCBOR } from 'tee-attestation-js/lib/cbor';
+import {
+  MAX_CBOR_BYTES,
+  decode as decodeCBOR,
+  encode as encodeCBOR
+} from 'tee-attestation-js/lib/cbor';
 
 export const VERSION = 2;
 export const PROTOCOL_ID = 'STEVE-E2P-V2';
@@ -10,6 +14,7 @@ export const RECORD_PROTECTION = 'AES-256-GCM';
 export const SESSION_ENDPOINT = '/e2p/v2/session';
 export const CONFIRM_ENDPOINT = '/e2p/v2/confirm';
 export const REQUEST_ENDPOINT = '/e2p/v2/request';
+export const MAX_ENVELOPE_BYTES = MAX_CBOR_BYTES;
 
 const encoder = new TextEncoder();
 const MAGIC = encoder.encode('STEVE-E2P-V2\0');
@@ -266,12 +271,24 @@ export function decodeSessionResponse(bytes, expectedKeyExchange) {
 
 export function encodeEnvelope(sessionId, sequence, ciphertext) {
   requireLength('session ID', sessionId, 16);
-  return encodeCBOR({
-    version: VERSION,
-    session_id: sessionId,
-    sequence: sequenceBytes(sequence),
-    ciphertext
-  });
+  let envelope;
+  try {
+    envelope = encodeCBOR({
+      version: VERSION,
+      session_id: sessionId,
+      sequence: sequenceBytes(sequence),
+      ciphertext
+    });
+  } catch (error) {
+    if (error?.message === 'CBOR output exceeds size limit') {
+      throw new Error('v2 envelope exceeds size limit', { cause: error });
+    }
+    throw error;
+  }
+  if (envelope.length > MAX_ENVELOPE_BYTES) {
+    throw new Error('v2 envelope exceeds size limit');
+  }
+  return envelope;
 }
 
 export function decodeEnvelope(bytes) {

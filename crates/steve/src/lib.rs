@@ -262,7 +262,14 @@ fn cors_layer(origins: &str) -> Result<CorsLayer, BoxError> {
 
 fn enclave_http_client() -> Result<Client, reqwest::Error> {
     // The enclave must never inherit host proxy configuration for its local upstream hop.
-    Client::builder().no_proxy().build()
+    // Keep plaintext responses byte-preserving; protected requests explicitly require identity.
+    Client::builder()
+        .no_proxy()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        .build()
 }
 
 async fn create_session(
@@ -516,9 +523,11 @@ async fn forward_protected_http(
         Err(_) => return failure("invalid upstream request"),
     };
 
-    let mut builder = client.request(method, url);
+    let mut builder = client
+        .request(method, url)
+        .header(header::ACCEPT_ENCODING, "identity");
     for (name, value) in request.headers {
-        if forwardable_header(&name) {
+        if forwardable_protected_request_header(&name) {
             builder = builder.header(name, value);
         }
     }
@@ -534,6 +543,10 @@ async fn forward_protected_http(
         }
     };
     let status = response.status().as_u16();
+    if has_unsupported_content_encoding(response.headers()) {
+        warn!("protected upstream returned unsupported content encoding");
+        return failure("unsupported upstream content encoding");
+    }
     let headers = response_headers(response.headers());
     let body = match read_protected_response_body(&mut response, MAX_PROTECTED_RESPONSE_BODY_BYTES)
         .await
@@ -590,11 +603,9 @@ async fn forward_unencrypted(state: &AppState, request: Request) -> Response {
         Err(_) => return ApiError::Malformed.into_response(),
     };
     let mut builder = state.http_client.request(method, url);
-    for (name, value) in headers {
-        if let Some(name) = name
-            && forwardable_header(name.as_str())
-        {
-            builder = builder.header(name, value);
+    for (name, value) in &headers {
+        if forwardable_header(name.as_str()) {
+            builder = builder.header(name.clone(), value.clone());
         }
     }
     let upstream = match builder.body(body).send().await {
@@ -610,15 +621,16 @@ async fn forward_unencrypted(state: &AppState, request: Request) -> Response {
         Ok(body) => body,
         Err(_) => return (StatusCode::BAD_GATEWAY, "upstream unavailable").into_response(),
     };
-    let mut response = Response::builder().status(status);
-    for (name, value) in headers {
-        if let Some(name) = name {
-            response = response.header(name, value);
+    let mut response = match Response::builder().status(status).body(Body::from(body)) {
+        Ok(response) => response,
+        Err(_) => return ApiError::Internal.into_response(),
+    };
+    for (name, value) in &headers {
+        if forwardable_header(name.as_str()) {
+            response.headers_mut().append(name.clone(), value.clone());
         }
     }
     response
-        .body(Body::from(body))
-        .unwrap_or_else(|_| ApiError::Internal.into_response())
 }
 
 fn upstream_url(base: &url::Url, path: &str) -> Result<url::Url, ()> {
@@ -650,10 +662,28 @@ fn forwardable_header(name: &str) -> bool {
     )
 }
 
+fn forwardable_protected_request_header(name: &str) -> bool {
+    forwardable_header(name) && !name.eq_ignore_ascii_case("accept-encoding")
+}
+
+fn has_unsupported_content_encoding(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            value.to_str().map_or(true, |value| {
+                let mut encodings = value.split(',').map(str::trim).peekable();
+                encodings.peek().is_none()
+                    || encodings.any(|encoding| !encoding.eq_ignore_ascii_case("identity"))
+            })
+        })
+}
+
 fn response_headers(headers: &HeaderMap) -> HashMap<String, String> {
     headers
         .iter()
         .filter(|(name, _)| forwardable_header(name.as_str()))
+        .filter(|(name, _)| *name != header::CONTENT_ENCODING)
         .filter_map(|(name, value)| {
             value
                 .to_str()
@@ -736,6 +766,15 @@ mod tests {
         executions: Arc<AtomicUsize>,
     }
 
+    async fn spawn_test_upstream(router: Router) -> url::Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        url::Url::parse(&format!("http://{address}")).unwrap()
+    }
+
     impl ProtectedUpstream for CountingUpstream {
         fn forward(&self, request: ApplicationRequest) -> ProtectedFuture<'_> {
             self.executions.fetch_add(1, Ordering::SeqCst);
@@ -789,6 +828,105 @@ mod tests {
             append_protected_response_chunk(&mut streamed, &[5], 4),
             Err(ProtectedResponseBodyError::TooLarge)
         ));
+    }
+
+    #[tokio::test]
+    async fn protected_upstream_requests_identity_and_accepts_identity_responses() {
+        let upstream = Router::new()
+            .route(
+                "/accepted",
+                axum::routing::get(|headers: HeaderMap| async move {
+                    headers
+                        .get(header::ACCEPT_ENCODING)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("missing")
+                        .to_string()
+                }),
+            )
+            .route(
+                "/identity",
+                axum::routing::get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_ENCODING, "identity")
+                        .header(header::CONTENT_LENGTH, 8)
+                        .body(Body::from("identity"))
+                        .unwrap()
+                }),
+            );
+        let upstream_url = spawn_test_upstream(upstream).await;
+        let client = enclave_http_client().unwrap();
+
+        let accepted = forward_protected_http(
+            &client,
+            &upstream_url,
+            ApplicationRequest {
+                method: "GET".to_string(),
+                path: "/accepted".to_string(),
+                headers: HashMap::from([(
+                    "accept-encoding".to_string(),
+                    "attacker-controlled".to_string(),
+                )]),
+                body: None,
+            },
+        )
+        .await;
+        assert_eq!(accepted.status, StatusCode::OK.as_u16());
+        assert_eq!(accepted.body.as_deref(), Some(b"identity".as_slice()));
+
+        let identity = forward_protected_http(
+            &client,
+            &upstream_url,
+            ApplicationRequest {
+                method: "GET".to_string(),
+                path: "/identity".to_string(),
+                headers: HashMap::new(),
+                body: None,
+            },
+        )
+        .await;
+        assert_eq!(identity.status, StatusCode::OK.as_u16());
+        assert_eq!(identity.body.as_deref(), Some(b"identity".as_slice()));
+        assert!(!identity.headers.contains_key("content-encoding"));
+        assert!(!identity.headers.contains_key("content-length"));
+    }
+
+    #[tokio::test]
+    async fn protected_upstream_rejects_non_identity_content_encodings() {
+        let upstream = Router::new().route(
+            "/{encoding}",
+            axum::routing::get(
+                |axum::extract::Path(encoding): axum::extract::Path<String>| async move {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_ENCODING, encoding)
+                        .body(Body::from("encoded"))
+                        .unwrap()
+                },
+            ),
+        );
+        let upstream_url = spawn_test_upstream(upstream).await;
+        let client = enclave_http_client().unwrap();
+        for encoding in ["gzip", "br", "deflate", "zstd", "compress%2C%20identity"] {
+            let response = forward_protected_http(
+                &client,
+                &upstream_url,
+                ApplicationRequest {
+                    method: "GET".to_string(),
+                    path: format!("/{encoding}"),
+                    headers: HashMap::new(),
+                    body: None,
+                },
+            )
+            .await;
+
+            assert_eq!(response.status, StatusCode::BAD_GATEWAY.as_u16());
+            assert_eq!(
+                response.error.as_deref(),
+                Some("unsupported upstream content encoding")
+            );
+            assert!(response.body.is_none());
+        }
     }
 
     #[tokio::test]
@@ -1466,6 +1604,154 @@ mod tests {
         assert_eq!(
             response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
             Some(&HeaderValue::from_static("https://upstream.example"))
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_forwarding_preserves_content_encoding() {
+        let encoded_body = vec![0x1f, 0x8b, 0x08, 0x00, 0x01, 0x02, 0x03];
+        let upstream = Router::new().route(
+            "/compressed",
+            axum::routing::get({
+                let encoded_body = encoded_body.clone();
+                move |headers: HeaderMap| {
+                    let encoded_body = encoded_body.clone();
+                    async move {
+                        assert_eq!(
+                            headers.get(header::ACCEPT_ENCODING),
+                            Some(&HeaderValue::from_static("gzip"))
+                        );
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_ENCODING, "gzip")
+                            .body(Body::from(encoded_body))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let upstream_url = spawn_test_upstream(upstream).await;
+        let app = build_router_with_components(
+            ServerConfig {
+                listen_addr: "127.0.0.1:0".to_string(),
+                upstream_url,
+                cors_origins: None,
+                key_exchange: KeyExchangeSuite::X25519,
+            },
+            Arc::new(FakeAttestationProvider::default()),
+            Arc::new(CountingUpstream {
+                executions: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/compressed")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING),
+            Some(&HeaderValue::from_static("gzip"))
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap(),
+            encoded_body
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_forwarding_preserves_repeated_headers_and_filters_framing() {
+        let upstream = Router::new().route(
+            "/headers",
+            axum::routing::get(|headers: HeaderMap| async move {
+                let request_values = headers
+                    .get_all("x-repeat")
+                    .iter()
+                    .map(|value| value.to_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut response = Response::new(Body::from(request_values));
+                response
+                    .headers_mut()
+                    .append("x-repeat-response", HeaderValue::from_static("one"));
+                response
+                    .headers_mut()
+                    .append("x-repeat-response", HeaderValue::from_static("two"));
+                response
+                    .headers_mut()
+                    .append(header::SET_COOKIE, HeaderValue::from_static("a=1"));
+                response
+                    .headers_mut()
+                    .append(header::SET_COOKIE, HeaderValue::from_static("b=2"));
+                response
+                    .headers_mut()
+                    .insert(header::CONNECTION, HeaderValue::from_static("close"));
+                response
+            }),
+        );
+        let upstream_url = spawn_test_upstream(upstream).await;
+        let app = build_router_with_components(
+            ServerConfig {
+                listen_addr: "127.0.0.1:0".to_string(),
+                upstream_url,
+                cors_origins: None,
+                key_exchange: KeyExchangeSuite::X25519,
+            },
+            Arc::new(FakeAttestationProvider::default()),
+            Arc::new(CountingUpstream {
+                executions: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+        .unwrap();
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("/headers")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .headers_mut()
+            .append("x-repeat", HeaderValue::from_static("first"));
+        request
+            .headers_mut()
+            .append("x-repeat", HeaderValue::from_static("second"));
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get_all("x-repeat-response")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["a=1", "b=2"]
+        );
+        assert!(!response.headers().contains_key(header::CONNECTION));
+        assert!(!response.headers().contains_key(header::TRANSFER_ENCODING));
+        assert!(!forwardable_header("content-length"));
+        if let Some(content_length) = response.headers().get(header::CONTENT_LENGTH) {
+            assert_eq!(content_length, HeaderValue::from_static("12"));
+        }
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap(),
+            "first,second"
         );
     }
 

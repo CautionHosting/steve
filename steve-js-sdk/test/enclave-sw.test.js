@@ -120,6 +120,24 @@ test('built-in bootstrap passthrough is limited to safe methods', () => {
   }
 });
 
+test('configured passthrough paths are limited to safe methods', () => {
+  configure({ passthroughPaths: ['/custom-bootstrap.js'] });
+
+  assert.equal(isProtected('https://example.test/custom-bootstrap.js'), false);
+  assert.equal(
+    isProtected('https://example.test/custom-bootstrap.js', { method: 'HEAD' }),
+    false
+  );
+  assert.equal(
+    isProtected('https://example.test/custom-bootstrap.js', { method: 'POST' }),
+    true
+  );
+  assert.equal(
+    isProtected('https://example.test/custom-bootstrap.js', { method: 'PUT' }),
+    true
+  );
+});
+
 test('same-origin interception remains the default', () => {
   assert.equal(getConfig().enclaveOrigin, 'https://example.test');
   assert.equal(isProtected('https://example.test/data'), true);

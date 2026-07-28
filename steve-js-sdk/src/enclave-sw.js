@@ -1,4 +1,7 @@
-import { encode as encodeCBOR, decode as decodeCBOR } from 'tee-attestation-js/lib/cbor';
+import {
+  decode as decodeCBOR,
+  encode as encodeCBOR
+} from 'tee-attestation-js/lib/cbor';
 import { ATTESTATION_PROFILE, verifyAttestation } from './attestation-verifier.js';
 import { createClientKeyExchange, loadVerifiedXWingModule } from './key-exchange.js';
 import {
@@ -574,7 +577,7 @@ function isPassthrough(request, url) {
 
   const configuredPassthrough = config.passthroughPaths.includes(url.pathname);
   const localBootstrap = localOrigin && configuredPassthrough;
-  return localBootstrap
+  return (localBootstrap && SAFE_BOOTSTRAP_METHODS.has(request.method))
     || config.excludePrefixes.some(prefix => url.pathname.startsWith(prefix));
 }
 

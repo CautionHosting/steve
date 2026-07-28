@@ -158,6 +158,12 @@ failures do not reset an otherwise valid secure session. The SDK does not
 automatically retry timed-out requests because the upstream operation may
 already have executed.
 
+The browser SDK requires module service workers, ES2020, WebCrypto, and
+WebAssembly. X25519 mode also requires WebCrypto X25519; X-Wing requires a CSP
+that permits the fixed same-origin WASM asset. Unsupported capabilities fail
+closed without a classic-worker or cryptographic fallback. See
+`steve-js-sdk/README.md` for the tested-browser policy.
+
 The native Rust SDK remains separate follow-up work; this branch contains the
 server and browser/WASM implementation.
 
@@ -169,6 +175,9 @@ make verify  # Full StageX, packaging, and dual-suite browser gate
 ```
 
 Focused targets are `test-wasm`, `test-production`, and `test-e2e`.
+`test-production` includes two no-cache StageX builds and byte-compares their
+published SDK outputs. That proves same-builder temporal determinism, not
+independent-party reproducibility.
 
 ## Local E2E
 

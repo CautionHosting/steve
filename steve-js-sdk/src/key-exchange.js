@@ -13,17 +13,30 @@ export const XWING_WASM_SHA256 =
     ? null
     : __STEVE_XWING_WASM_SHA256__;
 
-let verifiedXWingModule;
+export function createVerifiedXWingModuleLoader(initializer) {
+  if (typeof initializer !== 'function') {
+    throw new TypeError('X-Wing module initializer must be a function');
+  }
+  let cached;
+  return function loadModule() {
+    if (!cached) {
+      const attempt = Promise.resolve().then(initializer);
+      const guarded = attempt.catch(error => {
+        if (cached === guarded) cached = undefined;
+        throw error;
+      });
+      cached = guarded;
+    }
+    return cached;
+  };
+}
 
-export function loadVerifiedXWingModule() {
-  if (!verifiedXWingModule) {
-    verifiedXWingModule = initializeVerifiedXWingModule({
+export const loadVerifiedXWingModule = createVerifiedXWingModuleLoader(
+  () => initializeVerifiedXWingModule({
       initialize: initializeXWing,
       XWingClient
-    });
-  }
-  return verifiedXWingModule;
-}
+  })
+);
 
 export async function initializeVerifiedXWingModule({
   initialize,
