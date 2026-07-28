@@ -7,6 +7,6 @@ DIST_SNAPSHOT=$(mktemp -d)
 trap 'rm -rf -- "$DIST_SNAPSHOT"' EXIT HUP INT TERM
 
 cp -R "$DIST_DIR/." "$DIST_SNAPSHOT/"
-npm --prefix "$ROOT_DIR/steve-js-sdk" run build
+make -C "$ROOT_DIR/steve-js-sdk" build
 diff -ru "$DIST_SNAPSHOT" "$DIST_DIR"
 node "$ROOT_DIR/tests/production/check-exclusions.mjs"
