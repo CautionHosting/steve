@@ -139,7 +139,9 @@ make build
 ```
 
 `dist/` is a committed release artifact and only the digest-pinned StageX build
-may replace it. The Rust stage builds the matching
+may replace it. `make build` is the no-cache artifact-refresh operation; do not
+run it before the repository production checks, which build into temporary
+directories without replacing `dist/`. The Rust stage builds the matching
 `wasm32-unknown-unknown` standard library, installs exactly
 `wasm-bindgen-cli` 0.2.106, fetches the locked Cargo graph, and compiles with
 network access disabled, one codegen unit, and stable build-path remapping. The
@@ -158,12 +160,14 @@ make test-wasm   # RustCrypto/WASM interoperability tests inside StageX
 make build-e2e   # disposable assets in ../tests/e2e/public/
 ```
 
-The repository `test-production` target compares committed `dist/` with a
-clean StageX build and then byte-compares a second no-cache build. This
-establishes same-builder temporal determinism; independent reproducibility
-still requires a second builder or operator. Dependency acquisition, including
-the exact-version locked `wasm-bindgen-cli` install, remains network-enabled,
-so this check is not a claim of fully offline input provenance.
+The repository `test-production-fast` target compares committed `dist/` with
+one cache-enabled temporary StageX build. `test-production` compares committed
+`dist/` with a clean temporary StageX build and then byte-compares a second
+no-cache build. This establishes same-builder temporal determinism;
+independent reproducibility still requires a second builder or operator.
+Dependency acquisition, including the exact-version locked
+`wasm-bindgen-cli` install, remains network-enabled, so this check is not a
+claim of fully offline input provenance.
 
 Local Node.js is still useful for `npm test` and Playwright, but local Rust,
 `wasm-bindgen`, or esbuild versions never produce browser artifacts.

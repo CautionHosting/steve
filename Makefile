@@ -1,4 +1,5 @@
-.PHONY: test test-rust test-js test-wasm test-production test-e2e verify
+.PHONY: test test-rust test-js test-wasm test-production \
+	test-production-fast test-e2e verify-dev verify-release verify
 
 test: test-rust test-js
 
@@ -12,12 +13,22 @@ test-wasm:
 	$(MAKE) -C steve-js-sdk test-wasm
 
 test-production:
-	./scripts/test-production-exclusions.sh
+	./scripts/test-production-exclusions.sh release
+
+test-production-fast:
+	./scripts/test-production-exclusions.sh fast
 
 test-e2e:
 	./scripts/test-e2e.sh
 
-verify:
+verify-dev:
+	$(MAKE) test-rust
+	$(MAKE) test-production-fast
+	$(MAKE) test-e2e
+
+verify-release:
 	$(MAKE) test-rust
 	$(MAKE) test-production
 	$(MAKE) test-e2e
+
+verify: verify-release

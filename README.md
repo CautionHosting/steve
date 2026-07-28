@@ -170,14 +170,19 @@ server and browser/WASM implementation.
 ## Validation
 
 ```bash
-make test    # Fast Rust and JavaScript unit tests
-make verify  # Full StageX, packaging, and dual-suite browser gate
+make test            # Fast Rust and JavaScript unit tests
+make verify-dev      # Cached StageX, packaging, and dual-suite browser gate
+make verify          # Release gate; alias for make verify-release
 ```
 
-Focused targets are `test-wasm`, `test-production`, and `test-e2e`.
-`test-production` includes two no-cache StageX builds and byte-compares their
-published SDK outputs. That proves same-builder temporal determinism, not
-independent-party reproducibility.
+Focused targets are `test-wasm`, `test-production-fast`, `test-production`,
+and `test-e2e`. The fast production check compares one cache-enabled StageX
+build with committed `dist/`. The release check uses two temporary no-cache
+builds: it compares committed `dist/` with the first build, then compares the
+two builds. That proves same-builder temporal determinism, not
+independent-party reproducibility. Neither check replaces `dist/`; run
+`make -C steve-js-sdk build` only when intentionally refreshing the committed
+production assets, not before a production check.
 
 ## Local E2E
 
@@ -242,5 +247,6 @@ demo; the SDK defaults it off.
 Production exclusion checks are a separate packaging gate:
 
 ```bash
-./scripts/test-production-exclusions.sh
+./scripts/test-production-exclusions.sh fast     # One cache-enabled build
+./scripts/test-production-exclusions.sh release  # Two no-cache builds
 ```

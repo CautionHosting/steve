@@ -6,24 +6,20 @@ COMPOSE_FILE="$ROOT_DIR/tests/e2e/compose.yaml"
 PROJECT_NAME=steve-e2e
 ACTION=${1:-test}
 REQUESTED_KEY_EXCHANGE=${STEVE_KEY_EXCHANGE:-}
-
-if [ "$ACTION" = "test" ] && [ -z "$REQUESTED_KEY_EXCHANGE" ]; then
-  for suite in X25519 XWING-DRAFT10; do
-    echo "Running STEVE E2E suite: $suite"
-    STEVE_KEY_EXCHANGE="$suite" "$ROOT_DIR/scripts/test-e2e.sh" test
-  done
-  exit 0
-fi
-
 STEVE_KEY_EXCHANGE=${REQUESTED_KEY_EXCHANGE:-X25519}
+SERVICES_RUNNING=0
 
-case "$STEVE_KEY_EXCHANGE" in
-  X25519|XWING-DRAFT10) ;;
-  *)
-    echo "STEVE_KEY_EXCHANGE must be exactly X25519 or XWING-DRAFT10" >&2
-    exit 2
-    ;;
-esac
+validate_key_exchange() {
+  case "$1" in
+    X25519|XWING-DRAFT10) ;;
+    *)
+      echo "STEVE_KEY_EXCHANGE must be exactly X25519 or XWING-DRAFT10" >&2
+      exit 2
+      ;;
+  esac
+}
+
+validate_key_exchange "$STEVE_KEY_EXCHANGE"
 export STEVE_KEY_EXCHANGE
 
 compose() {
@@ -32,6 +28,11 @@ compose() {
 
 build_assets() {
   npm --prefix "$ROOT_DIR/steve-js-sdk" run build:e2e
+}
+
+prepare() {
+  build_assets
+  compose build
 }
 
 wait_for_services() {
@@ -48,24 +49,29 @@ wait_for_services() {
   done
 }
 
-start() {
-  build_assets
-  compose up --build --detach
+start_suite() {
+  STEVE_KEY_EXCHANGE=$1
+  export STEVE_KEY_EXCHANGE
+  SERVICES_RUNNING=1
+  compose up --detach --no-build --force-recreate
   wait_for_services
 }
 
 stop() {
   compose down --volumes --remove-orphans
+  SERVICES_RUNNING=0
 }
 
 cleanup_test() {
   status=$?
   trap - EXIT INT TERM
-  if [ "$status" -ne 0 ]; then
+  if [ "$status" -ne 0 ] && [ "$SERVICES_RUNNING" -eq 1 ]; then
     echo "STEVE E2E failed; container logs follow:" >&2
     compose logs --no-color --tail 200 >&2 || true
   fi
-  stop || true
+  if [ "$SERVICES_RUNNING" -eq 1 ]; then
+    stop || true
+  fi
   exit "$status"
 }
 
@@ -80,16 +86,31 @@ run_playwright() {
   fi
 }
 
+run_suite() {
+  suite=$1
+  echo "Running STEVE E2E suite: $suite"
+  start_suite "$suite"
+  run_playwright
+  stop
+}
+
 case "$ACTION" in
   test)
     trap cleanup_test EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    start
-    run_playwright
+    prepare
+    if [ -n "$REQUESTED_KEY_EXCHANGE" ]; then
+      run_suite "$REQUESTED_KEY_EXCHANGE"
+    else
+      for suite in X25519 XWING-DRAFT10; do
+        run_suite "$suite"
+      done
+    fi
     ;;
   up)
-    start
+    prepare
+    start_suite "$STEVE_KEY_EXCHANGE"
     echo "STEVE local E2E demo: http://127.0.0.1:3000"
     ;;
   down)
