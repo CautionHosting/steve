@@ -721,7 +721,7 @@ var MIN_REQUEST_TIMEOUT_MS = 1e3;
 var MAX_REQUEST_TIMEOUT_MS = 5 * 60 * 1e3;
 var SESSION_ESTABLISH_TIMEOUT_MS = 10 * 1e3;
 var SESSION_FATAL_HTTP_STATUSES = /* @__PURE__ */ new Set([400, 401, 409, 425]);
-var REQUEST_LOCAL_HTTP_STATUSES = /* @__PURE__ */ new Set([403, 404, 408, 429]);
+var REQUEST_LOCAL_HTTP_STATUSES = /* @__PURE__ */ new Set([403, 404, 408, 413, 429]);
 var CONFIG_CACHE_NAME = "steve-sdk-config-v1";
 var CONFIG_CACHE_PATH = ".steve-sdk/config-v1";
 function defaultConfig() {

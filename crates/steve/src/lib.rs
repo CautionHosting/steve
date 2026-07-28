@@ -33,6 +33,7 @@ use zeroize::Zeroizing;
 const DEFAULT_APP_UPSTREAM: &str = "http://127.0.0.1:8083";
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:49500";
 const MAX_ENVELOPE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PROTECTED_RESPONSE_BODY_BYTES: usize = MAX_ENVELOPE_BYTES;
 const MAX_UNENCRYPTED_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONCURRENT_ATTESTATIONS: usize = 8;
 
@@ -376,6 +377,45 @@ struct ApplicationResponse {
     error: Option<String>,
 }
 
+#[derive(Debug)]
+enum ProtectedResponseBodyError {
+    TooLarge,
+    Read(reqwest::Error),
+}
+
+fn append_protected_response_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    limit: usize,
+) -> Result<(), ProtectedResponseBodyError> {
+    if chunk.len() > limit.saturating_sub(body.len()) {
+        return Err(ProtectedResponseBodyError::TooLarge);
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn read_protected_response_body(
+    response: &mut reqwest::Response,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, ProtectedResponseBodyError> {
+    let content_length = response.content_length();
+    if content_length.is_some_and(|length| length > limit as u64) {
+        return Err(ProtectedResponseBodyError::TooLarge);
+    }
+
+    let mut body = Vec::with_capacity(content_length.unwrap_or(0) as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(ProtectedResponseBodyError::Read)?
+    {
+        append_protected_response_chunk(&mut body, &chunk, limit)?;
+    }
+
+    Ok((!body.is_empty()).then_some(body))
+}
+
 async fn forward_protected_http(
     client: &Client,
     upstream_url: &url::Url,
@@ -407,7 +447,7 @@ async fn forward_protected_http(
         builder = builder.body(body);
     }
 
-    let response = match builder.send().await {
+    let mut response = match builder.send().await {
         Ok(response) => response,
         Err(error) => {
             warn!(%error, "protected upstream request failed");
@@ -416,10 +456,18 @@ async fn forward_protected_http(
     };
     let status = response.status().as_u16();
     let headers = response_headers(response.headers());
-    let body = match response.bytes().await {
-        Ok(body) if body.is_empty() => None,
-        Ok(body) => Some(body.to_vec()),
-        Err(error) => {
+    let body = match read_protected_response_body(&mut response, MAX_PROTECTED_RESPONSE_BODY_BYTES)
+        .await
+    {
+        Ok(body) => body,
+        Err(ProtectedResponseBodyError::TooLarge) => {
+            warn!(
+                limit = MAX_PROTECTED_RESPONSE_BODY_BYTES,
+                "protected upstream response exceeded size limit"
+            );
+            return failure("upstream response too large");
+        }
+        Err(ProtectedResponseBodyError::Read(error)) => {
             warn!(%error, "failed reading protected upstream response");
             return failure("upstream response unavailable");
         }
@@ -628,6 +676,39 @@ mod tests {
         assert!(upstream_url(&base, "/ok?q=1").is_ok());
         assert!(upstream_url(&base, "//attacker.example/x").is_err());
         assert!(upstream_url(&base, "https://attacker.example").is_err());
+    }
+
+    #[tokio::test]
+    async fn protected_response_body_is_bounded() {
+        let mut accepted = reqwest::Response::from(
+            axum::http::Response::builder()
+                .body(reqwest::Body::from(vec![1, 2, 3, 4]))
+                .unwrap(),
+        );
+        assert_eq!(
+            read_protected_response_body(&mut accepted, 4)
+                .await
+                .unwrap(),
+            Some(vec![1, 2, 3, 4])
+        );
+
+        let mut rejected = reqwest::Response::from(
+            axum::http::Response::builder()
+                .body(reqwest::Body::from(vec![1, 2, 3, 4, 5]))
+                .unwrap(),
+        );
+        assert!(matches!(
+            read_protected_response_body(&mut rejected, 4).await,
+            Err(ProtectedResponseBodyError::TooLarge)
+        ));
+
+        let mut streamed = Vec::new();
+        append_protected_response_chunk(&mut streamed, &[1, 2], 4).unwrap();
+        append_protected_response_chunk(&mut streamed, &[3, 4], 4).unwrap();
+        assert!(matches!(
+            append_protected_response_chunk(&mut streamed, &[5], 4),
+            Err(ProtectedResponseBodyError::TooLarge)
+        ));
     }
 
     #[tokio::test]

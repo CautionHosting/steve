@@ -245,6 +245,7 @@ test('external aborts and transient HTTP failures are request-local', async () =
   assert.equal(isRequestLocalFailure(new ProtocolHttpError(403, 'v2 request')), true);
   assert.equal(isRequestLocalFailure(new ProtocolHttpError(404, 'v2 request')), true);
   assert.equal(isRequestLocalFailure(new ProtocolHttpError(408, 'v2 request')), true);
+  assert.equal(isRequestLocalFailure(new ProtocolHttpError(413, 'v2 request')), true);
   assert.equal(isRequestLocalFailure(new ProtocolHttpError(429, 'v2 request')), true);
   assert.equal(isRequestLocalFailure(new ProtocolHttpError(500, 'v2 request')), true);
   assert.equal(isRequestLocalFailure(new ProtocolHttpError(401, 'v2 request')), false);
@@ -504,6 +505,26 @@ test('a transient request failure does not poison a concurrent sibling', async (
 
   assert.equal(failed.status, 502);
   assert.equal(succeeded.status, 200);
+  assert.equal(getState().session, session);
+  assert.equal(await session.sequences.allocate(), 3n);
+});
+
+test('outer 413 retires only the oversized request', async () => {
+  const session = await installFakeSession();
+  let calls = 0;
+  globalThis.fetch = async (url, options) => {
+    calls += 1;
+    if (calls === 1) return new Response(null, { status: 413 });
+    return validProtocolResponse(options, session);
+  };
+
+  const [oversized, sibling] = await Promise.all([
+    handleProtectedRequest(new Request('https://example.test/oversized')),
+    handleProtectedRequest(new Request('https://example.test/sibling'))
+  ]);
+
+  assert.equal(oversized.status, 502);
+  assert.equal(sibling.status, 200);
   assert.equal(getState().session, session);
   assert.equal(await session.sequences.allocate(), 3n);
 });
