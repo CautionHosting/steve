@@ -86,11 +86,19 @@ run_playwright() {
   fi
 }
 
+run_native_sdk() {
+  STEVE_E2E_URL=http://127.0.0.1:49500 \
+    cargo test --locked --manifest-path "$ROOT_DIR/Cargo.toml" \
+      -p steve-sdk --lib tests::external_eval_e2e \
+      -- --exact --ignored --nocapture
+}
+
 run_suite() {
   suite=$1
   echo "Running STEVE E2E suite: $suite"
   start_suite "$suite"
   run_playwright
+  run_native_sdk
   stop
 }
 

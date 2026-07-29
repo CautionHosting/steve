@@ -20,7 +20,7 @@ use axum::{
     routing::any,
 };
 use base64::engine::general_purpose::STANDARD as BASE64;
-use coset::{CborSerializable, CoseSign1};
+use coset::{CborSerializable, CoseSign1, TaggedCborSerializable};
 use p384::ecdsa::{Signature, VerifyingKey, signature::Verifier as SignatureVerifier};
 use serde_cbor::Value;
 use steve::{
@@ -53,7 +53,7 @@ impl AttestationVerifier for EvalAttestationVerifier {
         _now: Duration,
         nonce: &[u8; 32],
     ) -> std::result::Result<Value, bootproof_sdk::format::Error> {
-        let cose = CoseSign1::from_slice(document)
+        let cose = CoseSign1::from_tagged_slice(document)
             .map_err(|_| malformed_attestation("eval cose sign1"))?;
         let payload_bytes = cose
             .payload
@@ -650,7 +650,7 @@ fn validates_every_attested_binding_field() {
 }
 
 #[test]
-fn signed_eval_verifier_rejects_bad_certificate_signature_pcr_and_nonce() {
+fn signed_eval_verifier_requires_tag_and_rejects_bad_certificate_signature_pcr_and_nonce() {
     let nonce = [7; 32];
     let document = EvalAttestationProvider
         .attest(&nonce, br#"{"protocol":"test"}"#)
@@ -661,6 +661,15 @@ fn signed_eval_verifier_rejects_bad_certificate_signature_pcr_and_nonce() {
             .verify(&document, &expected_pcrs(), Duration::ZERO, &nonce)
             .is_ok()
     );
+
+    let untagged = CoseSign1::from_tagged_slice(&document)
+        .unwrap()
+        .to_vec()
+        .unwrap();
+    assert!(matches!(
+        verifier.verify(&untagged, &expected_pcrs(), Duration::ZERO, &nonce),
+        Err(bootproof_sdk::format::Error::MalformedData(_))
+    ));
 
     let mut wrong_pcrs = expected_pcrs();
     wrong_pcrs.insert(2, vec![0x99; 48]);
@@ -673,11 +682,11 @@ fn signed_eval_verifier_rejects_bad_certificate_signature_pcr_and_nonce() {
         Err(bootproof_sdk::format::Error::InvalidNonce)
     ));
 
-    let mut bad_signature = CoseSign1::from_slice(&document).unwrap();
+    let mut bad_signature = CoseSign1::from_tagged_slice(&document).unwrap();
     bad_signature.signature[0] ^= 1;
     assert!(matches!(
         verifier.verify(
-            &bad_signature.to_vec().unwrap(),
+            &bad_signature.to_tagged_vec().unwrap(),
             &expected_pcrs(),
             Duration::ZERO,
             &nonce
@@ -685,7 +694,7 @@ fn signed_eval_verifier_rejects_bad_certificate_signature_pcr_and_nonce() {
         Err(bootproof_sdk::format::Error::BadSignature)
     ));
 
-    let mut bad_certificate = CoseSign1::from_slice(&document).unwrap();
+    let mut bad_certificate = CoseSign1::from_tagged_slice(&document).unwrap();
     let mut payload: Value =
         serde_cbor::from_slice(bad_certificate.payload.as_ref().unwrap()).unwrap();
     let Value::Map(map) = &mut payload else {
@@ -699,7 +708,7 @@ fn signed_eval_verifier_rejects_bad_certificate_signature_pcr_and_nonce() {
     bad_certificate.payload = Some(serde_cbor::to_vec(&payload).unwrap());
     assert!(matches!(
         verifier.verify(
-            &bad_certificate.to_vec().unwrap(),
+            &bad_certificate.to_tagged_vec().unwrap(),
             &expected_pcrs(),
             Duration::ZERO,
             &nonce
@@ -802,6 +811,83 @@ async fn xwing_signed_eval_server_round_trip_and_rotation() {
     let second = client.rotate_session().await.unwrap();
     assert_ne!(first.session_id, second.session_id);
     assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 2);
+}
+
+#[tokio::test]
+#[ignore = "requires the signed-eval services started by scripts/test-e2e.sh"]
+async fn external_eval_e2e() {
+    let base_url =
+        std::env::var("STEVE_E2E_URL").expect("STEVE_E2E_URL must identify the E2E STEVE origin");
+    let suite_name =
+        std::env::var("STEVE_KEY_EXCHANGE").expect("STEVE_KEY_EXCHANGE must select the E2E suite");
+    let suite = match suite_name.as_str() {
+        "X25519" => KeyExchangeSuite::X25519,
+        "XWING-DRAFT10" => KeyExchangeSuite::XWingDraft10,
+        _ => panic!("STEVE_KEY_EXCHANGE must be exactly X25519 or XWING-DRAFT10"),
+    };
+    let wrong_suite = match suite {
+        KeyExchangeSuite::X25519 => KeyExchangeSuite::XWingDraft10,
+        KeyExchangeSuite::XWingDraft10 => KeyExchangeSuite::X25519,
+    };
+
+    let mut wrong_builder = Client::builder(&base_url, expected_pcrs())
+        .unwrap()
+        .expected_key_exchange(wrong_suite);
+    wrong_builder.attestation_verifier = Arc::new(EvalAttestationVerifier);
+    assert!(matches!(
+        wrong_builder.connect().await,
+        Err(Error::ProtocolStatus {
+            operation: "session creation",
+            status: StatusCode::BAD_REQUEST,
+            ..
+        })
+    ));
+
+    let mut builder = Client::builder(&base_url, expected_pcrs())
+        .unwrap()
+        .expected_key_exchange(suite)
+        .request_timeout(Duration::from_secs(5));
+    builder.attestation_verifier = Arc::new(EvalAttestationVerifier);
+    let client = builder.connect().await.unwrap();
+    let first = client.verify_attestation().await.unwrap();
+    assert_eq!(first.module_id, "steve-local-eval");
+    assert_eq!(first.pcrs, expected_pcrs());
+
+    let body = b"native sdk through steve".to_vec();
+    let response = client
+        .post("/echo?client=rust")
+        .header("content-type", "application/octet-stream")
+        .unwrap()
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/octet-stream"
+    );
+    assert_eq!(response.bytes(), body);
+
+    let (slow, fast, medium) = tokio::join!(
+        client.get("/delay?ms=120").send(),
+        client.get("/delay?ms=20").send(),
+        client.get("/delay?ms=60").send(),
+    );
+    assert_eq!(slow.unwrap().bytes(), b"delayed:120");
+    assert_eq!(fast.unwrap().bytes(), b"delayed:20");
+    assert_eq!(medium.unwrap().bytes(), b"delayed:60");
+
+    let second = client.rotate_session().await.unwrap();
+    assert_ne!(first.session_id, second.session_id);
+    let response = client
+        .post("/echo?client=rust-after-rotation")
+        .body(b"rotated".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.bytes(), b"rotated");
 }
 
 #[tokio::test]
