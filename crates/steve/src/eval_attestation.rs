@@ -20,6 +20,7 @@ use serde_bytes::ByteBuf;
 use crate::attestation::{AttestationError, AttestationProvider};
 
 const MODULE_ID: &str = "steve-local-eval";
+const COSE_SIGN1_TAG: u64 = 18;
 const LEAF_KEY_PEM: &str = include_str!("../../../tests/e2e/fixtures/eval-leaf-key.pem");
 const LEAF_CERT_PEM: &str = include_str!("../../../tests/e2e/fixtures/eval-leaf-cert.pem");
 
@@ -73,12 +74,12 @@ impl AttestationProvider for EvalAttestationProvider {
         ))?;
         let signature: Signature = leaf_key.sign(&sig_structure);
 
-        encode(&(
+        encode(&ciborium::tag::Required::<_, COSE_SIGN1_TAG>((
             ByteBuf::from(protected),
             BTreeMap::<i32, i32>::new(),
             ByteBuf::from(payload),
             ByteBuf::from(signature.to_bytes().to_vec()),
-        ))
+        )))
     }
 }
 
@@ -111,6 +112,12 @@ mod tests {
 
         assert_ne!(first, second);
         let decoded: ciborium::Value = ciborium::from_reader(first.as_slice()).unwrap();
-        assert!(matches!(decoded, ciborium::Value::Array(values) if values.len() == 4));
+        assert!(matches!(
+            decoded,
+            ciborium::Value::Tag(
+                COSE_SIGN1_TAG,
+                value
+            ) if matches!(&*value, ciborium::Value::Array(values) if values.len() == 4)
+        ));
     }
 }

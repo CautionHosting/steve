@@ -123,14 +123,16 @@ function encode(value) {
   }
   return output;
 }
-function decode(input, { allowedTags = [] } = {}) {
+function decode(input, { allowedTags = [], requiredTag } = {}) {
   const bytes = input instanceof Uint8Array ? input : ArrayBuffer.isView(input) ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength) : input instanceof ArrayBuffer ? new Uint8Array(input) : null;
   if (!bytes) throw new TypeError("CBOR input must be bytes");
   if (bytes.length > MAX_CBOR_BYTES) {
     throw new Error("CBOR input exceeds size limit");
   }
   const acceptedTags = new Set(allowedTags);
+  if (requiredTag !== void 0) acceptedTags.add(requiredTag);
   let decodedNodes = 0;
+  let rootTag;
   let offset = 0;
   function requireBytes(length) {
     if (!Number.isSafeInteger(length) || length < 0 || length > MAX_CBOR_BYTES || length > bytes.length - offset) {
@@ -140,18 +142,23 @@ function decode(input, { allowedTags = [] } = {}) {
   function readArgument(additionalInfo) {
     if (additionalInfo < 24) return additionalInfo;
     let width;
+    let minimumValue;
     switch (additionalInfo) {
       case 24:
         width = 1;
+        minimumValue = 24n;
         break;
       case 25:
         width = 2;
+        minimumValue = 0x100n;
         break;
       case 26:
         width = 4;
+        minimumValue = 0x10000n;
         break;
       case 27:
         width = 8;
+        minimumValue = 0x100000000n;
         break;
       case 31:
         throw new Error("indefinite-length CBOR is not supported");
@@ -163,6 +170,9 @@ function decode(input, { allowedTags = [] } = {}) {
     for (let index = 0; index < width; index += 1) {
       value2 = value2 << 8n | BigInt(bytes[offset]);
       offset += 1;
+    }
+    if (value2 < minimumValue) {
+      throw new Error("non-preferred CBOR argument encoding");
     }
     if (value2 > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new Error("CBOR integer exceeds safe integer range");
@@ -264,12 +274,16 @@ function decode(input, { allowedTags = [] } = {}) {
         if (depth !== 0 || !acceptedTags.has(value2)) {
           throw new Error(`unsupported CBOR tag: ${value2}`);
         }
+        rootTag = value2;
         return read(depth + 1);
       default:
         throw new Error(`unsupported CBOR major type: ${majorType}`);
     }
   }
   const value = read(0);
+  if (requiredTag !== void 0 && rootTag !== requiredTag) {
+    throw new Error(`required CBOR tag: ${requiredTag}`);
+  }
   if (offset !== bytes.length) {
     throw new Error("trailing bytes after CBOR value");
   }
@@ -437,16 +451,16 @@ rfMCMQCi85sWBbJwKKXdS6BptQFuZbT73o/gBh1qUxl/nNr12UO8Yfwr6wPLb+6N
 IwLz3/Y=
 -----END CERTIFICATE-----`;
 function parse(document) {
-  const coseSign1 = decode(document, { allowedTags: [COSE_SIGN1_TAG] });
+  const coseSign1 = decode(document, { requiredTag: COSE_SIGN1_TAG });
   if (!Array.isArray(coseSign1) || coseSign1.length !== 4) {
     throw new Error("Invalid COSE Sign1 structure");
   }
-  const [protectedHeader, , payload, signature] = coseSign1;
-  if (!(protectedHeader instanceof Uint8Array) || !(payload instanceof Uint8Array) || !(signature instanceof Uint8Array)) {
+  const [protectedHeader, unprotectedHeader, payload, signature] = coseSign1;
+  if (!(protectedHeader instanceof Uint8Array) || !unprotectedHeader || Object.getPrototypeOf(unprotectedHeader) !== Object.prototype || Object.keys(unprotectedHeader).length !== 0 || !(payload instanceof Uint8Array) || !(signature instanceof Uint8Array)) {
     throw new Error("Invalid COSE Sign1 structure");
   }
   const decodedPayload = decode(payload);
-  if (!decodedPayload || typeof decodedPayload !== "object" || Array.isArray(decodedPayload)) {
+  if (!decodedPayload || Object.getPrototypeOf(decodedPayload) !== Object.prototype) {
     throw new Error("Invalid Nitro attestation payload");
   }
   const pcrs = {};
