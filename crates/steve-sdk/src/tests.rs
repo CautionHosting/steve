@@ -12,7 +12,11 @@ use std::{
 use x_wing::{Decapsulate, Encapsulate, Kem, KeyExport, XWingKem};
 
 use axum::{
-    Router, body::Bytes, extract::State, http::StatusCode as AxumStatus, response::IntoResponse,
+    Router,
+    body::{Body, Bytes},
+    extract::State,
+    http::{StatusCode as AxumStatus, Uri, header::CONTENT_LENGTH},
+    response::{IntoResponse, Response as AxumResponse},
     routing::any,
 };
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -201,6 +205,25 @@ async fn spawn_router(router: Router) -> String {
     format!("http://{address}")
 }
 
+async fn spawn_raw_response(response: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut written = 0;
+        while written < response.len() {
+            socket.writable().await.unwrap();
+            match socket.try_write(&response[written..]) {
+                Ok(0) => break,
+                Ok(count) => written += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("raw response write failed: {error}"),
+            }
+        }
+    });
+    format!("http://{address}")
+}
+
 async fn test_environment(
     provider: Arc<ControlledProvider>,
     request_timeout: Duration,
@@ -222,6 +245,19 @@ async fn test_environment_with_suites(
     server_key_exchange: KeyExchangeSuite,
     expected_key_exchange: KeyExchangeSuite,
 ) -> (Client, UpstreamState) {
+    let (steve_url, upstream_state) = test_server(provider, server_key_exchange).await;
+    let mut builder = Client::builder(&steve_url, expected_pcrs())
+        .unwrap()
+        .expected_key_exchange(expected_key_exchange)
+        .request_timeout(request_timeout);
+    builder.attestation_verifier = Arc::new(EvalAttestationVerifier);
+    (builder.build().unwrap(), upstream_state)
+}
+
+async fn test_server(
+    provider: Arc<ControlledProvider>,
+    key_exchange: KeyExchangeSuite,
+) -> (String, UpstreamState) {
     let upstream_state = UpstreamState::default();
     let upstream = Router::new()
         .route("/hello", any(hello))
@@ -233,7 +269,7 @@ async fn test_environment_with_suites(
             listen_addr: "127.0.0.1:0".into(),
             upstream_url: Url::parse(&upstream_url).unwrap(),
             cors_origins: None,
-            key_exchange: match server_key_exchange {
+            key_exchange: match key_exchange {
                 KeyExchangeSuite::X25519 => steve::protocol::KeyExchangeSuite::X25519,
                 KeyExchangeSuite::XWingDraft10 => steve::protocol::KeyExchangeSuite::XWingDraft10,
             },
@@ -242,12 +278,51 @@ async fn test_environment_with_suites(
     )
     .unwrap();
     let steve_url = spawn_router(steve).await;
-    let mut builder = Client::builder(&steve_url, expected_pcrs())
+    (steve_url, upstream_state)
+}
+
+#[derive(Clone)]
+struct OversizedOnceProxy {
+    target: String,
+    http: HttpClient,
+    protected_requests: Arc<AtomicUsize>,
+}
+
+async fn proxy_with_oversized_first_request(
+    State(state): State<OversizedOnceProxy>,
+    uri: Uri,
+    body: Bytes,
+) -> AxumResponse {
+    if uri.path() == REQUEST_ENDPOINT
+        && state
+            .protected_requests
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            == 0
+    {
+        return AxumResponse::builder()
+            .status(AxumStatus::OK)
+            .header("content-type", "application/cbor")
+            .header(CONTENT_LENGTH, MAX_APPLICATION_RESPONSE_BYTES + 1)
+            .body(Body::from(vec![0; MAX_APPLICATION_RESPONSE_BYTES + 1]))
+            .unwrap();
+    }
+
+    let target = format!("{}{}", state.target, uri.path());
+    let response = state
+        .http
+        .post(target)
+        .header("content-type", "application/cbor")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.bytes().await.unwrap();
+    AxumResponse::builder()
+        .status(status)
+        .header("content-type", "application/cbor")
+        .body(Body::from(body))
         .unwrap()
-        .expected_key_exchange(expected_key_exchange)
-        .request_timeout(request_timeout);
-    builder.attestation_verifier = Arc::new(EvalAttestationVerifier);
-    (builder.build().unwrap(), upstream_state)
 }
 
 fn binding(session_id: &[u8; 16], hash: &[u8; 32], binder: &[u8; 32]) -> AttestedBinding {
@@ -273,6 +348,59 @@ fn dummy_session(generation: u64, id: [u8; 16]) -> Arc<SessionState> {
         activated_at: Instant::now(),
         sequences: SequenceTracker::default(),
     })
+}
+
+#[tokio::test]
+async fn response_body_reader_accepts_the_exact_limit() {
+    let body = vec![0x5a; MAX_SESSION_RESPONSE_BYTES];
+    let mut raw = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    raw.extend_from_slice(&body);
+    let url = spawn_raw_response(raw).await;
+    let mut response = HttpClient::new().get(url).send().await.unwrap();
+
+    assert_eq!(
+        read_response_body(&mut response, MAX_SESSION_RESPONSE_BYTES)
+            .await
+            .unwrap(),
+        body
+    );
+}
+
+#[tokio::test]
+async fn response_body_reader_rejects_oversized_content_length() {
+    let raw = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        MAX_CONFIRMATION_RESPONSE_BYTES + 1
+    )
+    .into_bytes();
+    let url = spawn_raw_response(raw).await;
+    let mut response = HttpClient::new().get(url).send().await.unwrap();
+
+    assert!(matches!(
+        read_response_body(&mut response, MAX_CONFIRMATION_RESPONSE_BYTES).await,
+        Err(Error::Protocol("protocol response too large"))
+    ));
+}
+
+#[tokio::test]
+async fn response_body_reader_rejects_chunked_overflow() {
+    let first = vec![0x41; MAX_CONFIRMATION_RESPONSE_BYTES];
+    let mut raw =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+    raw.extend_from_slice(format!("{:x}\r\n", first.len()).as_bytes());
+    raw.extend_from_slice(&first);
+    raw.extend_from_slice(b"\r\n1\r\nB\r\n0\r\n\r\n");
+    let url = spawn_raw_response(raw).await;
+    let mut response = HttpClient::new().get(url).send().await.unwrap();
+
+    assert!(matches!(
+        read_response_body(&mut response, MAX_CONFIRMATION_RESPONSE_BYTES).await,
+        Err(Error::Protocol("protocol response too large"))
+    ));
 }
 
 #[test]
@@ -736,6 +864,46 @@ async fn timed_out_request_is_not_replayed_and_session_survives() {
         session_id
     );
     assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn oversized_protected_response_is_not_retried_and_recovers_with_a_new_session() {
+    let provider = Arc::new(ControlledProvider::default());
+    let (steve_url, upstream) = test_server(provider.clone(), KeyExchangeSuite::X25519).await;
+    let protected_requests = Arc::new(AtomicUsize::new(0));
+    let proxy = Router::new()
+        .fallback(any(proxy_with_oversized_first_request))
+        .with_state(OversizedOnceProxy {
+            target: steve_url,
+            http: HttpClient::new(),
+            protected_requests: Arc::clone(&protected_requests),
+        });
+    let proxy_url = spawn_router(proxy).await;
+    let mut builder = Client::builder(&proxy_url, expected_pcrs())
+        .unwrap()
+        .request_timeout(Duration::from_secs(2));
+    builder.attestation_verifier = Arc::new(EvalAttestationVerifier);
+    let client = builder.build().unwrap();
+    let original = client.initialize().await.unwrap();
+
+    let result = client.get("/hello").send().await;
+    assert!(
+        matches!(result, Err(Error::Protocol("protocol response too large"))),
+        "{result:?}"
+    );
+    assert_eq!(protected_requests.load(AtomicOrdering::Relaxed), 1);
+    assert!(client.inner.state.lock().await.is_none());
+    assert_eq!(upstream.executions.load(AtomicOrdering::Relaxed), 0);
+
+    let response = client.get("/hello").send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(protected_requests.load(AtomicOrdering::Relaxed), 2);
+    assert_eq!(upstream.executions.load(AtomicOrdering::Relaxed), 1);
+    assert_ne!(
+        client.verify_attestation().await.unwrap().session_id,
+        original.session_id
+    );
+    assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 2);
 }
 
 #[tokio::test]

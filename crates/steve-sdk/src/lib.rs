@@ -43,6 +43,9 @@ pub use bootproof_sdk::format::nitro::NitroPcrs as ExpectedPcrs;
 const SESSION_ENDPOINT: &str = "/e2p/v2/session";
 const CONFIRM_ENDPOINT: &str = "/e2p/v2/confirm";
 const REQUEST_ENDPOINT: &str = "/e2p/v2/request";
+const MAX_SESSION_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_CONFIRMATION_RESPONSE_BYTES: usize = 4 * 1024;
+const MAX_APPLICATION_RESPONSE_BYTES: usize = 32 * 1024 * 1024 + 64 * 1024;
 const DEFAULT_SESSION_ROTATION_INTERVAL: Duration = Duration::from_secs(25 * 60);
 const DEFAULT_SESSION_ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -581,7 +584,9 @@ impl Client {
             context_hash: self.inner.context_hash.to_vec(),
         })?;
 
-        let (status, body) = self.send_protocol(SESSION_ENDPOINT, request).await?;
+        let (status, body) = self
+            .send_protocol(SESSION_ENDPOINT, request, MAX_SESSION_RESPONSE_BYTES)
+            .await?;
         ensure_success("session creation", status, &body)?;
         let response: SessionResponse = decode_cbor(&body)?;
         if response.version != VERSION {
@@ -628,7 +633,13 @@ impl Client {
             sequence: 0u64.to_be_bytes().to_vec(),
             ciphertext: confirmation_ciphertext,
         })?;
-        let (status, body) = self.send_protocol(CONFIRM_ENDPOINT, confirmation).await?;
+        let (status, body) = self
+            .send_protocol(
+                CONFIRM_ENDPOINT,
+                confirmation,
+                MAX_CONFIRMATION_RESPONSE_BYTES,
+            )
+            .await?;
         ensure_success("session confirmation", status, &body)?;
         let envelope: Envelope = decode_cbor(&body)?;
         let (confirmed_session_id, sequence) = envelope.validate()?;
@@ -688,9 +699,10 @@ impl Client {
         &self,
         endpoint: &'static str,
         body: Vec<u8>,
+        max_response_bytes: usize,
     ) -> Result<(StatusCode, Vec<u8>)> {
         let url = self.resolve_url(endpoint)?;
-        let response = self
+        let mut response = self
             .inner
             .http
             .post(url)
@@ -701,7 +713,7 @@ impl Client {
             .await?;
         ensure_same_origin(&self.inner.base_url, response.url())?;
         let status = response.status();
-        let body = response.bytes().await?.to_vec();
+        let body = read_response_body(&mut response, max_response_bytes).await?;
         Ok((status, body))
     }
 
@@ -727,6 +739,28 @@ impl Client {
             state.sequences.close();
         }
     }
+}
+
+async fn read_response_body(response: &mut reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(Error::Protocol("protocol response too large"));
+    }
+
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default();
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(Error::Protocol("protocol response too large"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 pub struct RequestBuilder {
@@ -824,7 +858,9 @@ async fn send_application_request(
         sequence: sequence.to_be_bytes().to_vec(),
         ciphertext,
     })?;
-    let (status, body) = client.send_protocol(REQUEST_ENDPOINT, envelope).await?;
+    let (status, body) = client
+        .send_protocol(REQUEST_ENDPOINT, envelope, MAX_APPLICATION_RESPONSE_BYTES)
+        .await?;
     ensure_success("protected request", status, &body)?;
     let envelope: Envelope = decode_cbor(&body)?;
     let (response_session_id, response_sequence) = envelope.validate()?;
