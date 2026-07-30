@@ -197,66 +197,33 @@ executed.
 
 ## Validation
 
-```bash
-make test            # Fast Rust and JavaScript unit tests
-make verify-dev      # Cached StageX, packaging, and dual-suite browser gate
-make verify          # Release gate; alias for make verify-release
-```
-
-Focused targets are `test-wasm`, `test-production-fast`, `test-production`,
-`test-e2e`, and the opt-in `test-e2e-nitro`. The fast production check compares
-one cache-enabled StageX build with committed `dist/`. The release check uses
-two temporary no-cache builds: it compares committed `dist/` with the first
-build, then compares the two builds. That proves same-builder temporal
-determinism, not independent-party reproducibility. Neither check replaces
-`dist/`; run `make -C steve-js-sdk build` only when intentionally refreshing
-the committed production assets, not before a production check.
-
-## Local E2E
-
-The Docker harness runs the real browser SDK, STEVE protocol implementation,
-and a test upstream using pinned StageX `linux/amd64` images. The Rust SDK tests
-exercise the same server router. Both use signed synthetic Nitro-shaped
-evidence rooted in public test keys; they validate protocol and attestation
-bindings, not Nitro hardware authenticity or isolation.
-
-Install the local JavaScript dependencies once:
+Install the JavaScript dependencies once:
 
 ```bash
 npm --prefix steve-js-sdk ci --ignore-scripts
 ```
 
-Here `npm ci` means a clean, lockfile-exact dependency install; it does not
-configure a CI service. The SDK's project-scoped npm policy permits only Git
-dependencies declared directly in its `package.json`. Docker builds all E2E
-JavaScript and WASM artifacts through the pinned StageX toolchain; no host Rust
-target or `wasm-bindgen` installation is used.
-
-Run both X25519 and X-Wing suites with Chromium:
+### Local
 
 ```bash
-./scripts/test-e2e.sh
+make test        # Rust and JavaScript unit tests
+make test-e2e    # Browser/WASM + Rust; X25519 and X-Wing
+make verify-dev  # Cached StageX build, packaging, and local E2E
+make verify      # Release gate: two no-cache builds and local E2E
 ```
 
-On macOS the test uses installed Google Chrome. Elsewhere, install Playwright
-Chromium once with `npm --prefix steve-js-sdk exec playwright install chromium`.
-To run both suites with Playwright Firefox:
+Local E2E uses signed synthetic evidence. It tests both SDKs and protocols, not
+Nitro hardware or production PCRs. Run one suite or another browser with:
 
 ```bash
-npm --prefix steve-js-sdk exec playwright install firefox
-STEVE_E2E_BROWSER=firefox ./scripts/test-e2e.sh
+STEVE_KEY_EXCHANGE=XWING-DRAFT10 make test-e2e
+STEVE_E2E_BROWSER=firefox make test-e2e
 ```
 
-Select `webkit` the same way. To run only one suite, set the server's fixed
-suite and the browser's configured expectation with one variable:
+Install the selected Playwright browser first when it is not already available.
+On macOS, Chromium tests use installed Google Chrome by default.
 
-```bash
-STEVE_KEY_EXCHANGE=XWING-DRAFT10 \
-STEVE_E2E_BROWSER=chromium \
-./scripts/test-e2e.sh
-```
-
-For the manual demo:
+Manual demo:
 
 ```bash
 ./scripts/test-e2e.sh up
@@ -265,36 +232,46 @@ For the manual demo:
 ./scripts/test-e2e.sh down
 ```
 
-The demo uses the same StageX asset build, but does not require Playwright or
-its browser downloads.
+### Production Nitro
 
-### Real Nitro E2E
-
-The opt-in remote gate serves the committed production SDK on
-`http://127.0.0.1:3000`, verifies real AWS Nitro evidence, completes an
-encrypted `GET /index.html`, and checks that the other key-exchange suite fails
-closed. The enclave must allow that exact origin in `STEVE_CORS_ORIGINS`.
+Run this flow once per deployment. Set the suite to `X25519` or
+`XWING-DRAFT10`:
 
 ```bash
-STEVE_REMOTE_ORIGIN=http://203.0.113.10 \
-STEVE_KEY_EXCHANGE=XWING-DRAFT10 \
-make test-e2e-nitro
+export STEVE_REMOTE_ORIGIN=https://secure.example
+export STEVE_KEY_EXCHANGE=XWING-DRAFT10
 ```
 
-Debug enclaves produce zero PCRs. For a non-debug release gate, also set
-`STEVE_REMOTE_REQUIRE_NONZERO_PCRS=1`. This rejects debug evidence but is not
-an approved-PCR policy; the SDK still reports `expectedPcrPolicy: not-checked`.
-Use `STEVE_REMOTE_EXPECTED_BODY` only when the deployed test app does not return
-the default `xwing demo app\n` body.
-
-The demo accepts an application request body and shows the exact encrypted
-request/response envelopes alongside the plaintext visible to the browser
-before encryption and after decryption. Wire capture is enabled only by the
-demo; the SDK defaults it off.
-
-Production exclusion checks are a separate packaging gate:
+First reproduce the deployment and verify its PCR0/PCR1:
 
 ```bash
-./scripts/test-production-exclusions.sh fast     # One cache-enabled build
-./scripts/test-production-exclusions.sh release  # Two no-cache builds
+caution verify --attestation-url "$STEVE_REMOTE_ORIGIN/attestation"
 ```
+
+Then test the production browser/WASM SDK:
+
+```bash
+STEVE_REMOTE_REQUIRE_NONZERO_PCRS=1 make test-e2e-nitro
+```
+
+This verifies real Nitro evidence, requires nonzero PCR0/1/2, completes an
+encrypted `GET /index.html`, and rejects the wrong suite. The browser reports
+PCRs but does not enforce exact expected values.
+
+Finally test the Rust SDK with trusted 96-character hex PCR values from the
+verified build:
+
+```bash
+STEVE_EXPECTED_PCR0="$PCR0_HEX" \
+STEVE_EXPECTED_PCR1="$PCR1_HEX" \
+STEVE_EXPECTED_PCR2="$PCR2_HEX" \
+make test-e2e-nitro-rust
+```
+
+This enforces exact PCR0/1/2, completes encrypted requests before and after
+rotation, and rejects the wrong suite. Do not source expected PCRs from the
+unverified remote response alone.
+
+Remote Nitro tests are opt-in and are not part of `make verify`. The enclave
+must allow `http://127.0.0.1:3000` in `STEVE_CORS_ORIGINS`. Debug mode zeros
+PCRs, so it cannot pass the positive Rust gate.
