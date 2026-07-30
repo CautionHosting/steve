@@ -4,6 +4,8 @@
 
 End-to-end encryption for browser and native applications communicating with AWS Nitro Enclaves. With a v2 client active, application traffic is encrypted at the client and decrypted only inside the enclave.
 
+See the [normative STEVE v2 protocol specification](docs/steve-v2-protocol.md).
+
 > [!IMPORTANT]
 > v2 supports process-pinned X25519 or X-Wing draft-10 sessions and binds the
 > selected suite into the transcript and Nitro evidence. X-Wing protects
