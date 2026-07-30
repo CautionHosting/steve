@@ -41,6 +41,25 @@ async function registerClient(page, expectedKeyExchange) {
   }, { enclaveOrigin: remoteOrigin, suite: expectedKeyExchange });
 }
 
+async function initializeClient(page) {
+  await registerClient(page, keyExchange);
+  return page.evaluate(async () => {
+    await window.steveNitroClient.initialize();
+    return window.steveNitroClient.getStatus();
+  });
+}
+
+async function protectedGet(page) {
+  return page.evaluate(async enclaveOrigin => {
+    const result = await fetch(`${enclaveOrigin}/index.html`, { cache: 'no-store' });
+    return { status: result.status, body: await result.text() };
+  }, remoteOrigin);
+}
+
+function expectApplicationResponse(response) {
+  expect(response).toEqual({ status: 200, body: expectedBody });
+}
+
 test('verifies real Nitro evidence and completes an encrypted application request', async ({
   page
 }) => {
@@ -79,11 +98,7 @@ test('verifies real Nitro evidence and completes an encrypted application reques
     }
   }
 
-  const response = await page.evaluate(async enclaveOrigin => {
-    const result = await fetch(`${enclaveOrigin}/index.html`, { cache: 'no-store' });
-    return { status: result.status, body: await result.text() };
-  }, remoteOrigin);
-  expect(response).toEqual({ status: 200, body: expectedBody });
+  expectApplicationResponse(await protectedGet(page));
 });
 
 test('fails closed when the configured suite does not match the enclave', async ({
@@ -104,4 +119,106 @@ test('fails closed when the configured suite does not match the enclave', async 
   });
 
   expect(error).toMatch(/session creation rejected \(400\)/u);
+});
+
+test('establishes the session lazily on the first protected request', async ({ page }) => {
+  const idle = await registerClient(page, keyExchange);
+  expect(idle.state).toBe('idle');
+  expect(idle.initialized).toBe(false);
+
+  expectApplicationResponse(await protectedGet(page));
+
+  const status = await page.evaluate(() => window.steveNitroClient.getStatus());
+  expect(status.state).toBe('ready');
+  expect(status.session.trigger).toBe('protected-request');
+  expect(status.attestation.synthetic).toBe(false);
+});
+
+test('rotates to a fresh attested session and continues encrypted requests', async ({
+  page
+}) => {
+  const before = await initializeClient(page);
+  expectApplicationResponse(await protectedGet(page));
+
+  const after = await page.evaluate(async () => {
+    await window.steveNitroClient.rotateKey();
+    return window.steveNitroClient.getStatus();
+  });
+
+  expect(after.state).toBe('ready');
+  expect(after.session.trigger).toBe('rotation');
+  expect(after.session.id).not.toBe(before.session.id);
+  expect(after.attestation.synthetic).toBe(false);
+  expectApplicationResponse(await protectedGet(page));
+});
+
+test('preserves the live session across a page reload', async ({ page }) => {
+  const before = await initializeClient(page);
+  expectApplicationResponse(await protectedGet(page));
+
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  const after = await registerClient(page, keyExchange);
+
+  expect(after.state).toBe('ready');
+  expect(after.session.id).toBe(before.session.id);
+  expectApplicationResponse(await protectedGet(page));
+});
+
+test('restores configuration and re-attests after a service-worker restart', async ({
+  page,
+  browserName
+}) => {
+  test.skip(browserName !== 'chromium', 'service-worker process control requires Chromium CDP');
+  const before = await initializeClient(page);
+  expectApplicationResponse(await protectedGet(page));
+
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('ServiceWorker.enable');
+  await cdp.send('ServiceWorker.stopAllWorkers');
+
+  const after = await page.evaluate(async () => {
+    await window.steveNitroClient.initialize();
+    return window.steveNitroClient.getStatus();
+  });
+
+  expect(after.state).toBe('ready');
+  expect(after.session.id).not.toBe(before.session.id);
+  expect(after.attestation.synthetic).toBe(false);
+  expectApplicationResponse(await protectedGet(page));
+});
+
+test('handles concurrent encrypted requests and remains usable', async ({ page }) => {
+  const before = await initializeClient(page);
+
+  const result = await page.evaluate(async ({ enclaveOrigin, count }) => {
+    const errors = [];
+    window.steveNitroClient.on('error', error => errors.push(error));
+    const responses = await Promise.all(
+      Array.from({ length: count }, async (_, index) => {
+        const response = await fetch(
+          `${enclaveOrigin}/index.html?request=${index}`,
+          { cache: 'no-store' }
+        );
+        return { index, status: response.status, body: await response.text() };
+      })
+    );
+    return {
+      errors,
+      responses,
+      status: await window.steveNitroClient.getStatus()
+    };
+  }, { enclaveOrigin: remoteOrigin, count: 16 });
+
+  const failures = result.responses.filter(
+    response => response.status !== 200 || response.body !== expectedBody
+  );
+  expect(
+    failures,
+    `secure-channel failures: ${JSON.stringify(result.errors)}`
+  ).toEqual([]);
+  expect(result.responses).toHaveLength(16);
+
+  expect(result.status.state).toBe('ready');
+  expect(result.status.session.id).toBe(before.session.id);
+  expectApplicationResponse(await protectedGet(page));
 });

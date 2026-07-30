@@ -197,23 +197,32 @@ executed.
 
 ## Validation
 
-Install the JavaScript dependencies once:
+Run these commands from the repository root.
+
+### Local and CI fixture
+
+The fixture uses signed synthetic evidence. It exercises the browser/WASM and
+Rust SDKs against both `X25519` and `XWING-DRAFT10`, but does not prove Nitro
+hardware or production PCRs.
 
 ```bash
 npm --prefix steve-js-sdk ci --ignore-scripts
-```
 
-### Local
-
-```bash
 make test        # Rust and JavaScript unit tests
 make test-e2e    # Browser/WASM + Rust; X25519 and X-Wing
 make verify-dev  # Cached StageX build, packaging, and local E2E
 make verify      # Release gate: two no-cache builds and local E2E
 ```
 
-Local E2E uses signed synthetic evidence. It tests both SDKs and protocols, not
-Nitro hardware or production PCRs. Run one suite or another browser with:
+On a Linux amd64 CI runner with Docker and Docker Compose:
+
+```bash
+npm --prefix steve-js-sdk ci --ignore-scripts
+npm --prefix steve-js-sdk exec -- playwright install --with-deps chromium
+make test-e2e
+```
+
+For focused development, select one suite or another browser:
 
 ```bash
 STEVE_KEY_EXCHANGE=XWING-DRAFT10 make test-e2e
@@ -234,8 +243,9 @@ Manual demo:
 
 ### Production Nitro
 
-Run this flow once per deployment. Set the suite to `X25519` or
-`XWING-DRAFT10`:
+Run this flow once per deployment. The enclave must be deployed without debug
+mode and allow `http://127.0.0.1:3000` in `STEVE_CORS_ORIGINS`. Set the suite to
+`X25519` or `XWING-DRAFT10`:
 
 ```bash
 export STEVE_REMOTE_ORIGIN=https://secure.example
@@ -254,9 +264,10 @@ Then test the production browser/WASM SDK:
 STEVE_REMOTE_REQUIRE_NONZERO_PCRS=1 make test-e2e-nitro
 ```
 
-This verifies real Nitro evidence, requires nonzero PCR0/1/2, completes an
-encrypted `GET /index.html`, and rejects the wrong suite. The browser reports
-PCRs but does not enforce exact expected values.
+This runs seven tests: real Nitro evidence with nonzero PCR0/1/2, encrypted
+`GET /index.html`, wrong-suite rejection, lazy establishment, rotation, page
+reload, service-worker restart, and concurrent encrypted requests. The browser
+reports PCRs but does not enforce exact expected values.
 
 Finally test the Rust SDK with trusted 96-character hex PCR values from the
 verified build:
@@ -273,5 +284,6 @@ rotation, and rejects the wrong suite. Do not source expected PCRs from the
 unverified remote response alone.
 
 Remote Nitro tests are opt-in and are not part of `make verify`. The enclave
-must allow `http://127.0.0.1:3000` in `STEVE_CORS_ORIGINS`. Debug mode zeros
-PCRs, so it cannot pass the positive Rust gate.
+must expose `/index.html`; override `STEVE_REMOTE_EXPECTED_BODY` if its body is
+not `xwing demo app\n`. Use these commands in a manually triggered release job,
+not an untrusted pull-request job.
