@@ -176,13 +176,13 @@ make verify          # Release gate; alias for make verify-release
 ```
 
 Focused targets are `test-wasm`, `test-production-fast`, `test-production`,
-and `test-e2e`. The fast production check compares one cache-enabled StageX
-build with committed `dist/`. The release check uses two temporary no-cache
-builds: it compares committed `dist/` with the first build, then compares the
-two builds. That proves same-builder temporal determinism, not
-independent-party reproducibility. Neither check replaces `dist/`; run
-`make -C steve-js-sdk build` only when intentionally refreshing the committed
-production assets, not before a production check.
+`test-e2e`, and the opt-in `test-e2e-nitro`. The fast production check compares
+one cache-enabled StageX build with committed `dist/`. The release check uses
+two temporary no-cache builds: it compares committed `dist/` with the first
+build, then compares the two builds. That proves same-builder temporal
+determinism, not independent-party reproducibility. Neither check replaces
+`dist/`; run `make -C steve-js-sdk build` only when intentionally refreshing
+the committed production assets, not before a production check.
 
 ## Local E2E
 
@@ -238,6 +238,25 @@ For the manual demo:
 
 The demo uses the same StageX asset build, but does not require Playwright or
 its browser downloads.
+
+### Real Nitro E2E
+
+The opt-in remote gate serves the committed production SDK on
+`http://127.0.0.1:3000`, verifies real AWS Nitro evidence, completes an
+encrypted `GET /index.html`, and checks that the other key-exchange suite fails
+closed. The enclave must allow that exact origin in `STEVE_CORS_ORIGINS`.
+
+```bash
+STEVE_REMOTE_ORIGIN=http://203.0.113.10 \
+STEVE_KEY_EXCHANGE=XWING-DRAFT10 \
+make test-e2e-nitro
+```
+
+Debug enclaves produce zero PCRs. For a non-debug release gate, also set
+`STEVE_REMOTE_REQUIRE_NONZERO_PCRS=1`. This rejects debug evidence but is not
+an approved-PCR policy; the SDK still reports `expectedPcrPolicy: not-checked`.
+Use `STEVE_REMOTE_EXPECTED_BODY` only when the deployed test app does not return
+the default `xwing demo app\n` body.
 
 The demo accepts an application request body and shows the exact encrypted
 request/response envelopes alongside the plaintext visible to the browser

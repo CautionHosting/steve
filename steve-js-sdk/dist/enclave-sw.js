@@ -123,7 +123,11 @@ function encode(value) {
   }
   return output;
 }
-function decode(input, { allowedTags = [], requiredTag } = {}) {
+function decode(input, {
+  allowedTags = [],
+  requiredTag,
+  allowIndefinite = false
+} = {}) {
   const bytes = input instanceof Uint8Array ? input : ArrayBuffer.isView(input) ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength) : input instanceof ArrayBuffer ? new Uint8Array(input) : null;
   if (!bytes) throw new TypeError("CBOR input must be bytes");
   if (bytes.length > MAX_CBOR_BYTES) {
@@ -179,6 +183,96 @@ function decode(input, { allowedTags = [], requiredTag } = {}) {
     }
     return Number(value2);
   }
+  function claimMapProperty(keys, key) {
+    if (typeof key !== "string" && typeof key !== "number") {
+      throw new Error("CBOR map keys must be strings or integers");
+    }
+    const property = String(key);
+    if (keys.has(property)) {
+      throw new Error("duplicate CBOR map key");
+    }
+    keys.add(property);
+    return property;
+  }
+  function defineMapEntry(result, property, value2) {
+    Object.defineProperty(result, property, {
+      configurable: true,
+      enumerable: true,
+      value: value2,
+      writable: true
+    });
+  }
+  function readIndefiniteString(majorType, depth) {
+    const chunks = [];
+    let decodedLength = 0;
+    while (true) {
+      requireBytes(1);
+      if (bytes[offset] === 255) {
+        offset += 1;
+        break;
+      }
+      if (chunks.length >= MAX_CBOR_CONTAINER_ITEMS) {
+        throw new Error("CBOR container exceeds item limit");
+      }
+      const chunkInitial = bytes[offset];
+      const chunkMajorType = chunkInitial >> 5;
+      const chunkAdditionalInfo = chunkInitial & 31;
+      if (chunkMajorType !== majorType || chunkAdditionalInfo === 31) {
+        throw new Error("invalid indefinite-length CBOR string chunk");
+      }
+      const chunk = read(depth + 1);
+      decodedLength += majorType === 2 ? chunk.length : textEncoder.encode(chunk).length;
+      if (decodedLength > MAX_CBOR_BYTES) {
+        throw new Error("CBOR string exceeds size limit");
+      }
+      chunks.push(chunk);
+    }
+    if (majorType === 3) return chunks.join("");
+    const result = new Uint8Array(decodedLength);
+    let resultOffset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, resultOffset);
+      resultOffset += chunk.length;
+    }
+    return result;
+  }
+  function readIndefiniteArray(depth) {
+    const result = [];
+    while (true) {
+      requireBytes(1);
+      if (bytes[offset] === 255) {
+        offset += 1;
+        return result;
+      }
+      if (result.length >= MAX_CBOR_CONTAINER_ITEMS) {
+        throw new Error("CBOR container exceeds item limit");
+      }
+      result.push(read(depth + 1));
+    }
+  }
+  function readIndefiniteMap(depth) {
+    const result = {};
+    const keys = /* @__PURE__ */ new Set();
+    let itemCount = 0;
+    while (true) {
+      requireBytes(1);
+      if (bytes[offset] === 255) {
+        offset += 1;
+        return result;
+      }
+      if (itemCount >= MAX_CBOR_CONTAINER_ITEMS) {
+        throw new Error("CBOR container exceeds item limit");
+      }
+      const key = read(depth + 1);
+      requireBytes(1);
+      if (bytes[offset] === 255) {
+        throw new Error("indefinite-length CBOR map has a dangling key");
+      }
+      const property = claimMapProperty(keys, key);
+      defineMapEntry(result, property, read(depth + 1));
+      itemCount += 1;
+    }
+  }
   function read(depth) {
     if (depth > MAX_CBOR_DEPTH) {
       throw new Error("CBOR nesting exceeds depth limit");
@@ -206,6 +300,22 @@ function decode(input, { allowedTags = [], requiredTag } = {}) {
           throw new Error("unexpected CBOR break marker");
         default:
           throw new Error(`unsupported CBOR simple value: ${additionalInfo}`);
+      }
+    }
+    if (additionalInfo === 31) {
+      if (!allowIndefinite) {
+        throw new Error("indefinite-length CBOR is not supported");
+      }
+      switch (majorType) {
+        case 2:
+        case 3:
+          return readIndefiniteString(majorType, depth);
+        case 4:
+          return readIndefiniteArray(depth);
+        case 5:
+          return readIndefiniteMap(depth);
+        default:
+          throw new Error(`invalid indefinite-length CBOR major type: ${majorType}`);
       }
     }
     const value2 = readArgument(additionalInfo);
@@ -253,20 +363,8 @@ function decode(input, { allowedTags = [], requiredTag } = {}) {
         const keys = /* @__PURE__ */ new Set();
         for (let index = 0; index < value2; index += 1) {
           const key = read(depth + 1);
-          if (typeof key !== "string" && typeof key !== "number") {
-            throw new Error("CBOR map keys must be strings or integers");
-          }
-          const property = String(key);
-          if (keys.has(property)) {
-            throw new Error("duplicate CBOR map key");
-          }
-          keys.add(property);
-          Object.defineProperty(result, property, {
-            configurable: true,
-            enumerable: true,
-            value: read(depth + 1),
-            writable: true
-          });
+          const property = claimMapProperty(keys, key);
+          defineMapEntry(result, property, read(depth + 1));
         }
         return result;
       }
@@ -451,7 +549,7 @@ rfMCMQCi85sWBbJwKKXdS6BptQFuZbT73o/gBh1qUxl/nNr12UO8Yfwr6wPLb+6N
 IwLz3/Y=
 -----END CERTIFICATE-----`;
 function parse(document) {
-  const coseSign1 = decode(document, { requiredTag: COSE_SIGN1_TAG });
+  const coseSign1 = decode(document, { allowedTags: [COSE_SIGN1_TAG] });
   if (!Array.isArray(coseSign1) || coseSign1.length !== 4) {
     throw new Error("Invalid COSE Sign1 structure");
   }
@@ -459,7 +557,7 @@ function parse(document) {
   if (!(protectedHeader instanceof Uint8Array) || !unprotectedHeader || Object.getPrototypeOf(unprotectedHeader) !== Object.prototype || Object.keys(unprotectedHeader).length !== 0 || !(payload instanceof Uint8Array) || !(signature instanceof Uint8Array)) {
     throw new Error("Invalid COSE Sign1 structure");
   }
-  const decodedPayload = decode(payload);
+  const decodedPayload = decode(payload, { allowIndefinite: true });
   if (!decodedPayload || Object.getPrototypeOf(decodedPayload) !== Object.prototype) {
     throw new Error("Invalid Nitro attestation payload");
   }

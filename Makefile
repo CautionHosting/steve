@@ -1,5 +1,5 @@
 .PHONY: test test-rust test-js test-wasm test-production \
-	test-production-fast test-e2e verify-dev verify-release verify
+	test-production-fast test-e2e test-e2e-nitro verify-dev verify-release verify
 
 test: test-rust test-js
 
@@ -20,6 +20,9 @@ test-production-fast:
 
 test-e2e:
 	./scripts/test-e2e.sh
+
+test-e2e-nitro:
+	./scripts/test-e2e-nitro.sh
 
 verify-dev:
 	$(MAKE) test-rust

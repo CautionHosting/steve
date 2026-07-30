@@ -19,7 +19,8 @@
     "build:e2e": "make build-e2e",
     "test": "node --test test/*.test.js",
     "test:wasm": "make test-wasm",
-    "test:e2e": "playwright test --config test/e2e/playwright.config.js"
+    "test:e2e": "playwright test --config test/e2e/playwright.config.js",
+    "test:e2e:nitro": "playwright test --config test/e2e/playwright.nitro.config.js"
   },
   "keywords": [
     "tee",
@@ -36,7 +37,7 @@
     "url": "https://codeberg.org/caution/transport-security-service-worker.git"
   },
   "dependencies": {
-    "tee-attestation-js": "git+https://git.distrust.co/vincent/tee-attestation-js.git#010e7574a511708ee1e227a95c99d05b29d1e5a3"
+    "tee-attestation-js": "git+https://git.distrust.co/vincent/tee-attestation-js.git#d74c7ab2f7aa5c51a7c483e1e05516b90405efbe"
   },
   "devDependencies": {
     "@noble/post-quantum": "0.6.1",
