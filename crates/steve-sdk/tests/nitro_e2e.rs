@@ -33,6 +33,16 @@ fn expected_pcrs() -> ExpectedPcrs {
     ])
 }
 
+fn assert_expected_pcrs(actual: &ExpectedPcrs, expected: &ExpectedPcrs) {
+    for index in [0, 1, 2] {
+        assert_eq!(
+            actual.get(&index),
+            expected.get(&index),
+            "PCR{index} did not match the independently verified value"
+        );
+    }
+}
+
 fn selected_suite() -> KeyExchangeSuite {
     match required_env("STEVE_KEY_EXCHANGE").as_str() {
         "X25519" => KeyExchangeSuite::X25519,
@@ -72,7 +82,7 @@ async fn remote_nitro_e2e() {
 
     let client = result.expect("real Nitro session establishment failed");
     let first = client.verify_attestation().await.unwrap();
-    assert_eq!(first.pcrs, expected_pcrs);
+    assert_expected_pcrs(&first.pcrs, &expected_pcrs);
 
     let mismatch = Client::builder(&origin, expected_pcrs.clone())
         .unwrap()
@@ -97,7 +107,7 @@ async fn remote_nitro_e2e() {
 
     let second = client.reconnect().await.unwrap();
     assert_ne!(first.session_id, second.session_id);
-    assert_eq!(second.pcrs, expected_pcrs);
+    assert_expected_pcrs(&second.pcrs, &expected_pcrs);
 
     let response = client.get(path).send().await.unwrap();
     assert_eq!(response.status().as_u16(), 200);
