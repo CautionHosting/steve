@@ -194,12 +194,12 @@ sequenceDiagram
     C->>C: Generate nonce and ephemeral KEM material
     C->>H: POST /session (suite, nonce, client material, context hash)
     H->>S: Forward SessionRequest
-    S->>S: KEM; random session ID; transcript; HKDF
+    S->>S: KEM, random session ID, transcript, HKDF
     S->>N: Attest(nonce = client_nonce, user_data = binding)
     N-->>S: Signed attestation document
     S-->>H: SessionResponse (server material, session ID, evidence)
     H-->>C: Forward SessionResponse
-    C->>C: KEM; transcript; HKDF; verify evidence and binding
+    C->>C: KEM, transcript, HKDF, verify evidence and binding
     C->>H: POST /confirm (C2S confirmation, sequence 0)
     H->>S: Forward Envelope
     S-->>H: S2C confirmation (sequence 0)
