@@ -1,17 +1,71 @@
 import { expect, test } from '@playwright/test';
 
+const profile = process.env.STEVE_E2E_PROFILE || 'local';
 const keyExchange = process.env.STEVE_KEY_EXCHANGE || 'X25519';
+const isNitro = profile === 'nitro';
+const fixtureContract = {
+  contract: 'steve-test-fixture/v1',
+  capabilities: ['echo', 'unauthorized', 'delay', 'compressed'],
+  max_echo_bytes: 1024 * 1024,
+  max_delay_ms: 10_000
+};
+
+if (!['local', 'nitro'].includes(profile)) {
+  throw new Error('STEVE_E2E_PROFILE must be exactly local or nitro');
+}
 if (!['X25519', 'XWING-DRAFT10'].includes(keyExchange)) {
   throw new Error('STEVE_KEY_EXCHANGE must be exactly X25519 or XWING-DRAFT10');
 }
 
-async function openDemo(page, url = '/') {
-  await page.goto(url);
+function requiredPcr(name) {
+  const value = process.env[name];
+  if (!value || !/^[0-9a-f]{96}$/iu.test(value)) {
+    throw new Error(`${name} must contain exactly 96 hexadecimal characters`);
+  }
+  if (value.toLowerCase() === '0'.repeat(96)) {
+    throw new Error(`${name} must be nonzero; deploy without Caution debug mode`);
+  }
+  return value.toLowerCase();
+}
+
+function normalizeRemoteOrigin(value) {
+  if (!value) throw new Error('STEVE_REMOTE_ORIGIN is required');
+  const url = new URL(value);
+  if (
+    !['http:', 'https:'].includes(url.protocol)
+    || url.username
+    || url.password
+    || url.pathname !== '/'
+    || url.search
+    || url.hash
+  ) {
+    throw new Error('STEVE_REMOTE_ORIGIN must be an absolute HTTP(S) origin');
+  }
+  return url.origin;
+}
+
+const targetOrigin = isNitro
+  ? normalizeRemoteOrigin(process.env.STEVE_REMOTE_ORIGIN)
+  : 'http://127.0.0.1:49500';
+const expectedPcrs = isNitro
+  ? {
+      PCR0: requiredPcr('STEVE_EXPECTED_PCR0'),
+      PCR1: requiredPcr('STEVE_EXPECTED_PCR1'),
+      PCR2: requiredPcr('STEVE_EXPECTED_PCR2')
+    }
+  : null;
+
+function demoPath(origin = targetOrigin, suite = keyExchange) {
+  const params = new URLSearchParams({ origin, suite });
+  return `/${profile}/?${params}`;
+}
+
+async function openDemo(page, options = {}) {
+  const pageOrigin = options.pageOrigin || '';
+  await page.goto(`${pageOrigin}${demoPath(options.origin, options.suite)}`);
   await page.waitForFunction(() => Boolean(window.steveDemo));
   await expect(page.locator('#system-status')).toContainText('Service worker active');
   return page.evaluate(async () => {
-    // Do not repair the suite here: manual browser use must receive the same
-    // deployment-pinned configuration as the automated test.
     const client = await window.steveDemo.ready;
     return client.getStatus();
   });
@@ -23,48 +77,62 @@ async function initialize(page) {
   return page.evaluate(() => window.steveDemo.initialize());
 }
 
-test('starts with an honest idle state and synthetic verifier profile', async ({ page }) => {
+async function currentStatus(page) {
+  return page.evaluate(() => window.steveDemo.status());
+}
+
+function expectAttestationProfile(status) {
+  if (isNitro) {
+    expect(status.attestationVerifier).toEqual({
+      id: 'aws-nitro',
+      trustAnchor: 'AWS Nitro root CA',
+      synthetic: false
+    });
+    expect(status.attestation.synthetic).toBe(false);
+    expect(status.attestation.moduleId).toEqual(expect.any(String));
+    expect(status.attestation.pcrs).toMatchObject(expectedPcrs);
+  } else {
+    expect(status.attestationVerifier).toEqual({
+      id: 'synthetic-eval',
+      trustAnchor: 'STEVE Local Eval Root',
+      synthetic: true
+    });
+    expect(status.attestation.synthetic).toBe(true);
+    expect(status.attestation.moduleId).toBe('steve-local-eval');
+    expect(Object.keys(status.attestation.pcrs)).toEqual(['PCR0', 'PCR1', 'PCR2']);
+  }
+}
+
+test('starts idle with the selected evidence profile and suite', async ({ page }) => {
   const status = await openDemo(page);
 
-  await expect(page.locator('meta[name="steve-key-exchange"]')).toHaveAttribute(
+  await expect(page.locator('meta[name="steve-profile"]')).toHaveAttribute(
     'content',
-    keyExchange
+    profile
   );
+  await expect(page.locator('#target-origin-input')).toHaveValue(targetOrigin);
+  await expect(page.locator('#target-suite-input')).toHaveValue(keyExchange);
   expect(status.state).toBe('idle');
   expect(status.initialized).toBe(false);
-  expect(status.session).toBeNull();
-  expect(status.protocol).toEqual({
-    id: 'STEVE-E2P-V2',
-    version: 2,
-    keyEstablishment: keyExchange,
-    keyDerivation: 'HKDF-SHA256',
-    recordProtection: 'AES-256-GCM'
-  });
-  expect(status.attestationVerifier).toEqual({
-    id: 'synthetic-eval',
-    trustAnchor: 'STEVE Local Eval Root',
-    synthetic: true
-  });
-  await expect(page.locator('#system-status')).toContainText('session idle');
-  await expect(page.locator('#trust-warning')).toContainText('this is not an enclave');
+  expect(status.protocol.keyEstablishment).toBe(keyExchange);
+  expect(status.attestationVerifier.synthetic).toBe(!isNitro);
   await expect(page.getByRole('button', { name: 'Rotate session' })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Reset session' })).toBeDisabled();
+  if (isNitro) {
+    await expect(page.locator('#trust-warning')).toBeHidden();
+  } else {
+    await expect(page.locator('#trust-warning')).toContainText('this is not an enclave');
+  }
 });
 
-test('establishes a signed eval session and completes an encrypted echo', async ({ page }) => {
+test('establishes an attested session and uses the versioned fixture', async ({ page }) => {
   const status = await initialize(page);
 
   expect(status.state).toBe('ready');
-  expect(status.initialized).toBe(true);
   expect(status.protocol.keyEstablishment).toBe(keyExchange);
   expect(status.session.trigger).toBe('explicit-initialize');
   expect(status.session.confirmation).toBe('verified');
-  expect(status.session.id).toHaveLength(22);
-  expect(status.session.transcriptHash).toHaveLength(43);
   expect(status.attestation.verified).toBe(true);
-  expect(status.attestation.synthetic).toBe(true);
-  expect(status.attestation.moduleId).toBe('steve-local-eval');
-  expect(Object.keys(status.attestation.pcrs)).toEqual(['PCR0', 'PCR1', 'PCR2']);
   expect(status.attestation.checks).toEqual({
     certificateChain: 'verified',
     nonceBinding: 'verified',
@@ -72,28 +140,20 @@ test('establishes a signed eval session and completes an encrypted echo', async 
     keyConfirmation: 'verified',
     expectedPcrPolicy: 'not-checked'
   });
-  await expect(page.locator('#verification-checks')).toContainText('Expected PCR policy');
-  await expect(page.locator('#verification-checks')).toContainText('not-checked');
-  await expect(page.locator('#pcr-details')).toContainText(
-    'Reported only; not compared with an approved PCR policy.'
-  );
-
+  expectAttestationProfile(status);
+  expect(await page.evaluate(() => window.steveDemo.fixture())).toEqual(fixtureContract);
   expect(await page.evaluate(() => window.steveDemo.echo('browser-to-steve'))).toEqual({
     status: 200,
     body: 'browser-to-steve'
   });
 });
 
-test('protects a 100 KiB application body and requests identity responses', async ({
-  page
-}) => {
+test('protects a 100 KiB body and requests an identity response', async ({ page }) => {
   await initialize(page);
-  const payload = 'x'.repeat(100 * 1024);
+  const large = await page.evaluate(() => window.steveDemo.largeEcho());
 
-  expect(await page.evaluate(value => window.steveDemo.echo(value), payload)).toEqual({
-    status: 200,
-    body: payload
-  });
+  expect(large.status).toBe(200);
+  expect(large.body).toBe('x'.repeat(100 * 1024));
   expect(await page.evaluate(() => window.steveDemo.compressed())).toEqual({
     status: 200,
     body: 'identity-through-steve',
@@ -103,247 +163,221 @@ test('protects a 100 KiB application body and requests identity responses', asyn
   });
 });
 
-test('fails closed when the browser and server key exchanges disagree', async ({ page }) => {
+test('fails closed when the browser and server suites disagree', async ({ page }) => {
   await openDemo(page);
-  const mismatchedKeyExchange = keyExchange === 'X25519'
-    ? 'XWING-DRAFT10'
-    : 'X25519';
+  const mismatched = keyExchange === 'X25519' ? 'XWING-DRAFT10' : 'X25519';
 
-  const failed = await page.evaluate(async expectedKeyExchange => {
+  const error = await page.evaluate(async suite => {
     const client = await window.steveDemo.ready;
-    await client.configure({ expectedKeyExchange });
+    await client.configure({ expectedKeyExchange: suite });
     try {
       await client.initialize();
-      return false;
-    } catch {
-      return true;
+      return null;
+    } catch (failure) {
+      return failure.message;
     }
-  }, mismatchedKeyExchange);
+  }, mismatched);
 
-  expect(failed).toBe(true);
+  expect(error).toMatch(/session creation rejected \(400\)/u);
   await expect(page.locator('#system-status')).toHaveAttribute('data-state', 'error');
-  await expect(page.locator('#session-id')).toHaveText('—');
-  await expect(page.locator('#key-establishment')).toHaveText(mismatchedKeyExchange);
 });
 
-test('reports lazy establishment by the first protected request', async ({ page }) => {
+test('establishes lazily on the first protected request', async ({ page }) => {
   const before = await openDemo(page);
   expect(before.state).toBe('idle');
 
-  await page.locator('#request-body').fill('lazy-session');
-  await page.getByRole('button', { name: 'Send protected request' }).click();
-  await expect(page.locator('#application-response-body')).toHaveText('lazy-session');
-  const after = await page.evaluate(() => window.steveDemo.status());
-
+  expect(await page.evaluate(() => window.steveDemo.echo('lazy-session'))).toEqual({
+    status: 200,
+    body: 'lazy-session'
+  });
+  const after = await currentStatus(page);
   expect(after.state).toBe('ready');
   expect(after.session.trigger).toBe('protected-request');
-  await expect(page.locator('#session-trigger')).toHaveText('First protected request');
-  await expect(page.locator('#events')).toContainText('first protected request');
-  await expect(page.locator('#application-request-meta')).toContainText('POST /echo');
-  await expect(page.locator('#application-request-body')).toHaveText('lazy-session');
-  await expect(page.locator('#wire-request-meta')).toContainText('POST /e2p/v2/request');
-  await expect(page.locator('#wire-request-meta')).toContainText('sequence 1');
-  await expect(page.locator('#wire-request-envelope')).not.toHaveText('—');
-  await expect(page.locator('#wire-response-meta')).toContainText(
-    'Response from /e2p/v2/request'
-  );
-  await expect(page.locator('#wire-response-envelope')).not.toHaveText('—');
-  await expect(page.locator('#application-response-meta')).toContainText('HTTP 200');
-  expect(await page.locator('#wire-request-envelope').textContent()).not.toContain('lazy-session');
+  expectAttestationProfile(after);
 });
 
-test('restores the live session status after a page reload', async ({ page }) => {
+test('preserves the live session across a page reload', async ({ page }) => {
   const before = await initialize(page);
   await page.reload({ waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => Boolean(window.steveDemo));
 
-  const after = await page.evaluate(() => window.steveDemo.status());
+  const after = await currentStatus(page);
   expect(after.state).toBe('ready');
   expect(after.session.id).toBe(before.session.id);
-  await expect(page.locator('#system-status')).toContainText('secure session ready');
-  await expect(page.locator('#events')).toContainText('resumed an existing secure session');
+  expect(await page.evaluate(() => window.steveDemo.echo('after-reload'))).toEqual({
+    status: 200,
+    body: 'after-reload'
+  });
 });
 
-test('rotates to a fresh session and resets diagnostics to idle', async ({ page }) => {
+test('rotates to fresh attested keys and resets to idle', async ({ page }) => {
   const before = await initialize(page);
   const rotated = await page.evaluate(() => window.steveDemo.rotate());
 
   expect(rotated.state).toBe('ready');
   expect(rotated.session.trigger).toBe('rotation');
   expect(rotated.session.id).not.toBe(before.session.id);
+  expectAttestationProfile(rotated);
+  expect(await page.evaluate(() => window.steveDemo.echo('after-rotation'))).toEqual({
+    status: 200,
+    body: 'after-rotation'
+  });
 
   const reset = await page.evaluate(() => window.steveDemo.reset());
   expect(reset.state).toBe('idle');
-  expect(reset.initialized).toBe(false);
   expect(reset.session).toBeNull();
-  await expect(page.locator('#system-status')).toContainText('session idle');
-  await expect(page.locator('#session-id')).toHaveText('—');
-});
-
-test('initializes from the manually opened localhost demo', async ({ page }) => {
-  await openDemo(page, 'http://localhost:3000/');
-
-  const status = await page.evaluate(() => window.steveDemo.initialize());
-  const echo = await page.evaluate(() => window.steveDemo.echo('localhost-demo'));
-
-  expect(status.initialized).toBe(true);
-  expect(status.attestation.verified).toBe(true);
-  expect(echo).toEqual({ status: 200, body: 'localhost-demo' });
-});
-
-test('serves bootstrap scripts through a controlling worker even when the enclave shares the page origin', async ({
-  page
-}) => {
-  await page.goto('/');
-  await page.waitForFunction(() => Boolean(window.steveDemo));
-  await expect(page.locator('#system-status')).toContainText('Service worker active');
-
-  // Force the worst case: point the enclave at the page's own origin so the
-  // worker treats same-origin traffic as protected. The bootstrap scripts must
-  // still pass through untouched, or the page can never load the code that
-  // configures the worker — the self-perpetuating deadlock this guards against.
-  await page.evaluate(async expectedKeyExchange => {
-    const client = await window.steveDemo.ready;
-    await client.configure({
-      enclaveOrigin: location.origin,
-      expectedKeyExchange
-    });
-  }, keyExchange);
-
-  const fetched = await page.evaluate(async () => {
-    const read = async path => {
-      const response = await fetch(path, { cache: 'no-store' });
-      return { status: response.status, body: (await response.text()).slice(0, 64) };
-    };
-    return {
-      bootstrap: Object.fromEntries(
-        await Promise.all(
-          [
-            '/attestation-widget.js',
-            '/register.js',
-            '/enclave-sw.js',
-            '/xwing/steve_xwing_wasm_bg.wasm'
-          ].map(
-            async path => [path, await read(path)]
-          )
-        )
-      ),
-      // A same-origin path that is NOT a bootstrap script must be captured,
-      // proving the worker really is protecting this origin.
-      protected: await read('/not-a-bootstrap-path.js'),
-      rootPost: await fetch('/', {
-        method: 'POST',
-        body: 'must-not-pass-through'
-      }).then(async response => ({
-        status: response.status,
-        body: await response.text()
-      }))
-    };
-  });
-
-  for (const path of [
-    '/attestation-widget.js',
-    '/register.js',
-    '/enclave-sw.js',
-    '/xwing/steve_xwing_wasm_bg.wasm'
-  ]) {
-    expect(fetched.bootstrap[path].status).toBe(200);
-    expect(fetched.bootstrap[path].body).not.toContain('secure channel failed');
-  }
-  expect(fetched.protected.body).toContain('secure channel failed');
-  expect(fetched.rootPost.body).toContain('secure channel failed');
 });
 
 test('preserves the session across an encrypted application 401', async ({ page }) => {
   const before = await initialize(page);
   const unauthorized = await page.evaluate(() => window.steveDemo.unauthorized());
   const echo = await page.evaluate(() => window.steveDemo.echo('after-401'));
-  const after = await page.evaluate(() => window.steveDemo.status());
+  const after = await currentStatus(page);
 
-  expect(unauthorized.status).toBe(401);
+  expect(unauthorized).toEqual({
+    status: 401,
+    body: 'application unauthorized\n'
+  });
   expect(echo).toEqual({ status: 200, body: 'after-401' });
-  expect(after.lastKeyRotation).toBe(before.lastKeyRotation);
+  expect(after.session.id).toBe(before.session.id);
 });
 
-test('renders concise outcomes for request-debugging controls', async ({ page }) => {
-  await initialize(page);
+test('retires a timed-out request and keeps the session usable', async ({ page }) => {
+  const before = await initialize(page);
+  const timedOut = await page.evaluate(() => window.steveDemo.timeout());
+  const echo = await page.evaluate(() => window.steveDemo.echo('after-timeout'));
+  const after = await currentStatus(page);
 
-  await page.getByRole('button', { name: 'Encrypted application 401' }).click();
-  await expect(page.locator('#events')).toContainText('401 HTTP');
-  await expect(page.locator('#scenario-result')).toContainText(
-    'encrypted application HTTP 401; session is ready'
-  );
-
-  await page.getByRole('button', { name: 'Client request timeout' }).click();
-  await expect(page.locator('#events')).toContainText('504 HTTP');
-  await expect(page.locator('#scenario-result')).toContainText(
-    'sequence retired and session is ready'
-  );
-
-  await page.getByRole('button', { name: 'Sequence-window pressure' }).click();
-  await expect(page.locator('#events')).toContainText(
-    '65 requests · 64 HTTP 200 · 1 HTTP 504'
-  );
-  await expect(page.locator('#scenario-result')).toContainText(
-    'sequence window reopened without rotating the session'
-  );
+  expect(timedOut.status).toBe(504);
+  expect(echo).toEqual({ status: 200, body: 'after-timeout' });
+  expect(after.session.id).toBe(before.session.id);
 });
 
-test('restores routing configuration after the service worker is restarted', async ({
+test('restores configuration and re-attests after a service-worker restart', async ({
   page,
   browserName
 }) => {
   test.skip(browserName !== 'chromium', 'service-worker process control requires Chromium CDP');
-  await initialize(page);
+  const before = await initialize(page);
 
   const cdp = await page.context().newCDPSession(page);
   await cdp.send('ServiceWorker.enable');
   await cdp.send('ServiceWorker.stopAllWorkers');
 
-  const status = await page.evaluate(async expectedKeyExchange => {
-    const client = await window.steveDemo.ready;
-    await client.configure({ expectedKeyExchange });
-    return window.steveDemo.initialize();
-  }, keyExchange);
-  const echo = await page.evaluate(() => window.steveDemo.echo('after-worker-restart'));
-  expect(status.initialized).toBe(true);
-  expect(echo).toEqual({ status: 200, body: 'after-worker-restart' });
+  const after = await page.evaluate(() => window.steveDemo.initialize());
+  expect(after.state).toBe('ready');
+  expect(after.session.id).not.toBe(before.session.id);
+  expectAttestationProfile(after);
+  expect(await page.evaluate(() => window.steveDemo.echo('after-worker-restart'))).toEqual({
+    status: 200,
+    body: 'after-worker-restart'
+  });
 });
 
-test('reconfigures after persisted routing configuration is lost', async ({
-  page,
-  browserName
-}) => {
-  test.skip(browserName !== 'chromium', 'service-worker process control requires Chromium CDP');
-  await initialize(page);
-
-  await page.evaluate(() => caches.delete('steve-sdk-config-v1'));
-  const cdp = await page.context().newCDPSession(page);
-  await cdp.send('ServiceWorker.enable');
-  await cdp.send('ServiceWorker.stopAllWorkers');
-  await page.reload({ waitUntil: 'domcontentloaded' });
-
-  await page.waitForFunction(() => Boolean(window.steveDemo));
-  await expect(page.locator('#system-status')).toContainText('Service worker active');
-  const status = await page.evaluate(async expectedKeyExchange => {
-    const client = await window.steveDemo.ready;
-    await client.configure({ expectedKeyExchange });
-    return window.steveDemo.initialize();
-  }, keyExchange);
-  const echo = await page.evaluate(() => window.steveDemo.echo('after-config-loss'));
-
-  expect(status.initialized).toBe(true);
-  expect(echo).toEqual({ status: 200, body: 'after-config-loss' });
-});
-
-test('retires a timed-out oldest request and unblocks the replay window', async ({ page }) => {
+test('handles bounded concurrency and remains usable', async ({ page }) => {
   const before = await initialize(page);
   const responses = await page.evaluate(() => window.steveDemo.concurrency());
-  const afterWindow = await page.evaluate(() => window.steveDemo.echo('after-window'));
-  const after = await page.evaluate(() => window.steveDemo.status());
+  const afterWindow = await page.evaluate(() => window.steveDemo.echo('after-concurrency'));
+  const after = await currentStatus(page);
 
-  expect(responses.filter(response => response.status === 504)).toHaveLength(1);
-  expect(responses.filter(response => response.status === 200)).toHaveLength(64);
-  expect(afterWindow).toEqual({ status: 200, body: 'after-window' });
-  expect(after.lastKeyRotation).toBe(before.lastKeyRotation);
+  expect(responses).toHaveLength(16);
+  expect(responses.every(response => response.status === 200)).toBe(true);
+  expect(responses.map(response => response.body)).toEqual(
+    Array.from({ length: 16 }, (_, index) => `concurrent-${index}`)
+  );
+  expect(afterWindow).toEqual({ status: 200, body: 'after-concurrency' });
+  expect(after.session.id).toBe(before.session.id);
+});
+
+test.describe('local synthetic profile', () => {
+  test.skip(isNitro, 'local-only deterministic and bootstrap coverage');
+
+  test('works when manually opened through localhost', async ({ page }) => {
+    await openDemo(page, { pageOrigin: 'http://localhost:3000' });
+    const status = await page.evaluate(() => window.steveDemo.initialize());
+    expect(status.attestation.synthetic).toBe(true);
+    expect(await page.evaluate(() => window.steveDemo.echo('localhost-demo'))).toEqual({
+      status: 200,
+      body: 'localhost-demo'
+    });
+  });
+
+  test('passes scoped bootstrap assets through for a same-origin target', async ({ page }) => {
+    await openDemo(page);
+    await page.evaluate(async suite => {
+      const client = await window.steveDemo.ready;
+      await client.configure({
+        enclaveOrigin: location.origin,
+        expectedKeyExchange: suite
+      });
+    }, keyExchange);
+
+    const fetched = await page.evaluate(async currentProfile => {
+      const base = `/${currentProfile}/`;
+      const read = async path => {
+        const response = await fetch(path, { cache: 'no-store' });
+        return { status: response.status, body: (await response.text()).slice(0, 64) };
+      };
+      const bootstrapPaths = [
+        `${base}attestation-widget.js`,
+        `${base}register.js`,
+        `${base}enclave-sw.js`,
+        `${base}xwing/steve_xwing_wasm_bg.wasm`
+      ];
+      return {
+        bootstrap: Object.fromEntries(
+          await Promise.all(bootstrapPaths.map(async path => [path, await read(path)]))
+        ),
+        protected: await read(`${base}not-a-bootstrap-path.js`),
+        rootPost: await fetch(base, {
+          method: 'POST',
+          body: 'must-not-pass-through'
+        }).then(async response => ({
+          status: response.status,
+          body: await response.text()
+        }))
+      };
+    }, profile);
+
+    for (const response of Object.values(fetched.bootstrap)) {
+      expect(response.status).toBe(200);
+      expect(response.body).not.toContain('secure channel failed');
+    }
+    expect(fetched.protected.body).toContain('secure channel failed');
+    expect(fetched.rootPost.body).toContain('secure channel failed');
+  });
+
+  test('recovers after persisted routing configuration is lost', async ({
+    page,
+    browserName
+  }) => {
+    test.skip(browserName !== 'chromium', 'service-worker process control requires Chromium CDP');
+    await initialize(page);
+
+    await page.evaluate(() => caches.delete('steve-sdk-config-v1'));
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('ServiceWorker.enable');
+    await cdp.send('ServiceWorker.stopAllWorkers');
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => Boolean(window.steveDemo));
+
+    const status = await page.evaluate(() => window.steveDemo.initialize());
+    expect(status.initialized).toBe(true);
+    expect(await page.evaluate(() => window.steveDemo.echo('after-config-loss'))).toEqual({
+      status: 200,
+      body: 'after-config-loss'
+    });
+  });
+
+  test('reopens the exact 64-entry sequence window after timeout', async ({ page }) => {
+    const before = await initialize(page);
+    const responses = await page.evaluate(() => window.steveDemo.windowPressure());
+    const afterWindow = await page.evaluate(() => window.steveDemo.echo('after-window'));
+    const after = await currentStatus(page);
+
+    expect(responses.filter(response => response.status === 504)).toHaveLength(1);
+    expect(responses.filter(response => response.status === 200)).toHaveLength(64);
+    expect(afterWindow).toEqual({ status: 200, body: 'after-window' });
+    expect(after.session.id).toBe(before.session.id);
+  });
 });

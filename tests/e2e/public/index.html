@@ -3,8 +3,11 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="steve-profile" content="__STEVE_PROFILE__">
     <meta name="steve-key-exchange" content="__STEVE_KEY_EXCHANGE__">
-    <title>STEVE local E2E</title>
+    <meta name="steve-default-origin" content="__STEVE_DEFAULT_ORIGIN__">
+    <meta name="steve-request-timeout-ms" content="__STEVE_REQUEST_TIMEOUT_MS__">
+    <title>STEVE E2E</title>
     <style>
       :root {
         color-scheme: dark;
@@ -153,6 +156,32 @@
       }
       button:hover { background: #252c37; }
       button:disabled { cursor: not-allowed; opacity: .45; }
+      input, select {
+        background: var(--panel-deep);
+        border: 1px solid #424d5f;
+        border-radius: .4rem;
+        color: var(--text);
+        font: inherit;
+        min-width: 0;
+        padding: .55rem .65rem;
+      }
+      .target-config {
+        align-items: end;
+        display: grid;
+        gap: .7rem;
+        grid-template-columns: minmax(240px, 1fr) minmax(170px, auto) auto;
+      }
+      .target-config label {
+        color: var(--muted);
+        display: grid;
+        gap: .35rem;
+      }
+      .profile-links {
+        display: flex;
+        gap: .8rem;
+        margin-top: .6rem;
+      }
+      .profile-links a { color: var(--blue); }
       .target {
         color: var(--muted);
         margin: .35rem 0 0;
@@ -278,6 +307,7 @@
         .verification-card { grid-column: span 2; }
       }
       @media (max-width: 620px) {
+        .target-config,
         .request-composer,
         .exchange-grid,
         .scenario { grid-template-columns: 1fr; }
@@ -288,12 +318,38 @@
   </head>
   <body>
     <header>
-      <h1>STEVE local E2E</h1>
+      <h1>STEVE E2E</h1>
       <p class="lede">Inspect the browser-to-STEVE v2 session without exposing key material.</p>
+      <nav class="profile-links" aria-label="Evidence profile">
+        <a href="/local/">Local synthetic</a>
+        <a href="/nitro/">Production Nitro</a>
+      </nav>
       <p id="trust-warning" class="warning" hidden></p>
     </header>
 
     <main>
+      <section class="panel" aria-labelledby="target-heading">
+        <h2 id="target-heading">Target</h2>
+        <form id="target-form" class="target-config">
+          <label for="target-origin-input">
+            STEVE origin
+            <input id="target-origin-input" name="origin" type="url" required>
+          </label>
+          <label for="target-suite-input">
+            Expected suite
+            <select id="target-suite-input" name="suite">
+              <option value="X25519">X25519</option>
+              <option value="XWING-DRAFT10">XWING-DRAFT10</option>
+            </select>
+          </label>
+          <button id="apply-target" type="submit">Apply target</button>
+        </form>
+        <p class="hint">
+          The local and Nitro profiles use different attestation verifiers and isolated
+          service-worker scopes.
+        </p>
+      </section>
+
       <section class="panel" aria-labelledby="diagnostics-heading">
         <h2 id="diagnostics-heading">Live diagnostics</h2>
         <p id="system-status" class="system-status" data-state="loading" aria-live="polite">
@@ -436,8 +492,16 @@
       </section>
 
       <section class="panel" aria-labelledby="failure-cases-heading">
-        <h2 id="failure-cases-heading">Failure and window cases</h2>
+        <h2 id="failure-cases-heading">Application and recovery cases</h2>
         <div class="scenario-list">
+          <div class="scenario">
+            <button data-action="largeEcho" disabled>Encrypted 100 KiB echo</button>
+            <span>A large application body should round-trip without plaintext fallback.</span>
+          </div>
+          <div class="scenario">
+            <button data-action="compressed" disabled>Compression handling</button>
+            <span>STEVE should request an identity response from the upstream application.</span>
+          </div>
           <div class="scenario">
             <button data-action="unauthorized" disabled>Encrypted application 401</button>
             <span>The decrypted application error should not reset the secure session.</span>
@@ -447,8 +511,8 @@
             <span>The timed-out sequence is retired; the session remains usable.</span>
           </div>
           <div class="scenario">
-            <button data-action="concurrency" disabled>Sequence-window pressure</button>
-            <span>One slow request fills the oldest slot while 64 requests exercise backpressure.</span>
+            <button data-action="concurrency" disabled>Bounded concurrency</button>
+            <span>Sixteen concurrent encrypted requests should complete without losing the session.</span>
           </div>
         </div>
         <p id="scenario-result" class="scenario-result">No failure case run.</p>
@@ -465,6 +529,6 @@
       </details>
     </main>
 
-    <script type="module" src="/attestation-widget.js"></script>
+    <script type="module" src="./attestation-widget.js"></script>
   </body>
 </html>

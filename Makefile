@@ -1,5 +1,6 @@
 .PHONY: test test-rust test-js test-wasm test-production \
-	test-production-fast test-e2e test-e2e-nitro test-e2e-nitro-rust \
+	test-production-fast test-e2e test-e2e-nitro \
+	test-e2e-nitro-browser test-e2e-nitro-rust \
 	verify-dev verify-release verify
 
 test: test-rust test-js
@@ -25,8 +26,11 @@ test-e2e:
 test-e2e-nitro:
 	./scripts/test-e2e-nitro.sh
 
+test-e2e-nitro-browser:
+	./scripts/test-e2e-nitro.sh browser
+
 test-e2e-nitro-rust:
-	./scripts/test-sdk-nitro.sh
+	./scripts/test-e2e-nitro.sh rust
 
 verify-dev:
 	$(MAKE) test-rust

@@ -27,7 +27,7 @@ compose() {
 }
 
 build_assets() {
-  npm --prefix "$ROOT_DIR/steve-js-sdk" run build:e2e
+  make -C "$ROOT_DIR/steve-js-sdk" build-test-assets
 }
 
 prepare() {
@@ -37,7 +37,7 @@ prepare() {
 
 wait_for_services() {
   attempts=0
-  until curl --fail --silent http://127.0.0.1:3000/ >/dev/null \
+  until curl --fail --silent http://127.0.0.1:3000/local/ >/dev/null \
     && curl --fail --silent http://127.0.0.1:49500/health >/dev/null; do
     attempts=$((attempts + 1))
     if [ "$attempts" -ge 90 ]; then
@@ -77,12 +77,13 @@ cleanup_test() {
 
 run_playwright() {
   if [ -n "${STEVE_E2E_BROWSER:-}" ]; then
-    npm --prefix "$ROOT_DIR/steve-js-sdk" run test:e2e
+    STEVE_E2E_PROFILE=local npm --prefix "$ROOT_DIR/steve-js-sdk" run test:e2e
   elif [ -d "/Applications/Google Chrome.app" ]; then
+    STEVE_E2E_PROFILE=local \
     STEVE_E2E_BROWSER_CHANNEL=chrome \
       npm --prefix "$ROOT_DIR/steve-js-sdk" run test:e2e
   else
-    npm --prefix "$ROOT_DIR/steve-js-sdk" run test:e2e
+    STEVE_E2E_PROFILE=local npm --prefix "$ROOT_DIR/steve-js-sdk" run test:e2e
   fi
 }
 
@@ -119,7 +120,8 @@ case "$ACTION" in
   up)
     prepare
     start_suite "$STEVE_KEY_EXCHANGE"
-    echo "STEVE local E2E demo: http://127.0.0.1:3000"
+    echo "STEVE local synthetic UI: http://127.0.0.1:3000/local/"
+    echo "STEVE production Nitro UI: http://127.0.0.1:3000/nitro/"
     ;;
   down)
     stop

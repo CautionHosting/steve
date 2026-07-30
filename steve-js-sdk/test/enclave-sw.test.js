@@ -120,6 +120,35 @@ test('built-in bootstrap passthrough is limited to safe methods', () => {
   }
 });
 
+test('built-in bootstrap passthrough follows the service worker scope', () => {
+  globalThis.self.registration.scope = 'https://example.test/local/';
+
+  for (const path of [
+    '/local/enclave-sw.js',
+    '/local/register.js',
+    '/local/attestation-widget.js',
+    '/local/xwing/steve_xwing_wasm_bg.wasm'
+  ]) {
+    assert.equal(isProtected(`https://example.test${path}`), false);
+    assert.equal(isProtected(`https://example.test${path}`, { method: 'HEAD' }), false);
+    assert.equal(isProtected(`https://example.test${path}`, { method: 'POST' }), true);
+  }
+});
+
+test('scope root navigation remains available when persisted config is lost', () => {
+  globalThis.self.registration.scope = 'https://example.test/local/';
+  const scopedRequest = (method = 'GET') => ({
+    url: 'https://example.test/local/',
+    method,
+    mode: 'navigate',
+    destination: 'document'
+  });
+
+  assert.equal(shouldProtectRequest(scopedRequest()), false);
+  assert.equal(isProtected('https://example.test/local/'), true);
+  assert.equal(shouldProtectRequest(scopedRequest('POST')), true);
+});
+
 test('configured passthrough paths are limited to safe methods', () => {
   configure({ passthroughPaths: ['/custom-bootstrap.js'] });
 

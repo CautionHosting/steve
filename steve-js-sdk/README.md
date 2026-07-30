@@ -157,7 +157,7 @@ inspection outputs:
 make build-wasm  # fresh WASM + JS glue in ignored wasm-pkg/
 cmp wasm-pkg/steve_xwing_wasm_bg.wasm dist/xwing/steve_xwing_wasm_bg.wasm
 make test-wasm   # RustCrypto/WASM interoperability tests inside StageX
-make build-e2e   # disposable assets in ../tests/e2e/public/
+make build-test-assets  # local-eval + production assets in ignored E2E output
 ```
 
 The repository `test-production-fast` target compares committed `dist/` with

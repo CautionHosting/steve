@@ -110,6 +110,12 @@ FROM scratch AS e2e-output
 COPY --from=e2e-builder /build/e2e/ /build/e2e/
 CMD ["true"]
 
+FROM scratch AS test-assets-output
+
+COPY --from=e2e-builder /build/e2e/ /build/test-assets/local/
+COPY --from=builder /build/dist/ /build/test-assets/nitro/
+CMD ["true"]
+
 FROM scratch AS output
 
 COPY --from=test /build/dist/ /build/dist/

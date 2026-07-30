@@ -10,7 +10,8 @@ WASM_IMAGE ?= enclave-service-worker-wasm
 WASM_TEST_IMAGE ?= enclave-service-worker-wasm-test
 E2E_IMAGE ?= enclave-service-worker-e2e
 
-.PHONY: build build-cached build-wasm build-e2e test-wasm clean clean-e2e
+.PHONY: build build-cached build-wasm build-e2e build-test-assets \
+	test-wasm clean clean-e2e
 
 build:
 	@tmp_root=$${TMPDIR:-/tmp}; \
@@ -68,25 +69,23 @@ test-wasm:
 	$(CONTAINER_ENGINE) build --platform "$(BUILD_PLATFORM)" -f Containerfile \
 		--target wasm-test -t "$(WASM_TEST_IMAGE)" "$(BUILD_CONTEXT)"
 
-build-e2e:
-	rm -rf "$(STAGE_OUTPUT)/e2e"
-	mkdir -p "$(STAGE_OUTPUT)/e2e"
+build-e2e: build-test-assets
+
+build-test-assets:
+	rm -rf "$(STAGE_OUTPUT)/test-assets"
+	mkdir -p "$(STAGE_OUTPUT)/test-assets"
 	$(CONTAINER_ENGINE) build --platform "$(BUILD_PLATFORM)" -f Containerfile \
-		--target e2e-output -t "$(E2E_IMAGE)" "$(BUILD_CONTEXT)"
+		--target test-assets-output -t "$(E2E_IMAGE)" "$(BUILD_CONTEXT)"
 	container_id=$$($(CONTAINER_ENGINE) create "$(E2E_IMAGE)" true) && \
-		$(CONTAINER_ENGINE) cp "$$container_id:/build/e2e/." "$(STAGE_OUTPUT)/e2e/" && \
-		$(CONTAINER_ENGINE) rm "$$container_id" > /dev/null
-	rm -f ../tests/e2e/public/enclave-sw.js ../tests/e2e/public/register.js
-	rm -rf ../tests/e2e/public/xwing
-	mv "$(STAGE_OUTPUT)/e2e/enclave-sw.js" ../tests/e2e/public/enclave-sw.js
-	mv "$(STAGE_OUTPUT)/e2e/register.js" ../tests/e2e/public/register.js
-	mv "$(STAGE_OUTPUT)/e2e/xwing" ../tests/e2e/public/xwing
-	rmdir "$(STAGE_OUTPUT)/e2e"
-	@echo "StageX E2E assets complete"
+			$(CONTAINER_ENGINE) cp "$$container_id:/build/test-assets/." \
+				"$(STAGE_OUTPUT)/test-assets/" && \
+			$(CONTAINER_ENGINE) rm "$$container_id" > /dev/null
+	rm -rf ../tests/e2e/public/generated
+	mv "$(STAGE_OUTPUT)/test-assets" ../tests/e2e/public/generated
+	@echo "StageX local and Nitro E2E assets complete"
 
 clean-e2e:
-	rm -f ../tests/e2e/public/enclave-sw.js ../tests/e2e/public/register.js
-	rm -rf ../tests/e2e/public/xwing
+	rm -rf ../tests/e2e/public/generated
 
 clean: clean-e2e
 	rm -rf dist wasm-pkg "$(STAGE_OUTPUT)"

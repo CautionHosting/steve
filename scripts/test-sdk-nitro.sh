@@ -26,14 +26,6 @@ case "$STEVE_KEY_EXCHANGE" in
     ;;
 esac
 
-case "${STEVE_REMOTE_EXPECT_PCR_MISMATCH:-0}" in
-  0|1) ;;
-  *)
-    echo "STEVE_REMOTE_EXPECT_PCR_MISMATCH must be exactly 0 or 1" >&2
-    exit 2
-    ;;
-esac
-
 cargo test --locked --manifest-path "$ROOT_DIR/Cargo.toml" \
   -p steve-sdk --test nitro_e2e remote_nitro_e2e \
   -- --exact --ignored --nocapture

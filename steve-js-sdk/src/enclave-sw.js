@@ -38,6 +38,12 @@ const DEFAULT_BOOTSTRAP_PATHS = [
   '/attestation-widget.js',
   '/xwing/steve_xwing_wasm_bg.wasm'
 ];
+const SCOPED_BOOTSTRAP_PATHS = [
+  'enclave-sw.js',
+  'register.js',
+  'attestation-widget.js',
+  'xwing/steve_xwing_wasm_bg.wasm'
+];
 const SAFE_BOOTSTRAP_METHODS = new Set(['GET', 'HEAD']);
 const ROTATION_INTERVAL_MS = 25 * 60 * 1000;
 const PROTOCOL_EXCLUDE_PREFIXES = ['/e2p/'];
@@ -564,15 +570,21 @@ function shouldProtectRequest(request) {
 
 function isPassthrough(request, url) {
   const localOrigin = url.origin === self.location.origin;
+  const registrationScope = new URL(self.registration.scope);
   const bootstrapNavigation = localOrigin
-    && url.pathname === '/'
+    && (url.pathname === '/' || url.pathname === registrationScope.pathname)
     && request.method === 'GET'
     && request.mode === 'navigate'
     && request.destination === 'document';
   if (bootstrapNavigation) return true;
 
   const builtInBootstrap = localOrigin
-    && DEFAULT_BOOTSTRAP_PATHS.includes(url.pathname);
+    && (
+      DEFAULT_BOOTSTRAP_PATHS.includes(url.pathname)
+      || SCOPED_BOOTSTRAP_PATHS.some(
+        path => new URL(path, registrationScope).pathname === url.pathname
+      )
+    );
   if (builtInBootstrap) return SAFE_BOOTSTRAP_METHODS.has(request.method);
 
   const configuredPassthrough = config.passthroughPaths.includes(url.pathname);

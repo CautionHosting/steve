@@ -1,11 +1,19 @@
-import { registerEnclaveServiceWorker } from '/register.js';
+import { registerEnclaveServiceWorker } from './register.js';
 
-const ENCLAVE_ORIGIN = `http://${location.hostname}:49500`;
 const KEY_EXCHANGE_META = 'meta[name="steve-key-exchange"]';
+const PROFILE_META = 'meta[name="steve-profile"]';
+const DEFAULT_ORIGIN_META = 'meta[name="steve-default-origin"]';
+const REQUEST_TIMEOUT_META = 'meta[name="steve-request-timeout-ms"]';
 const RECOVERY_PARAM = 'steve-sw-recovery';
 const MAX_EVENTS = 100;
+const FIXTURE_CONTRACT = 'steve-test-fixture/v1';
+const supportedKeyExchanges = new Set(['X25519', 'XWING-DRAFT10']);
 const elements = Object.fromEntries(
   [
+    'target-form',
+    'target-origin-input',
+    'target-suite-input',
+    'apply-target',
     'trust-warning',
     'system-status',
     'runtime-worker',
@@ -44,15 +52,66 @@ const elements = Object.fromEntries(
   ].map(id => [id, document.querySelector(`#${id}`)])
 );
 const actionButtons = [...document.querySelectorAll('button[data-action]')];
-const requestActions = new Set(['echo', 'unauthorized', 'timeout', 'concurrency']);
+const requestActions = new Set([
+  'echo',
+  'largeEcho',
+  'compressed',
+  'unauthorized',
+  'timeout',
+  'concurrency'
+]);
 
-function configuredKeyExchange() {
-  const keyExchange = document.querySelector(KEY_EXCHANGE_META)?.content;
-  if (!['X25519', 'XWING-DRAFT10'].includes(keyExchange)) {
-    throw new Error('local E2E key-exchange pin is missing or invalid');
-  }
-  return keyExchange;
+function requiredMeta(selector, name) {
+  const value = document.querySelector(selector)?.content;
+  if (!value) throw new Error(`${name} is missing`);
+  return value;
 }
+
+function normalizeOrigin(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error('STEVE origin must be an absolute HTTP(S) origin');
+  }
+  if (
+    !['http:', 'https:'].includes(url.protocol)
+    || url.username
+    || url.password
+    || url.pathname !== '/'
+    || url.search
+    || url.hash
+  ) {
+    throw new Error('STEVE origin must be an absolute HTTP(S) origin');
+  }
+  return url.origin;
+}
+
+function normalizeKeyExchange(value) {
+  if (!supportedKeyExchanges.has(value)) {
+    throw new Error('expected suite must be exactly X25519 or XWING-DRAFT10');
+  }
+  return value;
+}
+
+const profile = requiredMeta(PROFILE_META, 'STEVE evidence profile');
+if (!['local', 'nitro'].includes(profile)) {
+  throw new Error('STEVE evidence profile must be exactly local or nitro');
+}
+const requestTimeoutMs = Number(requiredMeta(REQUEST_TIMEOUT_META, 'request timeout'));
+if (!Number.isInteger(requestTimeoutMs)) {
+  throw new Error('request timeout must be an integer');
+}
+const query = new URL(location.href).searchParams;
+let enclaveOrigin = normalizeOrigin(
+  query.get('origin') || requiredMeta(DEFAULT_ORIGIN_META, 'default STEVE origin')
+);
+let keyExchange = normalizeKeyExchange(
+  query.get('suite') || requiredMeta(KEY_EXCHANGE_META, 'default STEVE suite')
+);
+
+elements['target-origin-input'].value = enclaveOrigin;
+elements['target-suite-input'].value = keyExchange;
 
 const stateLabels = {
   idle: 'Idle',
@@ -211,7 +270,7 @@ function renderStatus(status) {
   setText('attestation-profile', attestation?.profile || verifier.id || '—');
   setText('trust-anchor', attestation?.trustAnchor || verifier.trustAnchor || '—');
   setText('module-id', attestation?.moduleId || '—');
-  setText('target-origin', ENCLAVE_ORIGIN);
+  setText('target-origin', enclaveOrigin);
 
   const warning = elements['trust-warning'];
   if (verifier.synthetic || attestation?.synthetic) {
@@ -342,7 +401,9 @@ async function recoverStaleRegistration(error) {
   const url = new URL(location.href);
   if (url.searchParams.has(RECOVERY_PARAM)) return false;
 
-  const registration = await navigator.serviceWorker.getRegistration('/');
+  const registration = await navigator.serviceWorker.getRegistration(
+    new URL('./', location.href).href
+  );
   await registration?.unregister();
   url.searchParams.set(RECOVERY_PARAM, '1');
   location.replace(url);
@@ -408,14 +469,21 @@ async function refreshStatus() {
 
 const ready = (async () => {
   try {
+    const profileBase = new URL('./', location.href).pathname;
     const client = await registerEnclaveServiceWorker({
-      swPath: '/enclave-sw.js',
-      scope: '/',
+      swPath: new URL('enclave-sw.js', location.href).pathname,
+      scope: profileBase,
       config: {
-        enclaveOrigin: ENCLAVE_ORIGIN,
+        enclaveOrigin,
         emitEncryptedPayloads: true,
-        requestTimeoutMs: 1000,
-        expectedKeyExchange: configuredKeyExchange()
+        requestTimeoutMs,
+        expectedKeyExchange: keyExchange,
+        passthroughPaths: [
+          `${profileBase}attestation-widget.js`,
+          `${profileBase}register.js`,
+          `${profileBase}enclave-sw.js`,
+          `${profileBase}xwing/steve_xwing_wasm_bg.wasm`
+        ]
       }
     });
     activeClient = client;
@@ -475,13 +543,40 @@ async function reset() {
   return refreshStatus();
 }
 
+async function applyTarget(origin, suite) {
+  const nextOrigin = normalizeOrigin(origin);
+  const nextSuite = normalizeKeyExchange(suite);
+  const client = await ready;
+  await client.configure({
+    enclaveOrigin: nextOrigin,
+    expectedKeyExchange: nextSuite,
+    requestTimeoutMs
+  });
+  enclaveOrigin = nextOrigin;
+  keyExchange = nextSuite;
+  elements['target-origin-input'].value = enclaveOrigin;
+  elements['target-suite-input'].value = keyExchange;
+  const url = new URL(location.href);
+  url.searchParams.set('origin', enclaveOrigin);
+  url.searchParams.set('suite', keyExchange);
+  history.replaceState(null, '', url);
+  inspectedExchange = null;
+  setText('target-origin', enclaveOrigin);
+  appendEvent(
+    'target',
+    `${profile === 'nitro' ? 'Nitro' : 'local'} profile configured for ${keyExchange} at ${enclaveOrigin}`,
+    'success'
+  );
+  return refreshStatus();
+}
+
 async function request(path, options, inspect = true) {
   const started = performance.now();
   const method = options?.method || 'GET';
   const body = typeof options?.body === 'string' ? options.body : '';
   if (inspect) beginExchange(method, path, body);
   try {
-    const response = await fetch(`${ENCLAVE_ORIGIN}${path}`, options);
+    const response = await fetch(`${enclaveOrigin}${path}`, options);
     const responseBody = await response.text();
     if (inspect) finishExchange(response.status, responseBody, performance.now() - started);
     return { status: response.status, body: responseBody };
@@ -504,11 +599,35 @@ function unauthorizedRequest(inspect = true) {
 }
 
 function timeoutRequest(inspect = true) {
-  return request('/delay?ms=2500', undefined, inspect);
+  return request(`/delay?ms=${requestTimeoutMs + 2000}`, undefined, inspect);
 }
 
 async function echo(value = elements['request-body'].value) {
   const result = await echoRequest(value);
+  await refreshStatus();
+  return result;
+}
+
+async function fixture() {
+  const result = await request('/.well-known/steve-test-fixture', undefined, false);
+  if (result.status !== 200) {
+    throw new Error(`fixture capability request returned HTTP ${result.status}`);
+  }
+  let capabilities;
+  try {
+    capabilities = JSON.parse(result.body);
+  } catch {
+    throw new Error('fixture capability response was not JSON');
+  }
+  if (capabilities.contract !== FIXTURE_CONTRACT) {
+    throw new Error(`expected fixture contract ${FIXTURE_CONTRACT}`);
+  }
+  return capabilities;
+}
+
+async function largeEcho() {
+  const payload = 'x'.repeat(100 * 1024);
+  const result = await echoRequest(payload, false);
   await refreshStatus();
   return result;
 }
@@ -526,7 +645,7 @@ async function timeout() {
 }
 
 async function compressed() {
-  const response = await fetch(`${ENCLAVE_ORIGIN}/compressed`);
+  const response = await fetch(`${enclaveOrigin}/compressed`);
   const result = {
     status: response.status,
     body: await response.text(),
@@ -539,6 +658,17 @@ async function compressed() {
 }
 
 async function concurrency() {
+  const results = await Promise.all(
+    Array.from(
+      { length: 16 },
+      (_, index) => echoRequest(`concurrent-${index}`, false)
+    )
+  );
+  await refreshStatus();
+  return results;
+}
+
+async function windowPressure() {
   const slow = timeoutRequest(false);
   await new Promise(resolve => setTimeout(resolve, 25));
   const fast = Array.from(
@@ -562,7 +692,7 @@ function resultSummary(action, result, duration) {
       total[response.status] = (total[response.status] || 0) + 1;
       return total;
     }, {});
-    return `${result.length} requests · ${counts[200] || 0} HTTP 200 · ${counts[504] || 0} HTTP 504 · ${elapsed}`;
+    return `${result.length} requests · ${counts[200] || 0} HTTP 200 · ${elapsed}`;
   }
   const bodySize = bytes(result.body);
   return `${result.status} HTTP · ${bodySize} response bytes · ${elapsed}`;
@@ -580,27 +710,46 @@ function renderScenarioResult(action, result) {
       `Observed local HTTP ${result.status} timeout; sequence retired and session is ${latestStatus?.state}.`
     );
   } else if (action === 'concurrency') {
-    const timeouts = result.filter(response => response.status === 504).length;
     const successes = result.filter(response => response.status === 200).length;
     setText(
       'scenario-result',
-      `${successes} completed, ${timeouts} timed out; sequence window reopened without rotating the session.`
+      `${successes} concurrent requests completed; the session remains usable.`
     );
   }
 }
 
 window.steveDemo = {
   ready,
+  profile,
   initialize,
   status,
   rotate,
   reset,
+  applyTarget,
+  fixture,
   echo,
+  largeEcho,
   compressed,
   unauthorized,
   timeout,
-  concurrency
+  concurrency,
+  windowPressure
 };
+
+elements['target-form'].addEventListener('submit', async event => {
+  event.preventDefault();
+  setBusy(true);
+  try {
+    await applyTarget(
+      elements['target-origin-input'].value,
+      elements['target-suite-input'].value
+    );
+  } catch (error) {
+    appendEvent('target', error.message, 'failure');
+  } finally {
+    setBusy(false);
+  }
+});
 
 actionButtons.forEach(button => {
   button.addEventListener('click', async () => {
