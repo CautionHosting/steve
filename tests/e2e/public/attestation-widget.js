@@ -7,6 +7,8 @@ const REQUEST_TIMEOUT_META = 'meta[name="steve-request-timeout-ms"]';
 const RECOVERY_PARAM = 'steve-sw-recovery';
 const MAX_EVENTS = 100;
 const FIXTURE_CONTRACT = 'steve-test-fixture/v1';
+const CONTROLLED_TIMEOUT_MS = 3000;
+const CONTROLLED_DELAY_MS = 5000;
 const supportedKeyExchanges = new Set(['X25519', 'XWING-DRAFT10']);
 const elements = Object.fromEntries(
   [
@@ -639,9 +641,15 @@ async function unauthorized() {
 }
 
 async function timeout() {
-  const result = await timeoutRequest();
-  await refreshStatus();
-  return result;
+  const client = await ready;
+  await client.configure({ requestTimeoutMs: CONTROLLED_TIMEOUT_MS });
+  try {
+    const result = await request(`/delay?ms=${CONTROLLED_DELAY_MS}`);
+    await refreshStatus();
+    return result;
+  } finally {
+    await client.configure({ requestTimeoutMs });
+  }
 }
 
 async function compressed() {

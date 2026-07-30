@@ -73,6 +73,8 @@ make test-e2e-nitro-rust
 All Nitro targets require exact, nonzero PCRs. Browser tests compare the
 verified reported values; the Rust SDK enforces them during session
 establishment and tests a mutated-PCR rejection. Run the gate once for the
-X-Wing deployment and once for X25519.
+X-Wing deployment and once for X25519. Normal remote requests have a 10-second
+deadline; only the controlled timeout scenario uses 3 seconds. The gate does
+not retry application requests.
 
 Remote Nitro tests are opt-in release tests, not untrusted pull-request jobs.

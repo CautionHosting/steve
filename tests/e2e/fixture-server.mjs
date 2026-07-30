@@ -46,7 +46,7 @@ function renderIndex(profile, requestHostname) {
     .replaceAll('__STEVE_PROFILE__', profile)
     .replaceAll('__STEVE_KEY_EXCHANGE__', keyExchange)
     .replaceAll('__STEVE_DEFAULT_ORIGIN__', localOrigin)
-    .replaceAll('__STEVE_REQUEST_TIMEOUT_MS__', profile === 'local' ? '1000' : '3000');
+    .replaceAll('__STEVE_REQUEST_TIMEOUT_MS__', profile === 'local' ? '1000' : '10000');
 }
 
 function readBody(request, limit) {

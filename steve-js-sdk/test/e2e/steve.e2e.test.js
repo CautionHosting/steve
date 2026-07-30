@@ -10,6 +10,17 @@ const fixtureContract = {
   max_delay_ms: 10_000
 };
 
+async function timedNitroOperation(label, operation) {
+  const started = performance.now();
+  try {
+    return await operation();
+  } finally {
+    if (isNitro) {
+      console.log(`[nitro timing] ${label}: ${Math.round(performance.now() - started)} ms`);
+    }
+  }
+}
+
 if (!['local', 'nitro'].includes(profile)) {
   throw new Error('STEVE_E2E_PROFILE must be exactly local or nitro');
 }
@@ -74,7 +85,10 @@ async function openDemo(page, options = {}) {
 async function initialize(page) {
   await openDemo(page);
   await expect(page.getByRole('button', { name: 'Establish session' })).toBeEnabled();
-  return page.evaluate(() => window.steveDemo.initialize());
+  return timedNitroOperation(
+    'session establishment',
+    () => page.evaluate(() => window.steveDemo.initialize())
+  );
 }
 
 async function currentStatus(page) {
@@ -150,11 +164,17 @@ test('establishes an attested session and uses the versioned fixture', async ({ 
 
 test('protects a 100 KiB body and requests an identity response', async ({ page }) => {
   await initialize(page);
-  const large = await page.evaluate(() => window.steveDemo.largeEcho());
+  const large = await timedNitroOperation(
+    '100 KiB echo',
+    () => page.evaluate(() => window.steveDemo.largeEcho())
+  );
 
   expect(large.status).toBe(200);
   expect(large.body).toBe('x'.repeat(100 * 1024));
-  expect(await page.evaluate(() => window.steveDemo.compressed())).toEqual({
+  expect(await timedNitroOperation(
+    'identity response',
+    () => page.evaluate(() => window.steveDemo.compressed())
+  )).toEqual({
     status: 200,
     body: 'identity-through-steve',
     contentEncoding: null,
@@ -244,8 +264,14 @@ test('preserves the session across an encrypted application 401', async ({ page 
 
 test('retires a timed-out request and keeps the session usable', async ({ page }) => {
   const before = await initialize(page);
-  const timedOut = await page.evaluate(() => window.steveDemo.timeout());
-  const echo = await page.evaluate(() => window.steveDemo.echo('after-timeout'));
+  const timedOut = await timedNitroOperation(
+    'controlled 3s timeout',
+    () => page.evaluate(() => window.steveDemo.timeout())
+  );
+  const echo = await timedNitroOperation(
+    'request after timeout',
+    () => page.evaluate(() => window.steveDemo.echo('after-timeout'))
+  );
   const after = await currentStatus(page);
 
   expect(timedOut.status).toBe(504);
@@ -276,8 +302,14 @@ test('restores configuration and re-attests after a service-worker restart', asy
 
 test('handles bounded concurrency and remains usable', async ({ page }) => {
   const before = await initialize(page);
-  const responses = await page.evaluate(() => window.steveDemo.concurrency());
-  const afterWindow = await page.evaluate(() => window.steveDemo.echo('after-concurrency'));
+  const responses = await timedNitroOperation(
+    '16 concurrent requests',
+    () => page.evaluate(() => window.steveDemo.concurrency())
+  );
+  const afterWindow = await timedNitroOperation(
+    'request after concurrency',
+    () => page.evaluate(() => window.steveDemo.echo('after-concurrency'))
+  );
   const after = await currentStatus(page);
 
   expect(responses).toHaveLength(16);

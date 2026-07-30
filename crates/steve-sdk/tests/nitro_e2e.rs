@@ -1,4 +1,7 @@
-use std::{env, time::Duration};
+use std::{
+    env,
+    time::{Duration, Instant},
+};
 
 use serde::Deserialize;
 use steve_sdk::{Client, Error, ExpectedPcrs, KeyExchangeSuite};
@@ -113,13 +116,18 @@ async fn remote_nitro_e2e() {
         "the remote enclave did not reject the wrong key-exchange suite: {suite_mismatch:?}"
     );
 
+    let session_started = Instant::now();
     let client = Client::builder(&origin, expected_pcrs.clone())
         .unwrap()
         .expected_key_exchange(suite)
-        .request_timeout(Duration::from_secs(3))
+        .request_timeout(Duration::from_secs(10))
         .connect()
         .await
         .expect("real Nitro session establishment failed");
+    println!(
+        "Nitro timing: session establishment completed in {:?}",
+        session_started.elapsed()
+    );
     let first = client.verify_attestation().await.unwrap();
     assert_expected_pcrs(&first.pcrs, &expected_pcrs);
 
@@ -146,6 +154,7 @@ async fn remote_nitro_e2e() {
     );
 
     let large_body = vec![b'x'; 100 * 1024];
+    let large_echo_started = Instant::now();
     let echo = client
         .post("/echo")
         .header("content-type", "application/octet-stream")
@@ -154,6 +163,10 @@ async fn remote_nitro_e2e() {
         .send()
         .await
         .unwrap();
+    println!(
+        "Nitro timing: 100 KiB echo completed in {:?}",
+        large_echo_started.elapsed()
+    );
     assert_eq!(echo.status().as_u16(), 200);
     assert_eq!(echo.headers()["content-type"], "application/octet-stream");
     assert_eq!(echo.bytes(), large_body);
@@ -175,7 +188,25 @@ async fn remote_nitro_e2e() {
         first.session_id
     );
 
-    let timed_out = client.get("/delay?ms=5000").send().await;
+    let short_session_started = Instant::now();
+    let timeout_client = Client::builder(&origin, expected_pcrs.clone())
+        .unwrap()
+        .expected_key_exchange(suite)
+        .request_timeout(Duration::from_secs(3))
+        .connect()
+        .await
+        .expect("real Nitro short-timeout session establishment failed");
+    println!(
+        "Nitro timing: short-timeout session establishment completed in {:?}",
+        short_session_started.elapsed()
+    );
+    let timeout_session = timeout_client.verify_attestation().await.unwrap();
+    let timeout_started = Instant::now();
+    let timed_out = timeout_client.get("/delay?ms=5000").send().await;
+    println!(
+        "Nitro timing: controlled timeout completed in {:?}",
+        timeout_started.elapsed()
+    );
     assert!(
         matches!(
             timed_out,
@@ -185,17 +216,26 @@ async fn remote_nitro_e2e() {
         ),
         "controlled delay did not produce a request-local timeout: {timed_out:?}"
     );
-    let recovered = client
+    let recovery_started = Instant::now();
+    let recovered = timeout_client
         .post("/echo")
         .body(b"after-timeout".to_vec())
         .send()
         .await
         .unwrap();
+    println!(
+        "Nitro timing: request after timeout completed in {:?}",
+        recovery_started.elapsed()
+    );
     assert_eq!(recovered.status().as_u16(), 200);
     assert_eq!(recovered.bytes(), b"after-timeout");
     assert_eq!(
-        client.verify_attestation().await.unwrap().session_id,
-        first.session_id
+        timeout_client
+            .verify_attestation()
+            .await
+            .unwrap()
+            .session_id,
+        timeout_session.session_id
     );
 
     let second = client.reconnect().await.unwrap();
