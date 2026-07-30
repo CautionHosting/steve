@@ -596,16 +596,32 @@ test('a transient request failure does not poison a concurrent sibling', async (
 test('outer 413 retires only the oversized request', async () => {
   const session = await installFakeSession();
   let calls = 0;
+  let resolveOversized;
+  let markOversizedStarted;
+  let markSiblingStarted;
+  const oversizedStarted = new Promise(resolve => { markOversizedStarted = resolve; });
+  const siblingStarted = new Promise(resolve => { markSiblingStarted = resolve; });
+  const oversizedResponse = new Promise(resolve => { resolveOversized = resolve; });
   globalThis.fetch = async (url, options) => {
     calls += 1;
-    if (calls === 1) return new Response(null, { status: 413 });
+    if (calls === 1) {
+      markOversizedStarted();
+      return oversizedResponse;
+    }
+    markSiblingStarted();
     return validProtocolResponse(options, session);
   };
 
-  const [oversized, sibling] = await Promise.all([
-    handleProtectedRequest(new Request('https://example.test/oversized')),
-    handleProtectedRequest(new Request('https://example.test/sibling'))
-  ]);
+  const oversizedPromise = handleProtectedRequest(
+    new Request('https://example.test/oversized')
+  );
+  await oversizedStarted;
+  const siblingPromise = handleProtectedRequest(
+    new Request('https://example.test/sibling')
+  );
+  await siblingStarted;
+  resolveOversized(new Response(null, { status: 413 }));
+  const [oversized, sibling] = await Promise.all([oversizedPromise, siblingPromise]);
 
   assert.equal(oversized.status, 502);
   assert.equal(sibling.status, 200);
