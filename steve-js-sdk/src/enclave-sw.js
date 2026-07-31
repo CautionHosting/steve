@@ -451,7 +451,6 @@ async function protocolFetch(path, body, signal) {
       method: 'POST',
       headers: { 'Content-Type': 'application/cbor' },
       body,
-      cache: 'no-store',
       credentials: 'omit',
       redirect: 'error',
       signal

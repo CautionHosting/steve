@@ -295,7 +295,7 @@ test('expectedKeyExchange defaults to X25519 and only accepts exact suites', () 
   }
 });
 
-test('protocol requests use the configured enclave origin without credentials', async () => {
+test('protocol requests use the configured enclave origin without credentials or cache bypass', async () => {
   configure({ enclaveOrigin: 'https://secure.example' });
   let captured;
   globalThis.fetch = async (url, options) => {
@@ -312,6 +312,7 @@ test('protocol requests use the configured enclave origin without credentials', 
   assert.equal(captured.url, 'https://secure.example/e2p/v2/session');
   assert.equal(captured.options.method, 'POST');
   assert.equal(captured.options.credentials, 'omit');
+  assert.equal(captured.options.cache, undefined);
   assert.equal(captured.options.headers['Content-Type'], 'application/cbor');
 });
 
