@@ -534,6 +534,18 @@ function arraysEqual(a, b) {
 
 // node_modules/tee-attestation-js/src/tee/nitro.js
 var COSE_SIGN1_TAG = 18;
+var NITRO_PROTECTED_HEADER = Uint8Array.of(161, 1, 56, 34);
+function validateProtectedHeader(protectedHeader) {
+  let decodedHeader;
+  try {
+    decodedHeader = decode(protectedHeader);
+  } catch {
+    throw new Error("Invalid COSE protected header");
+  }
+  if (!decodedHeader || Object.getPrototypeOf(decodedHeader) !== Object.prototype || Object.keys(decodedHeader).length !== 1 || decodedHeader[1] !== -35 || !arraysEqual(protectedHeader, NITRO_PROTECTED_HEADER)) {
+    throw new Error("Invalid COSE protected header");
+  }
+}
 var ROOT_CERT = `-----BEGIN CERTIFICATE-----
 MIICETCCAZagAwIBAgIRAPkxdWgbkK/hHUbMtOTn+FYwCgYIKoZIzj0EAwMwSTEL
 MAkGA1UEBhMCVVMxDzANBgNVBAoMBkFtYXpvbjEMMAoGA1UECwwDQVdTMRswGQYD
@@ -557,6 +569,7 @@ function parse(document) {
   if (!(protectedHeader instanceof Uint8Array) || !unprotectedHeader || Object.getPrototypeOf(unprotectedHeader) !== Object.prototype || Object.keys(unprotectedHeader).length !== 0 || !(payload instanceof Uint8Array) || !(signature instanceof Uint8Array)) {
     throw new Error("Invalid COSE Sign1 structure");
   }
+  validateProtectedHeader(protectedHeader);
   const decodedPayload = decode(payload, { allowIndefinite: true });
   if (!decodedPayload || Object.getPrototypeOf(decodedPayload) !== Object.prototype) {
     throw new Error("Invalid Nitro attestation payload");
@@ -1365,6 +1378,12 @@ var DEFAULT_BOOTSTRAP_PATHS = [
   "/attestation-widget.js",
   "/xwing/steve_xwing_wasm_bg.wasm"
 ];
+var SCOPED_BOOTSTRAP_PATHS = [
+  "enclave-sw.js",
+  "register.js",
+  "attestation-widget.js",
+  "xwing/steve_xwing_wasm_bg.wasm"
+];
 var SAFE_BOOTSTRAP_METHODS = /* @__PURE__ */ new Set(["GET", "HEAD"]);
 var ROTATION_INTERVAL_MS = 25 * 60 * 1e3;
 var PROTOCOL_EXCLUDE_PREFIXES = ["/e2p/"];
@@ -1735,7 +1754,6 @@ async function protocolFetch(path, body, signal) {
       method: "POST",
       headers: { "Content-Type": "application/cbor" },
       body,
-      cache: "no-store",
       credentials: "omit",
       redirect: "error",
       signal
@@ -1836,9 +1854,12 @@ function shouldProtectRequest(request) {
 }
 function isPassthrough(request, url) {
   const localOrigin = url.origin === self.location.origin;
-  const bootstrapNavigation = localOrigin && url.pathname === "/" && request.method === "GET" && request.mode === "navigate" && request.destination === "document";
+  const registrationScope = new URL(self.registration.scope);
+  const bootstrapNavigation = localOrigin && (url.pathname === "/" || url.pathname === registrationScope.pathname) && request.method === "GET" && request.mode === "navigate" && request.destination === "document";
   if (bootstrapNavigation) return true;
-  const builtInBootstrap = localOrigin && DEFAULT_BOOTSTRAP_PATHS.includes(url.pathname);
+  const builtInBootstrap = localOrigin && (DEFAULT_BOOTSTRAP_PATHS.includes(url.pathname) || SCOPED_BOOTSTRAP_PATHS.some(
+    (path) => new URL(path, registrationScope).pathname === url.pathname
+  ));
   if (builtInBootstrap) return SAFE_BOOTSTRAP_METHODS.has(request.method);
   const configuredPassthrough = config.passthroughPaths.includes(url.pathname);
   const localBootstrap = localOrigin && configuredPassthrough;

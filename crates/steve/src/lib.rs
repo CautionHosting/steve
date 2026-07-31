@@ -4,7 +4,7 @@ pub mod eval_attestation;
 pub mod protocol;
 pub mod sessions;
 
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use attestation::{AttestationProvider, NitroAttestationProvider};
 use axum::{
@@ -21,7 +21,7 @@ use protocol::{
     build_transcript, decode_cbor, derive_secrets, encode_cbor, fixed, transcript_hash,
 };
 use rand::{RngCore, rngs::OsRng};
-use reqwest::Client;
+use reqwest::{Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use sessions::{CLEANUP_INTERVAL, PENDING_TTL, Session, SessionError, SessionStore};
 use tokio::{sync::Semaphore, task};
@@ -34,11 +34,15 @@ use zeroize::{Zeroize, Zeroizing};
 const DEFAULT_APP_UPSTREAM: &str = "http://127.0.0.1:8083";
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:49500";
 const MAX_ENVELOPE_BYTES: usize = 32 * 1024 * 1024;
-const MAX_PROTECTED_RESPONSE_BODY_BYTES: usize = MAX_ENVELOPE_BYTES;
+const MAX_UPSTREAM_RESPONSE_BODY_BYTES: usize = MAX_ENVELOPE_BYTES;
 const MAX_UNENCRYPTED_BODY_BYTES: usize = 1024 * 1024;
 const MAX_SESSION_BODY_BYTES: usize = 4_096;
 const MAX_CONCURRENT_ATTESTATIONS: usize = 8;
 const MAX_CONCURRENT_KEY_EXCHANGES: usize = 8;
+const CORS_PREFLIGHT_MAX_AGE: Duration = Duration::from_secs(600);
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -257,13 +261,30 @@ fn cors_layer(origins: &str) -> Result<CorsLayer, BoxError> {
     Ok(CorsLayer::new()
         .allow_origin(AllowOrigin::list(values))
         .allow_methods([Method::POST])
-        .allow_headers([header::CONTENT_TYPE]))
+        .allow_headers([header::CONTENT_TYPE])
+        .max_age(CORS_PREFLIGHT_MAX_AGE))
 }
 
 fn enclave_http_client() -> Result<Client, reqwest::Error> {
+    enclave_http_client_with_timeouts(
+        UPSTREAM_CONNECT_TIMEOUT,
+        UPSTREAM_READ_TIMEOUT,
+        UPSTREAM_REQUEST_TIMEOUT,
+    )
+}
+
+fn enclave_http_client_with_timeouts(
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<Client, reqwest::Error> {
     // The enclave must never inherit host proxy configuration for its local upstream hop.
     // Keep plaintext responses byte-preserving; protected requests explicitly require identity.
     Client::builder()
+        .redirect(Policy::none())
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+        .timeout(request_timeout)
         .no_proxy()
         .no_gzip()
         .no_brotli()
@@ -464,39 +485,39 @@ struct ApplicationResponse {
 }
 
 #[derive(Debug)]
-enum ProtectedResponseBodyError {
+enum UpstreamResponseBodyError {
     TooLarge,
     Read(reqwest::Error),
 }
 
-fn append_protected_response_chunk(
+fn append_upstream_response_chunk(
     body: &mut Vec<u8>,
     chunk: &[u8],
     limit: usize,
-) -> Result<(), ProtectedResponseBodyError> {
+) -> Result<(), UpstreamResponseBodyError> {
     if chunk.len() > limit.saturating_sub(body.len()) {
-        return Err(ProtectedResponseBodyError::TooLarge);
+        return Err(UpstreamResponseBodyError::TooLarge);
     }
     body.extend_from_slice(chunk);
     Ok(())
 }
 
-async fn read_protected_response_body(
+async fn read_upstream_response_body(
     response: &mut reqwest::Response,
     limit: usize,
-) -> Result<Option<Vec<u8>>, ProtectedResponseBodyError> {
+) -> Result<Option<Vec<u8>>, UpstreamResponseBodyError> {
     let content_length = response.content_length();
     if content_length.is_some_and(|length| length > limit as u64) {
-        return Err(ProtectedResponseBodyError::TooLarge);
+        return Err(UpstreamResponseBodyError::TooLarge);
     }
 
     let mut body = Vec::with_capacity(content_length.unwrap_or(0) as usize);
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(ProtectedResponseBodyError::Read)?
+        .map_err(UpstreamResponseBodyError::Read)?
     {
-        append_protected_response_chunk(&mut body, &chunk, limit)?;
+        append_upstream_response_chunk(&mut body, &chunk, limit)?;
     }
 
     Ok((!body.is_empty()).then_some(body))
@@ -548,22 +569,21 @@ async fn forward_protected_http(
         return failure("unsupported upstream content encoding");
     }
     let headers = response_headers(response.headers());
-    let body = match read_protected_response_body(&mut response, MAX_PROTECTED_RESPONSE_BODY_BYTES)
-        .await
-    {
-        Ok(body) => body,
-        Err(ProtectedResponseBodyError::TooLarge) => {
-            warn!(
-                limit = MAX_PROTECTED_RESPONSE_BODY_BYTES,
-                "protected upstream response exceeded size limit"
-            );
-            return failure("upstream response too large");
-        }
-        Err(ProtectedResponseBodyError::Read(error)) => {
-            warn!(%error, "failed reading protected upstream response");
-            return failure("upstream response unavailable");
-        }
-    };
+    let body =
+        match read_upstream_response_body(&mut response, MAX_UPSTREAM_RESPONSE_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(UpstreamResponseBodyError::TooLarge) => {
+                warn!(
+                    limit = MAX_UPSTREAM_RESPONSE_BODY_BYTES,
+                    "protected upstream response exceeded size limit"
+                );
+                return failure("upstream response too large");
+            }
+            Err(UpstreamResponseBodyError::Read(error)) => {
+                warn!(%error, "failed reading protected upstream response");
+                return failure("upstream response unavailable");
+            }
+        };
     ApplicationResponse {
         status,
         headers,
@@ -608,7 +628,7 @@ async fn forward_unencrypted(state: &AppState, request: Request) -> Response {
             builder = builder.header(name.clone(), value.clone());
         }
     }
-    let upstream = match builder.body(body).send().await {
+    let mut upstream = match builder.body(body).send().await {
         Ok(response) => response,
         Err(error) => {
             error!(%error, "unencrypted upstream request failed");
@@ -617,10 +637,21 @@ async fn forward_unencrypted(state: &AppState, request: Request) -> Response {
     };
     let status = upstream.status();
     let headers = upstream.headers().clone();
-    let body = match upstream.bytes().await {
-        Ok(body) => body,
-        Err(_) => return (StatusCode::BAD_GATEWAY, "upstream unavailable").into_response(),
-    };
+    let body =
+        match read_upstream_response_body(&mut upstream, MAX_UPSTREAM_RESPONSE_BODY_BYTES).await {
+            Ok(body) => body.unwrap_or_default(),
+            Err(UpstreamResponseBodyError::TooLarge) => {
+                error!(
+                    limit = MAX_UPSTREAM_RESPONSE_BODY_BYTES,
+                    "unencrypted upstream response exceeded size limit"
+                );
+                return (StatusCode::BAD_GATEWAY, "upstream response too large").into_response();
+            }
+            Err(UpstreamResponseBodyError::Read(error)) => {
+                error!(%error, "failed reading unencrypted upstream response");
+                return (StatusCode::BAD_GATEWAY, "upstream unavailable").into_response();
+            }
+        };
     let mut response = match Response::builder().status(status).body(Body::from(body)) {
         Ok(response) => response,
         Err(_) => return ApiError::Internal.into_response(),
@@ -758,6 +789,7 @@ mod tests {
     };
     use axum::body::to_bytes;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
     use x_wing::{Ciphertext, Decapsulate, Kem, KeyExport, XWingKem};
     use x25519_dalek::{EphemeralSecret, PublicKey};
@@ -773,6 +805,68 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         url::Url::parse(&format!("http://{address}")).unwrap()
+    }
+
+    async fn spawn_chunked_upstream(
+        chunks: Vec<Vec<u8>>,
+        stall_after_first_chunk: Option<Duration>,
+    ) -> url::Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let chunks = Arc::new(chunks);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let chunks = Arc::clone(&chunks);
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    if stream.read(&mut request).await.is_err()
+                        || stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                            )
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+
+                    for (index, chunk) in chunks.iter().enumerate() {
+                        let chunk_header = format!("{:x}\r\n", chunk.len());
+                        if stream.write_all(chunk_header.as_bytes()).await.is_err()
+                            || stream.write_all(chunk).await.is_err()
+                            || stream.write_all(b"\r\n").await.is_err()
+                        {
+                            return;
+                        }
+                        if index == 0
+                            && let Some(stall) = stall_after_first_chunk
+                        {
+                            tokio::time::sleep(stall).await;
+                        }
+                    }
+                    let _ = stream.write_all(b"0\r\n\r\n").await;
+                });
+            }
+        });
+        url::Url::parse(&format!("http://{address}")).unwrap()
+    }
+
+    fn test_app_state(upstream_url: url::Url, http_client: Client) -> AppState {
+        AppState {
+            attestation: Arc::new(FakeAttestationProvider::default()),
+            attestation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ATTESTATIONS)),
+            kem_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_KEY_EXCHANGES)),
+            sessions: Arc::new(SessionStore::default()),
+            key_exchange: KeyExchangeSuite::X25519,
+            http_client,
+            upstream_url,
+            protected_upstream: Arc::new(CountingUpstream {
+                executions: Arc::new(AtomicUsize::new(0)),
+            }),
+        }
     }
 
     impl ProtectedUpstream for CountingUpstream {
@@ -798,16 +892,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protected_response_body_is_bounded() {
+    async fn upstream_response_body_is_bounded() {
         let mut accepted = reqwest::Response::from(
             axum::http::Response::builder()
                 .body(reqwest::Body::from(vec![1, 2, 3, 4]))
                 .unwrap(),
         );
         assert_eq!(
-            read_protected_response_body(&mut accepted, 4)
-                .await
-                .unwrap(),
+            read_upstream_response_body(&mut accepted, 4).await.unwrap(),
             Some(vec![1, 2, 3, 4])
         );
 
@@ -817,17 +909,174 @@ mod tests {
                 .unwrap(),
         );
         assert!(matches!(
-            read_protected_response_body(&mut rejected, 4).await,
-            Err(ProtectedResponseBodyError::TooLarge)
+            read_upstream_response_body(&mut rejected, 4).await,
+            Err(UpstreamResponseBodyError::TooLarge)
         ));
 
         let mut streamed = Vec::new();
-        append_protected_response_chunk(&mut streamed, &[1, 2], 4).unwrap();
-        append_protected_response_chunk(&mut streamed, &[3, 4], 4).unwrap();
+        append_upstream_response_chunk(&mut streamed, &[1, 2], 4).unwrap();
+        append_upstream_response_chunk(&mut streamed, &[3, 4], 4).unwrap();
         assert!(matches!(
-            append_protected_response_chunk(&mut streamed, &[5], 4),
-            Err(ProtectedResponseBodyError::TooLarge)
+            append_upstream_response_chunk(&mut streamed, &[5], 4),
+            Err(UpstreamResponseBodyError::TooLarge)
         ));
+    }
+
+    #[tokio::test]
+    async fn upstream_redirects_are_returned_without_following() {
+        let target_hits = Arc::new(AtomicUsize::new(0));
+        let target_counter = Arc::clone(&target_hits);
+        let target = Router::new().route(
+            "/target",
+            axum::routing::get(move || {
+                let target_counter = Arc::clone(&target_counter);
+                async move {
+                    target_counter.fetch_add(1, Ordering::SeqCst);
+                    "redirect target"
+                }
+            }),
+        );
+        let target_url = spawn_test_upstream(target).await;
+        let location = target_url.join("/target").unwrap().to_string();
+        let redirect_location = location.clone();
+        let redirect = Router::new().route(
+            "/redirect",
+            axum::routing::get(move || {
+                let redirect_location = redirect_location.clone();
+                async move {
+                    Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header(header::LOCATION, redirect_location)
+                        .body(Body::empty())
+                        .unwrap()
+                }
+            }),
+        );
+        let upstream_url = spawn_test_upstream(redirect).await;
+        let client = enclave_http_client().unwrap();
+
+        let protected = forward_protected_http(
+            &client,
+            &upstream_url,
+            ApplicationRequest {
+                method: "GET".to_string(),
+                path: "/redirect".to_string(),
+                headers: HashMap::new(),
+                body: None,
+            },
+        )
+        .await;
+        assert_eq!(protected.status, StatusCode::FOUND.as_u16());
+        assert_eq!(
+            protected.headers.get(header::LOCATION.as_str()),
+            Some(&location)
+        );
+
+        let state = test_app_state(upstream_url, client);
+        let plaintext = forward_unencrypted(
+            &state,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/redirect")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(plaintext.status(), StatusCode::FOUND);
+        assert_eq!(
+            plaintext.headers().get(header::LOCATION),
+            Some(&HeaderValue::from_str(&location).unwrap())
+        );
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn upstream_timeouts_fail_both_forwarding_paths() {
+        let upstream = Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                "late response"
+            }),
+        );
+        let upstream_url = spawn_test_upstream(upstream).await;
+        let timeout = Duration::from_millis(50);
+        let client = enclave_http_client_with_timeouts(timeout, timeout, timeout).unwrap();
+
+        let protected = forward_protected_http(
+            &client,
+            &upstream_url,
+            ApplicationRequest {
+                method: "GET".to_string(),
+                path: "/slow".to_string(),
+                headers: HashMap::new(),
+                body: None,
+            },
+        )
+        .await;
+        assert_eq!(protected.status, StatusCode::BAD_GATEWAY.as_u16());
+        assert_eq!(protected.error.as_deref(), Some("upstream unavailable"));
+
+        let state = test_app_state(upstream_url, client);
+        let plaintext = forward_unencrypted(
+            &state,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/slow")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(plaintext.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            to_bytes(plaintext.into_body(), 1024).await.unwrap(),
+            "upstream unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_idle_read_timeouts_fail_both_forwarding_paths() {
+        let upstream_url =
+            spawn_chunked_upstream(vec![vec![0], vec![1]], Some(Duration::from_millis(250))).await;
+        let client = enclave_http_client_with_timeouts(
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        let protected = forward_protected_http(
+            &client,
+            &upstream_url,
+            ApplicationRequest {
+                method: "GET".to_string(),
+                path: "/stalled".to_string(),
+                headers: HashMap::new(),
+                body: None,
+            },
+        )
+        .await;
+        assert_eq!(protected.status, StatusCode::BAD_GATEWAY.as_u16());
+        assert_eq!(
+            protected.error.as_deref(),
+            Some("upstream response unavailable")
+        );
+
+        let state = test_app_state(upstream_url, client);
+        let plaintext = forward_unencrypted(
+            &state,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/stalled")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(plaintext.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            to_bytes(plaintext.into_body(), 1024).await.unwrap(),
+            "upstream unavailable"
+        );
     }
 
     #[tokio::test]
@@ -1496,6 +1745,10 @@ mod tests {
                 response.headers().get(header::ACCESS_CONTROL_ALLOW_HEADERS),
                 Some(&HeaderValue::from_static("content-type"))
             );
+            assert_eq!(
+                response.headers().get(header::ACCESS_CONTROL_MAX_AGE),
+                Some(&HeaderValue::from_static("600"))
+            );
 
             let response = app
                 .clone()
@@ -1752,6 +2005,81 @@ mod tests {
         assert_eq!(
             to_bytes(response.into_body(), 1024).await.unwrap(),
             "first,second"
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_forwarding_rejects_declared_oversized_response() {
+        let upstream = Router::new().route(
+            "/oversized",
+            axum::routing::get(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_LENGTH, MAX_UPSTREAM_RESPONSE_BODY_BYTES + 1)
+                    .body(Body::from(vec![0u8; MAX_UPSTREAM_RESPONSE_BODY_BYTES + 1]))
+                    .unwrap()
+            }),
+        );
+        let upstream_url = spawn_test_upstream(upstream).await;
+        let state = test_app_state(upstream_url, enclave_http_client().unwrap());
+
+        let response = forward_unencrypted(
+            &state,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/oversized")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap(),
+            "upstream response too large"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_oversized_responses_fail_both_forwarding_paths() {
+        let upstream_url = spawn_chunked_upstream(
+            vec![vec![0u8; MAX_UPSTREAM_RESPONSE_BODY_BYTES], vec![0]],
+            None,
+        )
+        .await;
+        let client = enclave_http_client().unwrap();
+
+        let protected = forward_protected_http(
+            &client,
+            &upstream_url,
+            ApplicationRequest {
+                method: "GET".to_string(),
+                path: "/oversized".to_string(),
+                headers: HashMap::new(),
+                body: None,
+            },
+        )
+        .await;
+        assert_eq!(protected.status, StatusCode::BAD_GATEWAY.as_u16());
+        assert_eq!(
+            protected.error.as_deref(),
+            Some("upstream response too large")
+        );
+
+        let state = test_app_state(upstream_url, client);
+        let plaintext = forward_unencrypted(
+            &state,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/oversized")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(plaintext.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            to_bytes(plaintext.into_body(), 1024).await.unwrap(),
+            "upstream response too large"
         );
     }
 

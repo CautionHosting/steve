@@ -155,6 +155,13 @@ plaintext fallback routes retain the upstream application's CORS policy.
 Wildcard origins are rejected; production deployments must list each allowed
 browser origin explicitly.
 
+STEVE does not follow redirects from the enclave-local application; it returns
+the upstream `3xx` response to the client. Upstream connections use a 5-second
+connect timeout, a 30-second idle-read timeout, and a 5-minute total timeout.
+Protected and plaintext upstream responses are both limited to 33,554,432
+bytes; timeout, read, or size failures return an upstream failure without an
+automatic retry.
+
 Protected application transactions default to a 30-second deadline
 (`requestTimeoutMs` accepts 1,000 through 300,000 milliseconds). Transport
 failures do not reset an otherwise valid secure session. The SDK does not
