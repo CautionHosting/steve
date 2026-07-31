@@ -33,12 +33,13 @@ test-e2e-nitro-rust:
 	./scripts/test-e2e-nitro.sh rust
 
 verify-dev:
-	$(MAKE) test-rust
+	$(MAKE) test
 	$(MAKE) test-production-fast
 	$(MAKE) test-e2e
 
 verify-release:
-	$(MAKE) test-rust
+	$(MAKE) test
+	$(MAKE) test-wasm
 	$(MAKE) test-production
 	$(MAKE) test-e2e
 

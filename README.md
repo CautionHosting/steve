@@ -10,8 +10,8 @@ See the [normative STEVE v2 protocol specification](docs/steve-v2-protocol.md).
 > v2 supports process-pinned X25519 or X-Wing draft-10 sessions and binds the
 > selected suite into the transcript and Nitro evidence. X-Wing protects
 > session secrecy independently of expected-deployment identity, but does not
-> provide trusted first-load bootstrap, expected-PCR delivery, or fail-closed
-> plaintext routing. The native Rust SDK requires independently supplied
+> provide trusted first-load bootstrap or expected-PCR delivery. STEVE rejects
+> plaintext application routing by default. The native Rust SDK requires independently supplied
 > expected PCR0/1/2 values; the browser SDK does not yet enforce expected PCRs.
 
 ## Architecture
@@ -84,6 +84,12 @@ bound per session.
 X25519. The suite is fixed for the process lifetime; changing it requires a
 new enclave build/deployment.
 
+STEVE rejects non-E2P application requests by default with
+`403 {"error":"e2e_required"}`. Set
+`STEVE_ALLOW_PLAINTEXT_FALLBACK=true` only for deployments that intentionally
+retain legacy plaintext forwarding. The value must be exactly `true` or
+`false`; invalid values fail startup.
+
 ## Security Properties
 
 - **E2E Encryption**: Data encrypted client ↔ enclave (AES-256-GCM)
@@ -96,7 +102,7 @@ new enclave build/deployment.
 Current limitations:
 
 - Expected PCR values are not enforced by the browser client.
-- Plaintext requests are still forwarded when the service worker is absent; fail-closed routing is deferred.
+- Deployments must keep the application upstream private; fail-closed STEVE routing does not protect a separately exposed app port.
 - The first-load service-worker bootstrap is not independently trusted.
 - A host can route a client to another legitimate enclave using the same pinned suite unless expected deployment identity is supplied independently.
 - Browser WASM must not be described as inherently constant-time; its supported-browser side-channel posture requires independent review.
@@ -151,7 +157,7 @@ application plaintext.
 
 Set `STEVE_CORS_ORIGINS` to the browser application's origin (for example,
 `http://localhost:3000`). STEVE applies that policy only to `/e2p/v2/*`;
-plaintext fallback routes retain the upstream application's CORS policy.
+explicitly enabled plaintext fallback routes retain the upstream application's CORS policy.
 Wildcard origins are rejected; production deployments must list each allowed
 browser origin explicitly.
 

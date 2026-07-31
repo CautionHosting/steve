@@ -273,6 +273,7 @@ async fn test_server(
                 KeyExchangeSuite::X25519 => steve::protocol::KeyExchangeSuite::X25519,
                 KeyExchangeSuite::XWingDraft10 => steve::protocol::KeyExchangeSuite::XWingDraft10,
             },
+            allow_plaintext_fallback: false,
         },
         provider,
     )

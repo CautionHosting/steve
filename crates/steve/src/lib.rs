@@ -52,6 +52,7 @@ pub struct ServerConfig {
     pub upstream_url: url::Url,
     pub cors_origins: Option<String>,
     pub key_exchange: KeyExchangeSuite,
+    pub allow_plaintext_fallback: bool,
 }
 
 /// Enclave metadata surfaced by bootproofd as attestation `user_data`.
@@ -100,7 +101,29 @@ impl ServerConfig {
             upstream_url: url::Url::parse(&upstream)?,
             cors_origins: std::env::var("STEVE_CORS_ORIGINS").ok(),
             key_exchange: configured_key_exchange()?,
+            allow_plaintext_fallback: configured_plaintext_fallback()?,
         })
+    }
+}
+
+fn configured_plaintext_fallback() -> Result<bool, BoxError> {
+    parse_configured_plaintext_fallback(std::env::var("STEVE_ALLOW_PLAINTEXT_FALLBACK"))
+}
+
+fn parse_configured_plaintext_fallback(
+    configured: Result<String, std::env::VarError>,
+) -> Result<bool, BoxError> {
+    match configured {
+        Ok(value) if value == "true" => Ok(true),
+        Ok(value) if value == "false" => Ok(false),
+        Ok(value) => Err(format!(
+            "invalid STEVE_ALLOW_PLAINTEXT_FALLBACK value {value:?}; expected true or false"
+        )
+        .into()),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("STEVE_ALLOW_PLAINTEXT_FALLBACK must be valid Unicode".into())
+        }
     }
 }
 
@@ -129,6 +152,7 @@ struct AppState {
     kem_slots: Arc<Semaphore>,
     sessions: Arc<SessionStore>,
     key_exchange: KeyExchangeSuite,
+    allow_plaintext_fallback: bool,
     http_client: Client,
     upstream_url: url::Url,
     protected_upstream: Arc<dyn ProtectedUpstream>,
@@ -206,6 +230,7 @@ fn build_router_with_components_and_store(
         kem_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_KEY_EXCHANGES)),
         sessions,
         key_exchange: config.key_exchange,
+        allow_plaintext_fallback: config.allow_plaintext_fallback,
         http_client: enclave_http_client()?,
         upstream_url: config.upstream_url,
         protected_upstream,
@@ -596,15 +621,26 @@ async fn fallback(State(state): State<Arc<AppState>>, request: Request) -> Respo
     if request.uri().path().starts_with("/e2p/") {
         return (StatusCode::NOT_FOUND, "E2P endpoint unavailable").into_response();
     }
-    forward_unencrypted(&state, request).await
+    if state.allow_plaintext_fallback {
+        forward_unencrypted(&state, request).await
+    } else {
+        e2e_required()
+    }
 }
 
 async fn e2p_not_found() -> Response {
     (StatusCode::NOT_FOUND, "E2P endpoint unavailable").into_response()
 }
 
-// Item 3 (fail-closed enforcement) is intentionally deferred. Until then, requests that are not
-// handled by the v2 service worker retain STEVE's existing plaintext forwarding behavior.
+fn e2e_required() -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(r#"{"error":"e2e_required"}"#))
+        .expect("static E2E-required response must be valid")
+}
+
 async fn forward_unencrypted(state: &AppState, request: Request) -> Response {
     let method = request.method().clone();
     let path = request
@@ -869,6 +905,7 @@ mod tests {
             kem_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_KEY_EXCHANGES)),
             sessions: Arc::new(SessionStore::default()),
             key_exchange: KeyExchangeSuite::X25519,
+            allow_plaintext_fallback: false,
             http_client,
             upstream_url,
             protected_upstream: Arc::new(CountingUpstream {
@@ -1248,6 +1285,7 @@ mod tests {
                 upstream_url: url::Url::parse("http://127.0.0.1:8083").unwrap(),
                 cors_origins: None,
                 key_exchange: KeyExchangeSuite::X25519,
+                allow_plaintext_fallback: false,
             },
             provider,
             protected_upstream,
@@ -1438,6 +1476,7 @@ mod tests {
                 upstream_url: url::Url::parse("http://127.0.0.1:8083").unwrap(),
                 cors_origins: None,
                 key_exchange: KeyExchangeSuite::X25519,
+                allow_plaintext_fallback: false,
             },
             provider,
             Arc::new(CountingUpstream {
@@ -1483,6 +1522,7 @@ mod tests {
             kem_slots,
             sessions: Arc::clone(&sessions),
             key_exchange: KeyExchangeSuite::X25519,
+            allow_plaintext_fallback: false,
             http_client: enclave_http_client().unwrap(),
             upstream_url: url::Url::parse("http://127.0.0.1:8083").unwrap(),
             protected_upstream: Arc::new(CountingUpstream {
@@ -1523,6 +1563,7 @@ mod tests {
                 upstream_url: url::Url::parse("http://127.0.0.1:8083").unwrap(),
                 cors_origins: None,
                 key_exchange: KeyExchangeSuite::XWingDraft10,
+                allow_plaintext_fallback: false,
             },
             provider,
             Arc::new(CountingUpstream {
@@ -1641,6 +1682,7 @@ mod tests {
                 upstream_url: url::Url::parse("http://127.0.0.1:8083").unwrap(),
                 cors_origins: None,
                 key_exchange: KeyExchangeSuite::XWingDraft10,
+                allow_plaintext_fallback: false,
             },
             fake.clone(),
             Arc::new(CountingUpstream {
@@ -1737,13 +1779,17 @@ mod tests {
         assert!(fake.last_call().is_none());
     }
 
-    fn try_test_router(cors_origins: Option<String>) -> Result<Router, BoxError> {
+    fn try_test_router_with_plaintext(
+        cors_origins: Option<String>,
+        allow_plaintext_fallback: bool,
+    ) -> Result<Router, BoxError> {
         build_router_with_components(
             ServerConfig {
                 listen_addr: "127.0.0.1:0".to_string(),
                 upstream_url: url::Url::parse("http://127.0.0.1:8083").unwrap(),
                 cors_origins,
                 key_exchange: KeyExchangeSuite::X25519,
+                allow_plaintext_fallback,
             },
             Arc::new(FakeAttestationProvider::default()),
             Arc::new(CountingUpstream {
@@ -1752,8 +1798,16 @@ mod tests {
         )
     }
 
+    fn try_test_router(cors_origins: Option<String>) -> Result<Router, BoxError> {
+        try_test_router_with_plaintext(cors_origins, false)
+    }
+
     fn test_router(cors_origins: Option<String>) -> Router {
         try_test_router(cors_origins).unwrap()
+    }
+
+    fn plaintext_test_router(cors_origins: Option<String>) -> Router {
+        try_test_router_with_plaintext(cors_origins, true).unwrap()
     }
 
     #[test]
@@ -1768,6 +1822,144 @@ mod tests {
         );
         assert!(parse_configured_key_exchange(Ok("x25519".to_string())).is_err());
         assert!(parse_configured_key_exchange(Ok(String::new())).is_err());
+    }
+
+    #[test]
+    fn plaintext_fallback_configuration_is_strict_and_defaults_closed() {
+        assert!(!parse_configured_plaintext_fallback(Err(std::env::VarError::NotPresent)).unwrap());
+        assert!(parse_configured_plaintext_fallback(Ok("true".to_string())).unwrap());
+        assert!(!parse_configured_plaintext_fallback(Ok("false".to_string())).unwrap());
+
+        for invalid in ["", "TRUE", "False", "1", "yes", " true"] {
+            assert!(
+                parse_configured_plaintext_fallback(Ok(invalid.to_string())).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+            let error = parse_configured_plaintext_fallback(Err(std::env::VarError::NotUnicode(
+                OsString::from_vec(vec![0xff]),
+            )))
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "STEVE_ALLOW_PLAINTEXT_FALLBACK must be valid Unicode"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_requests_fail_closed_without_contacting_upstream() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let observed_hits = Arc::clone(&upstream_hits);
+        let upstream = Router::new().fallback(axum::routing::any(move || {
+            let observed_hits = Arc::clone(&observed_hits);
+            async move {
+                observed_hits.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }
+        }));
+        let upstream_url = spawn_test_upstream(upstream).await;
+        let app = build_router_with_components(
+            ServerConfig {
+                listen_addr: "127.0.0.1:0".to_string(),
+                upstream_url,
+                cors_origins: None,
+                key_exchange: KeyExchangeSuite::X25519,
+                allow_plaintext_fallback: false,
+            },
+            Arc::new(FakeAttestationProvider::default()),
+            Arc::new(CountingUpstream {
+                executions: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+        .unwrap();
+
+        let requests = [
+            Request::builder()
+                .method(Method::GET)
+                .uri("/data?query=secret")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::HEAD)
+                .uri("/data")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/upload")
+                .body(Body::from(vec![0u8; MAX_UNENCRYPTED_BODY_BYTES + 1]))
+                .unwrap(),
+        ];
+
+        for request in requests {
+            let method = request.method().clone();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static("application/json"))
+            );
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL),
+                Some(&HeaderValue::from_static("no-store"))
+            );
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            if method != Method::HEAD {
+                assert_eq!(body, r#"{"error":"e2e_required"}"#);
+            }
+        }
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn e2p_routes_are_independent_of_plaintext_fallback() {
+        let denied = test_router(None);
+        let allowed = plaintext_test_router(None);
+
+        for app in [denied, allowed] {
+            for endpoint in ["/e2p/v2/session", "/e2p/v2/confirm", "/e2p/v2/request"] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri(endpoint)
+                            .header(header::CONTENT_TYPE, "application/cbor")
+                            .body(Body::from("invalid-cbor"))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{endpoint}");
+                assert_eq!(
+                    to_bytes(response.into_body(), 1024).await.unwrap(),
+                    r#"{"error":"protocol_error"}"#,
+                    "{endpoint}"
+                );
+            }
+
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/e2p/v2/unknown")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                to_bytes(response.into_body(), 1024).await.unwrap(),
+                "E2P endpoint unavailable"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1890,6 +2082,7 @@ mod tests {
                 upstream_url: url::Url::parse(&format!("http://{address}")).unwrap(),
                 cors_origins: Some("https://app.example".to_string()),
                 key_exchange: KeyExchangeSuite::X25519,
+                allow_plaintext_fallback: true,
             },
             Arc::new(FakeAttestationProvider::default()),
             Arc::new(CountingUpstream {
@@ -1946,6 +2139,7 @@ mod tests {
                 upstream_url,
                 cors_origins: None,
                 key_exchange: KeyExchangeSuite::X25519,
+                allow_plaintext_fallback: true,
             },
             Arc::new(FakeAttestationProvider::default()),
             Arc::new(CountingUpstream {
@@ -2013,6 +2207,7 @@ mod tests {
                 upstream_url,
                 cors_origins: None,
                 key_exchange: KeyExchangeSuite::X25519,
+                allow_plaintext_fallback: true,
             },
             Arc::new(FakeAttestationProvider::default()),
             Arc::new(CountingUpstream {
@@ -2179,7 +2374,7 @@ mod tests {
 
     #[tokio::test]
     async fn passthrough_rejects_oversized_body() {
-        let app = test_router(None);
+        let app = plaintext_test_router(None);
         let response = app
             .oneshot(
                 Request::builder()

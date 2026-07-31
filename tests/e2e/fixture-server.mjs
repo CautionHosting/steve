@@ -14,6 +14,7 @@ const supportedKeyExchanges = new Set(['X25519', 'XWING-DRAFT10']);
 const profiles = new Set(['local', 'nitro']);
 const maxEchoBytes = 1024 * 1024;
 const maxDelayMs = 10_000;
+const upstreamRequestCounts = new Map();
 const fixtureContract = Object.freeze({
   contract: 'steve-test-fixture/v1',
   capabilities: ['echo', 'unauthorized', 'delay', 'compressed'],
@@ -96,6 +97,8 @@ function logRequest(service, request, response) {
 const upstream = createServer(async (request, response) => {
   logRequest('upstream', request, response);
   const url = new URL(request.url, 'http://fixture:8083');
+  const countKey = `${request.method} ${url.pathname}`;
+  upstreamRequestCounts.set(countKey, (upstreamRequestCounts.get(countKey) || 0) + 1);
 
   if (request.method === 'GET' && url.pathname === '/health') {
     respond(response, 200, 'ok\n');
@@ -213,6 +216,16 @@ const web = createServer(async (request, response) => {
   const url = new URL(request.url, 'http://127.0.0.1:3000');
   if (url.pathname === '/__steve_e2e_health') {
     respond(response, 200, 'ok\n');
+    return;
+  }
+  if (url.pathname === '/__steve_e2e_upstream_count') {
+    const method = url.searchParams.get('method');
+    const requestPath = url.searchParams.get('path');
+    if (!method || !requestPath || !requestPath.startsWith('/')) {
+      respond(response, 400, 'method and absolute path are required\n');
+      return;
+    }
+    respond(response, 200, `${upstreamRequestCounts.get(`${method} ${requestPath}`) || 0}\n`);
     return;
   }
   if (url.pathname === '/') {

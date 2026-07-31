@@ -7,6 +7,7 @@ PROJECT_NAME=steve-e2e
 ACTION=${1:-test}
 REQUESTED_KEY_EXCHANGE=${STEVE_KEY_EXCHANGE:-}
 STEVE_KEY_EXCHANGE=${REQUESTED_KEY_EXCHANGE:-X25519}
+STEVE_ALLOW_PLAINTEXT_FALLBACK=${STEVE_ALLOW_PLAINTEXT_FALLBACK:-false}
 SERVICES_RUNNING=0
 
 validate_key_exchange() {
@@ -20,7 +21,15 @@ validate_key_exchange() {
 }
 
 validate_key_exchange "$STEVE_KEY_EXCHANGE"
+case "$STEVE_ALLOW_PLAINTEXT_FALLBACK" in
+  true|false) ;;
+  *)
+    echo "STEVE_ALLOW_PLAINTEXT_FALLBACK must be exactly true or false" >&2
+    exit 2
+    ;;
+esac
 export STEVE_KEY_EXCHANGE
+export STEVE_ALLOW_PLAINTEXT_FALLBACK
 
 compose() {
   docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" "$@"
@@ -38,7 +47,11 @@ prepare() {
 wait_for_services() {
   attempts=0
   until curl --fail --silent http://127.0.0.1:3000/local/ >/dev/null \
-    && curl --fail --silent http://127.0.0.1:49500/health >/dev/null; do
+    && [ "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      --request POST \
+      --header 'Content-Type: application/cbor' \
+      --data-binary 'not-cbor' \
+      http://127.0.0.1:49500/e2p/v2/session || true)" = "400" ]; do
     attempts=$((attempts + 1))
     if [ "$attempts" -ge 90 ]; then
       compose logs
@@ -51,7 +64,9 @@ wait_for_services() {
 
 start_suite() {
   STEVE_KEY_EXCHANGE=$1
+  STEVE_ALLOW_PLAINTEXT_FALLBACK=$2
   export STEVE_KEY_EXCHANGE
+  export STEVE_ALLOW_PLAINTEXT_FALLBACK
   SERVICES_RUNNING=1
   compose up --detach --no-build --force-recreate
   wait_for_services
@@ -97,9 +112,32 @@ run_native_sdk() {
 run_suite() {
   suite=$1
   echo "Running STEVE E2E suite: $suite"
-  start_suite "$suite"
+  start_suite "$suite" false
+  plaintext_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    http://127.0.0.1:49500/plaintext-probe)
+  if [ "$plaintext_status" != "403" ]; then
+    echo "plaintext request returned HTTP $plaintext_status; expected 403" >&2
+    return 1
+  fi
+  upstream_count=$(curl --fail --silent \
+    'http://127.0.0.1:3000/__steve_e2e_upstream_count?method=GET&path=/plaintext-probe')
+  if [ "$upstream_count" -ne 0 ]; then
+    echo "plaintext request reached the upstream $upstream_count time(s)" >&2
+    return 1
+  fi
   run_playwright
   run_native_sdk
+  stop
+}
+
+run_plaintext_compatibility() {
+  echo "Running explicit plaintext fallback compatibility probe"
+  start_suite X25519 true
+  response=$(curl --fail --silent http://127.0.0.1:49500/health)
+  if [ "$response" != "ok" ]; then
+    echo "plaintext compatibility response differed from the upstream" >&2
+    return 1
+  fi
   stop
 }
 
@@ -116,10 +154,11 @@ case "$ACTION" in
         run_suite "$suite"
       done
     fi
+    run_plaintext_compatibility
     ;;
   up)
     prepare
-    start_suite "$STEVE_KEY_EXCHANGE"
+    start_suite "$STEVE_KEY_EXCHANGE" "$STEVE_ALLOW_PLAINTEXT_FALLBACK"
     echo "STEVE local synthetic UI: http://127.0.0.1:3000/local/"
     echo "STEVE production Nitro UI: http://127.0.0.1:3000/nitro/"
     ;;

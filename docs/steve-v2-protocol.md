@@ -68,7 +68,6 @@ STEVE v2 does not itself provide:
 - trusted delivery of the initial browser code, service worker, WASM, expected
   PCR values, or suite configuration;
 - server-side authorization of a browser origin or client-supplied context;
-- fail-closed routing for requests that are not intercepted by a STEVE v2 client;
 - confidentiality of record sizes, timing, endpoints, session identifiers, or
   other transport metadata;
 - availability against a host, network, or resource-exhaustion attacker;
@@ -430,9 +429,10 @@ protocol.
   bytes, 4,096 bytes, and 33,619,968 bytes respectively.
 - `XWING-DRAFT10` uses self-hosted RustCrypto WASM whose build digest is checked
   before initialization. There is no cryptographic fallback.
-- Service-worker interception is not a fail-closed routing boundary. A
-  compromised first load or host can replace the page, worker, configuration,
-  or WASM before those components enforce STEVE v2.
+- Service-worker interception is not itself a fail-closed routing boundary.
+  STEVE rejects plaintext application requests by default, but a compromised
+  first load or host can still replace the page, worker, configuration, or
+  WASM before those components enforce the expected deployment policy.
 
 ### 10.2 Native Rust SDK profile
 
