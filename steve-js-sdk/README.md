@@ -126,7 +126,13 @@ callers must apply their own idempotency policy before retrying.
 
 The three v2 protocol endpoints are fixed and cannot be reconfigured; the
 `/e2p/` prefix is always kept in `excludePrefixes` even if the option is
-overridden, so the worker can never intercept its own protocol traffic. Passthrough rules only control service-worker interception. STEVE rejects plaintext application traffic by default; deployments that intentionally need legacy forwarding must set `STEVE_ALLOW_PLAINTEXT_FALLBACK=true`.
+overridden, so the worker can never intercept its own protocol traffic.
+Passthrough rules only control service-worker interception. STEVE rejects
+plaintext application traffic by default while forwarding the default
+root-scope bootstrap (`GET /` and safe-method requests for the fixed bootstrap
+assets). Custom scopes or passthrough paths need matching narrow ingress routes.
+Deployments that intentionally need legacy application forwarding must set
+`STEVE_ALLOW_PLAINTEXT_FALLBACK=true`.
 
 STEVE applies its configured CORS policy only to `/e2p/v2/*`. Plaintext
 fallback routes retain the upstream application's CORS policy.

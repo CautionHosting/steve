@@ -88,7 +88,12 @@ STEVE rejects non-E2P application requests by default with
 `403 {"error":"e2e_required"}`. Set
 `STEVE_ALLOW_PLAINTEXT_FALLBACK=true` only for deployments that intentionally
 retain legacy plaintext forwarding. The value must be exactly `true` or
-`false`; invalid values fail startup.
+`false`; invalid values fail startup. The default root-scope browser bootstrap
+remains available: `GET /` and `GET`/`HEAD` for `/enclave-sw.js`,
+`/register.js`, `/attestation-widget.js`, and
+`/xwing/steve_xwing_wasm_bg.wasm` are forwarded as public bootstrap material.
+Custom service-worker scopes or bootstrap paths require matching narrow ingress
+routes; they do not enable general plaintext application forwarding.
 
 ## Security Properties
 

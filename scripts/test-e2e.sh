@@ -113,6 +113,11 @@ run_suite() {
   suite=$1
   echo "Running STEVE E2E suite: $suite"
   start_suite "$suite" false
+  bootstrap_response=$(curl --fail --silent http://127.0.0.1:49500/)
+  if [ "$bootstrap_response" != "steve nitro test app" ]; then
+    echo "default bootstrap response differed from the upstream" >&2
+    return 1
+  fi
   plaintext_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
     http://127.0.0.1:49500/plaintext-probe)
   if [ "$plaintext_status" != "403" ]; then

@@ -433,6 +433,9 @@ protocol.
   STEVE rejects plaintext application requests by default, but a compromised
   first load or host can still replace the page, worker, configuration, or
   WASM before those components enforce the expected deployment policy.
+- STEVE forwards only the default root-scope page and fixed bootstrap assets
+  over safe methods while plaintext application fallback is disabled. Custom
+  service-worker scopes require equivalent narrow routing at ingress.
 
 ### 10.2 Native Rust SDK profile
 

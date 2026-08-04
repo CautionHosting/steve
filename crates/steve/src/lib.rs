@@ -33,6 +33,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 const DEFAULT_APP_UPSTREAM: &str = "http://127.0.0.1:8083";
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:49500";
+const PLAINTEXT_BOOTSTRAP_ASSET_PATHS: &[&str] = &[
+    "/enclave-sw.js",
+    "/register.js",
+    "/attestation-widget.js",
+    "/xwing/steve_xwing_wasm_bg.wasm",
+];
 const MAX_ENVELOPE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_UPSTREAM_RESPONSE_BODY_BYTES: usize = MAX_ENVELOPE_BYTES;
 const MAX_UNENCRYPTED_BODY_BYTES: usize = 1024 * 1024;
@@ -621,11 +627,19 @@ async fn fallback(State(state): State<Arc<AppState>>, request: Request) -> Respo
     if request.uri().path().starts_with("/e2p/") {
         return (StatusCode::NOT_FOUND, "E2P endpoint unavailable").into_response();
     }
-    if state.allow_plaintext_fallback {
+    if state.allow_plaintext_fallback || is_plaintext_bootstrap_request(&request) {
         forward_unencrypted(&state, request).await
     } else {
         e2e_required()
     }
+}
+
+fn is_plaintext_bootstrap_request(request: &Request) -> bool {
+    let method = request.method();
+    let path = request.uri().path();
+    (method == Method::GET && path == "/")
+        || ((method == Method::GET || method == Method::HEAD)
+            && PLAINTEXT_BOOTSTRAP_ASSET_PATHS.contains(&path))
 }
 
 async fn e2p_not_found() -> Response {
@@ -1850,6 +1864,78 @@ mod tests {
                 "STEVE_ALLOW_PLAINTEXT_FALLBACK must be valid Unicode"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn fail_closed_allows_only_exact_safe_method_bootstrap_requests() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let observed_hits = Arc::clone(&upstream_hits);
+        let upstream = Router::new().fallback(axum::routing::any(move || {
+            let observed_hits = Arc::clone(&observed_hits);
+            async move {
+                observed_hits.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }
+        }));
+        let upstream_url = spawn_test_upstream(upstream).await;
+        let app = build_router_with_components(
+            ServerConfig {
+                listen_addr: "127.0.0.1:0".to_string(),
+                upstream_url,
+                cors_origins: None,
+                key_exchange: KeyExchangeSuite::X25519,
+                allow_plaintext_fallback: false,
+            },
+            Arc::new(FakeAttestationProvider::default()),
+            Arc::new(CountingUpstream {
+                executions: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+        .unwrap();
+
+        for (method, uri) in [
+            (Method::GET, "/?reload=1"),
+            (Method::GET, "/enclave-sw.js"),
+            (Method::HEAD, "/register.js"),
+            (Method::GET, "/attestation-widget.js"),
+            (Method::HEAD, "/xwing/steve_xwing_wasm_bg.wasm"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{uri}");
+        }
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 5);
+
+        for (method, uri) in [
+            (Method::HEAD, "/"),
+            (Method::POST, "/enclave-sw.js"),
+            (Method::GET, "/nested/enclave-sw.js"),
+            (Method::GET, "/xwing/steve_xwing_wasm_bg.wasm.bak"),
+            (Method::GET, "/api/data"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]
