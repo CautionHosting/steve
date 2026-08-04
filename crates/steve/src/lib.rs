@@ -477,7 +477,7 @@ struct ApplicationRequest {
 #[derive(Debug, Serialize, Deserialize)]
 struct ApplicationResponse {
     status: u16,
-    headers: HashMap<String, String>,
+    headers: Vec<(String, String)>,
     #[serde(with = "serde_bytes")]
     body: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -530,7 +530,7 @@ async fn forward_protected_http(
 ) -> ApplicationResponse {
     let failure = |message: &str| ApplicationResponse {
         status: StatusCode::BAD_GATEWAY.as_u16(),
-        headers: HashMap::new(),
+        headers: Vec::new(),
         body: None,
         error: Some(message.to_string()),
     };
@@ -710,7 +710,7 @@ fn has_unsupported_content_encoding(headers: &HeaderMap) -> bool {
         })
 }
 
-fn response_headers(headers: &HeaderMap) -> HashMap<String, String> {
+fn response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
         .filter(|(name, _)| forwardable_header(name.as_str()))
@@ -807,6 +807,14 @@ mod tests {
         url::Url::parse(&format!("http://{address}")).unwrap()
     }
 
+    fn application_header_values<'a>(headers: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+        headers
+            .iter()
+            .filter(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
+
     async fn spawn_chunked_upstream(
         chunks: Vec<Vec<u8>>,
         stall_after_first_chunk: Option<Duration>,
@@ -875,7 +883,7 @@ mod tests {
             Box::pin(async move {
                 ApplicationResponse {
                     status: StatusCode::CREATED.as_u16(),
-                    headers: HashMap::new(),
+                    headers: Vec::new(),
                     body: request.body,
                     error: None,
                 }
@@ -968,8 +976,8 @@ mod tests {
         .await;
         assert_eq!(protected.status, StatusCode::FOUND.as_u16());
         assert_eq!(
-            protected.headers.get(header::LOCATION.as_str()),
-            Some(&location)
+            application_header_values(&protected.headers, header::LOCATION.as_str()),
+            [location.as_str()]
         );
 
         let state = test_app_state(upstream_url, client);
@@ -1136,8 +1144,56 @@ mod tests {
         .await;
         assert_eq!(identity.status, StatusCode::OK.as_u16());
         assert_eq!(identity.body.as_deref(), Some(b"identity".as_slice()));
-        assert!(!identity.headers.contains_key("content-encoding"));
-        assert!(!identity.headers.contains_key("content-length"));
+        assert!(application_header_values(&identity.headers, "content-encoding").is_empty());
+        assert!(application_header_values(&identity.headers, "content-length").is_empty());
+    }
+
+    #[tokio::test]
+    async fn protected_forwarding_preserves_repeated_response_headers() {
+        let upstream = Router::new().route(
+            "/headers",
+            axum::routing::get(|| async {
+                let mut response = Response::new(Body::empty());
+                response
+                    .headers_mut()
+                    .append("x-repeat", HeaderValue::from_static("one"));
+                response
+                    .headers_mut()
+                    .append("x-repeat", HeaderValue::from_static("two"));
+                response
+                    .headers_mut()
+                    .append(header::SET_COOKIE, HeaderValue::from_static("a=1"));
+                response
+                    .headers_mut()
+                    .append(header::SET_COOKIE, HeaderValue::from_static("b=2"));
+                response
+                    .headers_mut()
+                    .insert(header::CONNECTION, HeaderValue::from_static("close"));
+                response
+            }),
+        );
+        let upstream_url = spawn_test_upstream(upstream).await;
+        let response = forward_protected_http(
+            &enclave_http_client().unwrap(),
+            &upstream_url,
+            ApplicationRequest {
+                method: "GET".to_string(),
+                path: "/headers".to_string(),
+                headers: HashMap::new(),
+                body: None,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            application_header_values(&response.headers, "x-repeat"),
+            ["one", "two"]
+        );
+        assert_eq!(
+            application_header_values(&response.headers, header::SET_COOKIE.as_str()),
+            ["a=1", "b=2"]
+        );
+        assert!(application_header_values(&response.headers, "connection").is_empty());
     }
 
     #[tokio::test]

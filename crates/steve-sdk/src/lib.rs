@@ -934,7 +934,7 @@ struct ApplicationRequest {
 #[derive(Debug, Deserialize)]
 struct ApplicationResponse {
     status: u16,
-    headers: HashMap<String, String>,
+    headers: Vec<(String, String)>,
     #[serde(with = "serde_bytes")]
     body: Option<Vec<u8>>,
     error: Option<String>,
@@ -951,7 +951,7 @@ impl TryFrom<ApplicationResponse> for Response {
             .map_err(|_| Error::InvalidResponseStatus(response.status))?;
         let mut headers = HeaderMap::new();
         for (key, value) in response.headers {
-            headers.insert(HeaderName::try_from(key)?, HeaderValue::try_from(value)?);
+            headers.append(HeaderName::try_from(key)?, HeaderValue::try_from(value)?);
         }
         let body = match (response.body, response.error) {
             (Some(body), _) => body,

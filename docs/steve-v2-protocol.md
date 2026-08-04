@@ -149,7 +149,7 @@ The plaintext protected by an application envelope is a CBOR map.
 | Field | CBOR type | Requirement |
 | --- | --- | --- |
 | `status` | `uint` | HTTP status in the range 200 through 599. |
-| `headers` | map of `tstr` to `tstr` | Zero or more HTTP response header name/value pairs. |
+| `headers` | array of `[tstr, tstr]` pairs | Zero or more HTTP response header name/value pairs. Repeated names remain separate entries in upstream order. |
 | `body` | `bstr` or `null` | Response body, or `null` when absent. |
 | `error` | `tstr` or absent | Optional forwarding error. When `body` is absent, clients expose this as an error body. |
 
@@ -157,6 +157,9 @@ STEVE filters connection-specific and unsafe forwarding headers. Its protected
 upstream response-body limit is 33,554,432 bytes. Because CBOR and AEAD add
 overhead, the maximum usable application body is smaller than the enclosing
 message limit.
+
+The native SDK preserves repeated response headers. Browser clients remain
+subject to Fetch restrictions, including its special handling of `Set-Cookie`.
 
 ### 2.5 Protocol errors
 

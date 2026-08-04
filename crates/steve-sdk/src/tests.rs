@@ -786,6 +786,30 @@ async fn signed_eval_server_round_trip_and_rotation() {
     assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 2);
 }
 
+#[test]
+fn application_response_preserves_repeated_headers() {
+    let response = Response::try_from(ApplicationResponse {
+        status: StatusCode::OK.as_u16(),
+        headers: vec![
+            ("set-cookie".to_string(), "a=1".to_string()),
+            ("set-cookie".to_string(), "b=2".to_string()),
+        ],
+        body: None,
+        error: None,
+    })
+    .unwrap();
+
+    assert_eq!(
+        response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["a=1", "b=2"]
+    );
+}
+
 #[tokio::test]
 async fn xwing_signed_eval_server_round_trip_and_rotation() {
     let provider = Arc::new(ControlledProvider::default());

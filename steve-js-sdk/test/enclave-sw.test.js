@@ -547,11 +547,16 @@ async function installFakeSession() {
   return session;
 }
 
-async function validProtocolResponse(options, session, applicationStatus = 200) {
+async function validProtocolResponse(
+  options,
+  session,
+  applicationStatus = 200,
+  headers = [['content-type', 'text/plain']]
+) {
   const requestEnvelope = decodeEnvelope(new Uint8Array(options.body));
   const plaintext = encodeCBOR({
     status: applicationStatus,
-    headers: { 'content-type': 'text/plain' },
+    headers,
     body: null,
     error: applicationStatus >= 400 ? 'application rejected' : null
   });
@@ -568,6 +573,35 @@ async function validProtocolResponse(options, session, applicationStatus = 200) 
     { status: 200, headers: { 'Content-Type': 'application/cbor' } }
   );
 }
+
+test('protected responses preserve repeated headers', async () => {
+  const session = await installFakeSession();
+  globalThis.fetch = (url, options) => validProtocolResponse(
+    options,
+    session,
+    200,
+    [['x-repeat', 'one'], ['x-repeat', 'two']]
+  );
+
+  const response = await handleProtectedRequest(new Request('https://example.test/headers'));
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('x-repeat'), 'one, two');
+});
+
+test('protected responses reject malformed header pairs', async () => {
+  const session = await installFakeSession();
+  globalThis.fetch = (url, options) => validProtocolResponse(
+    options,
+    session,
+    200,
+    [['x-repeat']]
+  );
+
+  const response = await handleProtectedRequest(new Request('https://example.test/headers'));
+
+  assert.equal(response.status, 502);
+});
 
 test('opt-in wire traces expose encrypted envelopes but not application plaintext', async () => {
   const session = await installFakeSession();

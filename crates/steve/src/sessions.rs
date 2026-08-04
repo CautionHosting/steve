@@ -82,10 +82,7 @@ impl Session {
 
     pub fn is_expired(&self, now: Instant) -> bool {
         let state = self.mutable.lock().unwrap();
-        match state.lifecycle {
-            Lifecycle::Pending => now.duration_since(self.created_at) >= PENDING_TTL,
-            Lifecycle::Active { expires_at } => now >= expires_at,
-        }
+        self.is_expired_locked(&state, now)
     }
 
     pub fn confirm(&self, sequence: u64, ciphertext: &[u8]) -> Result<Vec<u8>, SessionError> {
@@ -163,6 +160,7 @@ impl Session {
             .map_err(Into::into)
     }
 
+    /// Check expiry without reacquiring `mutable`; the caller already holds it.
     fn is_expired_locked(&self, state: &MutableSession, now: Instant) -> bool {
         match state.lifecycle {
             Lifecycle::Pending => now.duration_since(self.created_at) >= PENDING_TTL,

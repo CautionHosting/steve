@@ -1511,7 +1511,7 @@ async function handleProtectedRequest(request) {
         validateApplicationResponse(decoded);
         const body = decoded.body instanceof Uint8Array ? decoded.body : decoded.error ? new TextEncoder().encode(JSON.stringify({ error: decoded.error })) : null;
         return {
-          response: new Response(body, { status: decoded.status, headers: decoded.headers || {} }),
+          response: new Response(body, { status: decoded.status, headers: decoded.headers }),
           sequenceValue: responseEnvelope.sequenceValue,
           responseEnvelope: responseBytes
         };
@@ -1840,7 +1840,7 @@ function validateApplicationResponse(response) {
   if (!response || !Number.isInteger(response.status) || response.status < 200 || response.status > 599) {
     throw new Error("invalid protected application response");
   }
-  if (response.headers && (typeof response.headers !== "object" || Array.isArray(response.headers))) {
+  if (!Array.isArray(response.headers) || response.headers.some((header) => !Array.isArray(header) || header.length !== 2 || typeof header[0] !== "string" || typeof header[1] !== "string")) {
     throw new Error("invalid protected application headers");
   }
   if (response.body !== null && response.body !== void 0 && !(response.body instanceof Uint8Array)) {
