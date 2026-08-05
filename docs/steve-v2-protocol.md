@@ -293,8 +293,11 @@ The context hash and both key-exchange messages are not repeated in
 `user_data`; they are committed through `transcript_hash`. JSON serialization
 does not enter the STEVE v2 transcript or key schedule, and no canonical JSON form
 is required; the complete `user_data` bytes are nevertheless protected by the
-Nitro attestation signature. The UTF-8 JSON encoding MUST fit Nitro's
-1,024-byte `user_data` limit.
+Nitro attestation signature. The UTF-8 JSON encoding MUST NOT exceed the
+stricter 512-byte `user_data` validation limit documented by the
+[AWS NSM API](https://github.com/aws/aws-nitro-enclaves-nsm-api/blob/main/docs/attestation_process.md).
+This also fits AWS's generic 1,024-byte attestation-document
+[CDDL definition](https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html).
 
 Before confirmation, a client MUST:
 
@@ -403,8 +406,11 @@ before sequence exhaustion.
 
 Activity does not extend either lifetime. Clients SHOULD rotate before server
 expiry; the browser and native profiles currently rotate after 25 minutes.
-Failures that make record-delivery status ambiguous SHOULD cause the client to
-discard the session rather than reuse affected sequence numbers.
+After a failure that leaves record-delivery status ambiguous, a client MUST NOT
+reuse the affected sequence number or automatically replay the application
+request. It MAY retain the session by permanently retiring that sequence while
+continuing to satisfy the 64-record outstanding-span requirement; otherwise it
+SHOULD discard the session.
 
 ## 10. Client profiles (Informative)
 
