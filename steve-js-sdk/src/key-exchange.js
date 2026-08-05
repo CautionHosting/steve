@@ -92,7 +92,7 @@ export async function createClientKeyExchange(
 async function createX25519Client() {
   let keyPair = await crypto.subtle.generateKey(
     { name: 'X25519' },
-    true,
+    false,
     ['deriveBits']
   );
   const publicKey = new Uint8Array(

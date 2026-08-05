@@ -1294,7 +1294,7 @@ async function createClientKeyExchange(keyExchange, xwingModuleLoader) {
 async function createX25519Client() {
   let keyPair = await crypto.subtle.generateKey(
     { name: "X25519" },
-    true,
+    false,
     ["deriveBits"]
   );
   const publicKey = new Uint8Array(
@@ -1391,6 +1391,9 @@ var DEFAULT_REQUEST_TIMEOUT_MS = 30 * 1e3;
 var MIN_REQUEST_TIMEOUT_MS = 1e3;
 var MAX_REQUEST_TIMEOUT_MS = 5 * 60 * 1e3;
 var SESSION_ESTABLISH_TIMEOUT_MS = 10 * 1e3;
+var MAX_SESSION_RESPONSE_BYTES = 64 * 1024;
+var MAX_CONFIRMATION_RESPONSE_BYTES = 4 * 1024;
+var MAX_APPLICATION_RESPONSE_BYTES = 32 * 1024 * 1024 + 64 * 1024;
 var SESSION_FATAL_HTTP_STATUSES = /* @__PURE__ */ new Set([400, 401, 409, 425]);
 var REQUEST_LOCAL_HTTP_STATUSES = /* @__PURE__ */ new Set([403, 404, 408, 413, 429]);
 var CONFIG_CACHE_NAME = "steve-sdk-config-v1";
@@ -1492,7 +1495,10 @@ async function handleProtectedRequest(request) {
         if (!response.ok) {
           throw new ProtocolHttpError(response.status, "v2 request");
         }
-        const responseBytes = new Uint8Array(await response.arrayBuffer());
+        const responseBytes = await readBoundedResponse(
+          response,
+          MAX_APPLICATION_RESPONSE_BYTES
+        );
         throwIfAborted(signal);
         const responseEnvelope = decodeEnvelope(responseBytes);
         if (!equalBytes(responseEnvelope.session_id, session.id) || responseEnvelope.sequenceValue !== sequence) {
@@ -1535,9 +1541,10 @@ async function handleProtectedRequest(request) {
     if (session ? !isRequestLocalFailure(error) && state.session === session : !hasValidSession(state.session)) {
       resetState(publicError(error));
     }
+    const requestUrl = new URL(request.url);
     notifyClients("error", {
       message: publicError(error),
-      url: request.url,
+      url: requestUrl.origin + requestUrl.pathname,
       stage: session ? "request" : "initialization"
     });
     return new Response(JSON.stringify({ error: "secure channel failed" }), {
@@ -1652,7 +1659,7 @@ async function establishSessionWithinDeadline(signal, targetState) {
     );
     if (!response.ok) throw new ProtocolHttpError(response.status, "session creation");
     const sessionResponse = decodeSessionResponse(
-      new Uint8Array(await response.arrayBuffer()),
+      await readBoundedResponse(response, MAX_SESSION_RESPONSE_BYTES),
       keyExchange
     );
     throwIfAborted(signal);
@@ -1703,7 +1710,7 @@ async function establishSessionWithinDeadline(signal, targetState) {
       throw new ProtocolHttpError(confirmationResponse.status, "session confirmation");
     }
     const confirmationEnvelope = decodeEnvelope(
-      new Uint8Array(await confirmationResponse.arrayBuffer())
+      await readBoundedResponse(confirmationResponse, MAX_CONFIRMATION_RESPONSE_BYTES)
     );
     throwIfAborted(signal);
     if (confirmationEnvelope.sequenceValue !== 0n || !equalBytes(confirmationEnvelope.session_id, sessionResponse.session_id)) {
@@ -1762,6 +1769,41 @@ async function protocolFetch(path, body, signal) {
     if (signal?.aborted) throw new ProtocolAbortError();
     throw new ProtocolTransportError(error);
   }
+}
+async function readBoundedResponse(response, limit) {
+  const declaredLength = response.headers.get("content-length");
+  if (declaredLength !== null && /^[0-9]+$/u.test(declaredLength)) {
+    const length = Number(declaredLength);
+    if (!Number.isSafeInteger(length) || length > limit) {
+      throw new Error("protocol response too large");
+    }
+  }
+  if (!response.body) return new Uint8Array();
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.byteLength > limit - total) {
+        await reader.cancel().catch(() => {
+        });
+        throw new Error("protocol response too large");
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
 }
 var ProtocolTimeoutError = class extends Error {
   constructor(message = "v2 operation timed out") {
@@ -2050,38 +2092,3 @@ function updateStage(targetState, stage) {
   targetState.stage = stage;
   notifyStatus();
 }
-self.__ENCLAVE_SW_TEST__ = {
-  configure,
-  hasValidSession,
-  lifecycleState,
-  statusMessage,
-  resetState,
-  ensureSession,
-  rotateSession,
-  handleProtectedRequest,
-  protocolFetch,
-  withDeadline,
-  ProtocolHttpError,
-  ProtocolTimeoutError,
-  ProtocolTransportError,
-  isRequestLocalFailure,
-  configureAndPersist,
-  configCacheKey,
-  initializeConfig,
-  persistConfig,
-  restoreConfig,
-  resolveProtocolUrl,
-  shouldProtectRequest,
-  getConfigRestoreError: () => configRestoreError,
-  getState: () => state,
-  getConfig: () => config,
-  resetConfig: () => {
-    config = defaultConfig();
-  },
-  setEstablishSession: (fn) => {
-    establishSessionFn = fn;
-  },
-  resetEstablishSession: () => {
-    establishSessionFn = establishSession;
-  }
-};

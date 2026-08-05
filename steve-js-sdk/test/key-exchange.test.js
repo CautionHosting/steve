@@ -12,7 +12,16 @@ import {
   XWING_KEY_EXCHANGE
 } from '../src/protocol-v2.js';
 
-test('X25519 remains a WebCrypto client and derives the server secret', async () => {
+test('X25519 remains a non-extractable WebCrypto client and derives the server secret', async t => {
+  const subtle = crypto.subtle;
+  const generateKey = subtle.generateKey;
+  let clientExtractable;
+  subtle.generateKey = function (algorithm, extractable, usages) {
+    clientExtractable ??= extractable;
+    return generateKey.call(this, algorithm, extractable, usages);
+  };
+  t.after(() => { subtle.generateKey = generateKey; });
+
   const client = await createClientKeyExchange(X25519_KEY_EXCHANGE);
   const server = await crypto.subtle.generateKey(
     { name: 'X25519' },
@@ -36,6 +45,7 @@ test('X25519 remains a WebCrypto client and derives the server secret', async ()
   );
 
   assert.equal(client.keyExchange, X25519_KEY_EXCHANGE);
+  assert.equal(clientExtractable, false);
   assert.deepEqual(await client.decapsulate(serverPublicKey), expected);
   await assert.rejects(
     () => client.decapsulate(serverPublicKey),

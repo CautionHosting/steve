@@ -420,6 +420,8 @@ protocol.
   compare PCR0, PCR1, or PCR2 with independently supplied expected values.
   Therefore it verifies a Nitro-backed session binding but does not establish
   that the enclave is the expected STEVE deployment.
+- It caps session, confirmation, and application protocol responses at 65,536
+  bytes, 4,096 bytes, and 33,619,968 bytes respectively.
 - `XWING-DRAFT10` uses self-hosted RustCrypto WASM whose build digest is checked
   before initialization. There is no cryptographic fallback.
 - Service-worker interception is not a fail-closed routing boundary. A

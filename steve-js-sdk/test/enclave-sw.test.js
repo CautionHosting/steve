@@ -44,10 +44,11 @@ globalThis.self = {
     }
   }
 };
+globalThis.__STEVE_ENABLE_TEST_HOOKS__ = true;
 
 await import('../src/enclave-sw.js');
 const { configure, hasValidSession, resetState, ensureSession, getState, getConfig,
-  protocolFetch, resolveProtocolUrl, shouldProtectRequest, resetConfig,
+  protocolFetch, readBoundedResponse, resolveProtocolUrl, shouldProtectRequest, resetConfig,
   handleProtectedRequest, withDeadline, ProtocolHttpError, ProtocolTimeoutError,
   ProtocolTransportError,
   isRequestLocalFailure,
@@ -73,6 +74,39 @@ test.afterEach(async () => {
   cachedResponses.clear();
   await initializeConfig();
   globalThis.fetch = originalFetch;
+});
+
+test('protocol responses are read within their byte limit', async () => {
+  assert.deepEqual(await readBoundedResponse(new Response(null), 4), new Uint8Array());
+  assert.deepEqual(
+    await readBoundedResponse(new Response(new Uint8Array([1, 2, 3, 4])), 4),
+    new Uint8Array([1, 2, 3, 4])
+  );
+});
+
+test('protocol responses reject declared and streamed overflow', async () => {
+  await assert.rejects(
+    () => readBoundedResponse(new Response(new Uint8Array([1]), {
+      headers: { 'Content-Length': '5' }
+    }), 4),
+    /protocol response too large/u
+  );
+
+  let cancelled = false;
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array([1, 2, 3]));
+      controller.enqueue(new Uint8Array([4, 5]));
+    },
+    cancel() {
+      cancelled = true;
+    }
+  });
+  await assert.rejects(
+    () => readBoundedResponse(new Response(stream), 4),
+    /protocol response too large/u
+  );
+  assert.equal(cancelled, true);
 });
 
 test('configure() cannot drop the /e2p/ protocol prefix', () => {
@@ -773,16 +807,38 @@ test('an encrypted application 401 does not reset the secure session', async () 
 
 test('an invalid protected response resets the secure session', async () => {
   const session = await installFakeSession();
+  captureClientMessages = true;
   globalThis.fetch = async () => new Response(new Uint8Array([0]), { status: 200 });
 
   const response = await handleProtectedRequest(
-    new Request('https://example.test/invalid-response')
+    new Request('https://example.test/invalid-response?token=secret')
+  );
+
+  assert.equal(response.status, 502);
+  assert.equal(getState().session, null);
+  const errorMessage = clientMessages.find(message => message.type === 'enclave:error');
+  assert.equal(errorMessage.url, 'https://example.test/invalid-response');
+  assert.throws(
+    () => session.sequences.accept(1n, 1n),
+    /unsupported envelope version/u
+  );
+});
+
+test('an oversized protected response resets the secure session', async () => {
+  const session = await installFakeSession();
+  globalThis.fetch = async () => new Response(new Uint8Array([0]), {
+    status: 200,
+    headers: { 'Content-Length': String(32 * 1024 * 1024 + 64 * 1024 + 1) }
+  });
+
+  const response = await handleProtectedRequest(
+    new Request('https://example.test/oversized-response')
   );
 
   assert.equal(response.status, 502);
   assert.equal(getState().session, null);
   assert.throws(
     () => session.sequences.accept(1n, 1n),
-    /unsupported envelope version/u
+    /protocol response too large/u
   );
 });

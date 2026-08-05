@@ -58,7 +58,8 @@ const buildOptions = {
   logLevel: 'info',
   loader: evalBuild ? { '.pem': 'text' } : {},
   define: {
-    __STEVE_XWING_WASM_SHA256__: JSON.stringify(xwingWasmSha256)
+    __STEVE_XWING_WASM_SHA256__: JSON.stringify(xwingWasmSha256),
+    'globalThis.__STEVE_ENABLE_TEST_HOOKS__': 'false'
   },
   plugins: evalBuild
     ? [evalVerifierPlugin, xwingBindingsPlugin]

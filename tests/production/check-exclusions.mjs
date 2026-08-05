@@ -95,7 +95,8 @@ if (forbiddenPaths.length > 0) {
 const forbiddenMarkers = [
   'steve-local-eval',
   'STEVE Local Eval Root',
-  'BEGIN PRIVATE KEY'
+  'BEGIN PRIVATE KEY',
+  '__ENCLAVE_SW_TEST__'
 ];
 for (const file of packedFiles) {
   const contents = await readFile(path.join(sdk, file), 'utf8').catch(() => '');
