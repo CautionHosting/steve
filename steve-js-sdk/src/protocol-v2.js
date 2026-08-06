@@ -1,0 +1,368 @@
+import {
+  MAX_CBOR_BYTES,
+  decode as decodeCBOR,
+  encode as encodeCBOR
+} from 'tee-attestation-js/lib/cbor';
+
+export const VERSION = 2;
+export const PROTOCOL_ID = 'STEVE-E2P-V2';
+export const X25519_KEY_EXCHANGE = 'X25519';
+export const XWING_KEY_EXCHANGE = 'XWING-DRAFT10';
+export const DEFAULT_KEY_EXCHANGE = X25519_KEY_EXCHANGE;
+export const KEY_DERIVATION = 'HKDF-SHA256';
+export const RECORD_PROTECTION = 'AES-256-GCM';
+export const SESSION_ENDPOINT = '/e2p/v2/session';
+export const CONFIRM_ENDPOINT = '/e2p/v2/confirm';
+export const REQUEST_ENDPOINT = '/e2p/v2/request';
+export const MAX_ENVELOPE_BYTES = MAX_CBOR_BYTES;
+
+const encoder = new TextEncoder();
+const MAGIC = encoder.encode('STEVE-E2P-V2\0');
+const KEY_MATERIAL_LENGTHS = Object.freeze({
+  [X25519_KEY_EXCHANGE]: Object.freeze({ client: 32, server: 32 }),
+  [XWING_KEY_EXCHANGE]: Object.freeze({ client: 1216, server: 1120 })
+});
+const REPLAY_WINDOW_SIZE = 64n;
+const LABELS = {
+  c2sKey: encoder.encode('steve-e2p-v2/c2s-key'),
+  s2cKey: encoder.encode('steve-e2p-v2/s2c-key'),
+  c2sIv: encoder.encode('steve-e2p-v2/c2s-iv'),
+  s2cIv: encoder.encode('steve-e2p-v2/s2c-iv'),
+  binder: encoder.encode('steve-e2p-v2/attestation-binder')
+};
+
+export const Direction = Object.freeze({ CLIENT_TO_SERVER: 0, SERVER_TO_CLIENT: 1 });
+export const MessageType = Object.freeze({ CONFIRMATION: 0, APPLICATION: 1 });
+
+export class SequenceTracker {
+  constructor() {
+    this.next = 1n;
+    this.pending = new Set();
+    this.waiters = [];
+    this.closedError = null;
+  }
+
+  async allocate() {
+    while (!this.canAllocate()) {
+      await new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
+    }
+    if (this.closedError) throw this.closedError;
+    const sequence = this.next;
+    if (sequence > 0xffffffffffffffffn) throw new Error('session sequence exhausted');
+    this.next += 1n;
+    this.pending.add(sequence);
+    return sequence;
+  }
+
+  accept(expected, received) {
+    if (this.closedError) throw this.closedError;
+    if (received !== expected || !this.pending.delete(expected)) {
+      throw new Error('unexpected v2 response sequence');
+    }
+    this.wakeWaiters();
+  }
+
+  retire(sequence) {
+    if (this.closedError) return false;
+    if (!this.pending.delete(sequence)) {
+      throw new Error('unexpected v2 retired sequence');
+    }
+    this.wakeWaiters();
+    return true;
+  }
+
+  close(error = new Error('session sequence tracker closed')) {
+    if (this.closedError) return;
+    this.closedError = error instanceof Error ? error : new Error(String(error));
+    this.pending.clear();
+    const waiters = this.waiters.splice(0);
+    for (const waiter of waiters) waiter.reject(this.closedError);
+  }
+
+  canAllocate() {
+    if (this.closedError) return true;
+    const oldest = this.pending.values().next().value;
+    return oldest === undefined || this.next - oldest < REPLAY_WINDOW_SIZE;
+  }
+
+  wakeWaiters() {
+    const waiters = this.waiters.splice(0);
+    for (const waiter of waiters) waiter.resolve();
+  }
+}
+
+export function concatBytes(...parts) {
+  const length = parts.reduce((total, part) => total + part.length, 0);
+  const output = new Uint8Array(length);
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.length;
+  }
+  return output;
+}
+
+export function equalBytes(left, right) {
+  if (!(left instanceof Uint8Array) || !(right instanceof Uint8Array) || left.length !== right.length) {
+    return false;
+  }
+  let difference = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    difference |= left[index] ^ right[index];
+  }
+  return difference === 0;
+}
+
+export function buildTranscript(
+  keyExchange,
+  clientNonce,
+  clientKeyMaterial,
+  serverKeyMaterial,
+  sessionId,
+  contextHash
+) {
+  requireKeyExchange(keyExchange);
+  requireLength('client nonce', clientNonce, 32);
+  requireKeyMaterial(keyExchange, 'client', clientKeyMaterial);
+  requireKeyMaterial(keyExchange, 'server', serverKeyMaterial);
+  requireLength('session ID', sessionId, 16);
+  requireLength('context hash', contextHash, 32);
+  return concatBytes(
+    MAGIC,
+    encoder.encode(keyExchange),
+    new Uint8Array([0]),
+    clientNonce,
+    clientKeyMaterial,
+    serverKeyMaterial,
+    sessionId,
+    contextHash
+  );
+}
+
+export async function sha256(bytes) {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+}
+
+export async function hashOrigin(origin) {
+  return sha256(encoder.encode(origin));
+}
+
+export async function deriveMaterial(sharedSecret, transcriptHash) {
+  requireLength('key-exchange shared secret', sharedSecret, 32);
+  requireLength('transcript hash', transcriptHash, 32);
+  let hkdfKey;
+  try {
+    hkdfKey = await crypto.subtle.importKey('raw', sharedSecret, 'HKDF', false, ['deriveBits']);
+  } finally {
+    sharedSecret.fill(0);
+  }
+  const derive = async (label, bits) => new Uint8Array(await crypto.subtle.deriveBits({
+    name: 'HKDF',
+    hash: 'SHA-256',
+    salt: transcriptHash,
+    info: label
+  }, hkdfKey, bits));
+  return {
+    c2sKey: await derive(LABELS.c2sKey, 256),
+    s2cKey: await derive(LABELS.s2cKey, 256),
+    c2sIvPrefix: await derive(LABELS.c2sIv, 32),
+    s2cIvPrefix: await derive(LABELS.s2cIv, 32),
+    binder: await derive(LABELS.binder, 256)
+  };
+}
+
+export function sequenceBytes(sequence) {
+  const value = BigInt(sequence);
+  if (value < 0n || value > 0xffffffffffffffffn) {
+    throw new Error('sequence is out of range');
+  }
+  const bytes = new Uint8Array(8);
+  const view = new DataView(bytes.buffer);
+  view.setBigUint64(0, value, false);
+  return bytes;
+}
+
+export function parseSequence(bytes) {
+  requireLength('sequence', bytes, 8);
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(0, false);
+}
+
+export function messageNonce(prefix, sequence) {
+  requireLength('IV prefix', prefix, 4);
+  return concatBytes(prefix, sequenceBytes(sequence));
+}
+
+export function associatedData(messageType, direction, sessionId, sequence) {
+  requireLength('session ID', sessionId, 16);
+  return concatBytes(
+    MAGIC,
+    new Uint8Array([messageType, direction]),
+    sessionId,
+    sequenceBytes(sequence)
+  );
+}
+
+export async function seal(material, direction, messageType, sessionId, sequence, plaintext) {
+  const keyBytes = direction === Direction.CLIENT_TO_SERVER ? material.c2sKey : material.s2cKey;
+  const prefix = direction === Direction.CLIENT_TO_SERVER
+    ? material.c2sIvPrefix
+    : material.s2cIvPrefix;
+  const key = await crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['encrypt']);
+  const ciphertext = await crypto.subtle.encrypt({
+    name: 'AES-GCM',
+    iv: messageNonce(prefix, sequence),
+    additionalData: associatedData(messageType, direction, sessionId, sequence),
+    tagLength: 128
+  }, key, plaintext);
+  return new Uint8Array(ciphertext);
+}
+
+export async function open(material, direction, messageType, sessionId, sequence, ciphertext) {
+  const keyBytes = direction === Direction.CLIENT_TO_SERVER ? material.c2sKey : material.s2cKey;
+  const prefix = direction === Direction.CLIENT_TO_SERVER
+    ? material.c2sIvPrefix
+    : material.s2cIvPrefix;
+  const key = await crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['decrypt']);
+  const plaintext = await crypto.subtle.decrypt({
+    name: 'AES-GCM',
+    iv: messageNonce(prefix, sequence),
+    additionalData: associatedData(messageType, direction, sessionId, sequence),
+    tagLength: 128
+  }, key, ciphertext);
+  return new Uint8Array(plaintext);
+}
+
+export function encodeSessionRequest(
+  keyExchange,
+  clientNonce,
+  clientKeyMaterial,
+  contextHash
+) {
+  requireKeyExchange(keyExchange);
+  requireLength('client nonce', clientNonce, 32);
+  requireKeyMaterial(keyExchange, 'client', clientKeyMaterial);
+  requireLength('context hash', contextHash, 32);
+  return encodeCBOR({
+    version: VERSION,
+    key_exchange: keyExchange,
+    client_nonce: clientNonce,
+    client_key_material: clientKeyMaterial,
+    context_hash: contextHash
+  });
+}
+
+export function decodeSessionResponse(bytes, expectedKeyExchange) {
+  requireKeyExchange(expectedKeyExchange);
+  const response = decodeCBOR(bytes);
+  if (response.version !== VERSION) throw new Error('unsupported session response version');
+  if (response.key_exchange !== expectedKeyExchange) {
+    throw new Error('session key exchange mismatch');
+  }
+  requireLength('session ID', response.session_id, 16);
+  requireKeyMaterial(expectedKeyExchange, 'server', response.server_key_material);
+  if (!(response.attestation_document instanceof Uint8Array)) {
+    throw new Error('invalid attestation document');
+  }
+  if (!Number.isInteger(response.expires_in_seconds) || response.expires_in_seconds <= 0) {
+    throw new Error('invalid pending-session expiry');
+  }
+  return response;
+}
+
+export function encodeEnvelope(sessionId, sequence, ciphertext) {
+  requireLength('session ID', sessionId, 16);
+  let envelope;
+  try {
+    envelope = encodeCBOR({
+      version: VERSION,
+      session_id: sessionId,
+      sequence: sequenceBytes(sequence),
+      ciphertext
+    });
+  } catch (error) {
+    if (error?.message === 'CBOR output exceeds size limit') {
+      throw new Error('v2 envelope exceeds size limit', { cause: error });
+    }
+    throw error;
+  }
+  if (envelope.length > MAX_ENVELOPE_BYTES) {
+    throw new Error('v2 envelope exceeds size limit');
+  }
+  return envelope;
+}
+
+export function decodeEnvelope(bytes) {
+  const envelope = decodeCBOR(bytes);
+  if (envelope.version !== VERSION) throw new Error('unsupported envelope version');
+  requireLength('session ID', envelope.session_id, 16);
+  requireLength('sequence', envelope.sequence, 8);
+  if (!(envelope.ciphertext instanceof Uint8Array)) throw new Error('invalid envelope ciphertext');
+  return { ...envelope, sequenceValue: parseSequence(envelope.sequence) };
+}
+
+export function verifyBinding(userData, keyExchange, sessionId, transcriptHash, binder) {
+  requireKeyExchange(keyExchange);
+  if (!userData
+      || userData.protocol !== PROTOCOL_ID
+      || userData.key_exchange !== keyExchange) {
+    throw new Error('attestation protocol binding mismatch');
+  }
+  const expected = {
+    session_id: sessionId,
+    transcript_hash: transcriptHash,
+    binder
+  };
+  for (const [field, bytes] of Object.entries(expected)) {
+    const actual = decodeBase64Url(userData[field]);
+    if (!equalBytes(actual, bytes)) throw new Error(`attestation ${field} mismatch`);
+  }
+}
+
+export function validateAttestationResult(
+  result,
+  keyExchange,
+  sessionId,
+  transcriptHash,
+  binder
+) {
+  if (!result?.verified) {
+    throw new Error(`Nitro attestation verification failed: ${result?.error || 'unknown error'}`);
+  }
+  verifyBinding(result.userData, keyExchange, sessionId, transcriptHash, binder);
+}
+
+export function encodeBase64Url(bytes) {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '');
+}
+
+export function decodeBase64Url(value) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]*$/u.test(value)) {
+    throw new Error('invalid base64url value in attestation');
+  }
+  const padded = value.replaceAll('-', '+').replaceAll('_', '/')
+    + '='.repeat((4 - (value.length % 4)) % 4);
+  const binary = atob(padded);
+  return Uint8Array.from(binary, character => character.charCodeAt(0));
+}
+
+function requireLength(name, value, length) {
+  if (!(value instanceof Uint8Array) || value.length !== length) {
+    throw new Error(`invalid ${name}`);
+  }
+}
+
+export function requireKeyExchange(keyExchange) {
+  if (!Object.prototype.hasOwnProperty.call(KEY_MATERIAL_LENGTHS, keyExchange)) {
+    throw new Error(`unsupported key exchange: ${keyExchange}`);
+  }
+}
+
+function requireKeyMaterial(keyExchange, side, value) {
+  requireLength(
+    `${side} key material`,
+    value,
+    KEY_MATERIAL_LENGTHS[keyExchange][side]
+  );
+}

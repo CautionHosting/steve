@@ -3,6 +3,7 @@ resolver = "3"
 members = [
 	"crates/steve",
 	"crates/steve-sdk",
+	"crates/steve-xwing-wasm",
 ]
 
 [workspace.dependencies]

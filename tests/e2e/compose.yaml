@@ -1,0 +1,29 @@
+services:
+  fixture:
+    platform: linux/amd64
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Containerfile
+      target: fixture
+    environment:
+      STEVE_KEY_EXCHANGE: ${STEVE_KEY_EXCHANGE:-X25519}
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  steve-eval:
+    platform: linux/amd64
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Containerfile
+      target: steve-eval
+    depends_on:
+      - fixture
+    environment:
+      E2P_METADATA_FILE: /metadata.json
+      RUST_LOG: steve=debug,tower_http=debug
+      STEVE_APP_UPSTREAM: http://fixture:8083
+      STEVE_CORS_ORIGINS: http://127.0.0.1:3000,http://localhost:3000
+      STEVE_KEY_EXCHANGE: ${STEVE_KEY_EXCHANGE:-X25519}
+      STEVE_LISTEN_ADDR: 0.0.0.0:49500
+    ports:
+      - "127.0.0.1:49500:49500"

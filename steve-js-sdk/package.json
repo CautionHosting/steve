@@ -1,6 +1,6 @@
 {
   "name": "transport-security-service-worker",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "End-to-end encryption for web apps running in TEE enclaves",
   "type": "module",
   "main": "dist/register.js",
@@ -10,24 +10,38 @@
   },
   "files": [
     "dist",
-    "src",
     "LICENSE",
     "README.md"
   ],
   "scripts": {
-    "build": "node build.js",
-    "watch": "node build.js --watch"
+    "build": "make build",
+    "build:wasm": "make build-wasm",
+    "build:e2e": "make build-e2e",
+    "test": "node --test test/*.test.js",
+    "test:wasm": "make test-wasm",
+    "test:e2e": "playwright test --config test/e2e/playwright.config.js",
+    "test:e2e:nitro": "STEVE_E2E_PROFILE=nitro playwright test --config test/e2e/playwright.config.js"
   },
-  "keywords": ["tee", "enclave", "encryption", "service-worker", "attestation", "verifiable", "confidential compute"],
+  "keywords": [
+    "tee",
+    "enclave",
+    "encryption",
+    "service-worker",
+    "attestation",
+    "verifiable",
+    "confidential compute"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://codeberg.org/caution/transport-security-service-worker.git"
   },
   "dependencies": {
-    "tee-attestation-js": "git+https://git.distrust.co/public/tee-attestation-js.git"
+    "tee-attestation-js": "git+https://git.distrust.co/public/tee-attestation-js.git#ba0d0c57de673c8576c91a8730775a87575f5c10"
   },
   "devDependencies": {
-    "esbuild": "^0.24.0"
+    "@noble/post-quantum": "0.6.1",
+    "@playwright/test": "1.61.1",
+    "esbuild": "0.25.0"
   }
 }

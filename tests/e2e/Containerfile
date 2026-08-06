@@ -1,0 +1,40 @@
+FROM stagex/core-git@sha256:6b3e0055f6aeaa8465f207a871db2c63a939cd7406113e9d769ff3b37239f3d0 AS git
+FROM stagex/core-ca-certificates@sha256:d135f1189e9b232eb7316626bf7858534c5540b2fc53dced80a4c9a95f26493e AS ca-certificates
+
+FROM --platform=linux/amd64 stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS steve-builder
+
+COPY --from=git . /
+COPY --from=ca-certificates . /
+
+ENV SOURCE_DATE_EPOCH=1
+ENV CARGO_INCREMENTAL=0
+ENV CARGO_TARGET_DIR=/tmp/cargo-target
+ENV RUSTFLAGS="-C codegen-units=1 -C target-feature=+crt-static -C link-arg=-Wl,--build-id=none"
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+COPY test-vectors/ ./test-vectors/
+COPY tests/e2e/fixtures/ ./tests/e2e/fixtures/
+
+RUN cargo fetch --locked --target x86_64-unknown-linux-musl && \
+    cargo build --release --locked --offline --target x86_64-unknown-linux-musl \
+    -p steve --features eval-attestation --bin steve-eval && \
+    install -Dm755 \
+      /tmp/cargo-target/x86_64-unknown-linux-musl/release/steve-eval \
+      /out/steve-eval
+
+FROM scratch AS steve-eval
+COPY --from=steve-builder /out/steve-eval /steve-eval
+ENTRYPOINT ["/steve-eval"]
+
+FROM --platform=linux/amd64 stagex/pallet-nodejs@sha256:1f705b58321b17e87ea68c04431ad83be6e6b64253d0443be4c61501902d57c3 AS fixture
+
+WORKDIR /fixture
+COPY tests/e2e/fixture-server.mjs /fixture/fixture-server.mjs
+COPY tests/e2e/public/ /fixture/public/
+RUN chmod 0644 /fixture/fixture-server.mjs && \
+    find /fixture/public -type d -exec chmod 0755 {} + && \
+    find /fixture/public -type f -exec chmod 0644 {} +
+
+ENTRYPOINT ["node", "/fixture/fixture-server.mjs"]
