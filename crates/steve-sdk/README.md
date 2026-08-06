@@ -4,7 +4,7 @@ Native Rust client for the attestation-bound STEVE E2P v2 protocol.
 
 The client:
 
-- requires expected, nonzero 48-byte Nitro PCR0/1/2 values;
+- pins one or more complete Nitro PCR profiles, or uses caller-persisted TOFU;
 - verifies the AWS Nitro certificate chain, fresh nonce, session transcript, and key binder;
 - confirms the session before sending application data;
 - uses directional AES-256-GCM keys and replay-resistant sequences;
@@ -22,6 +22,66 @@ let expected_pcrs = ExpectedPcrs::from([
 let client = Client::new("https://secure.example", expected_pcrs).await?;
 let response = client.get("/api/secret").send().await?;
 ```
+
+`Client::new` and `Client::builder` remain single-profile pinned conveniences.
+For an upgrade window, approve multiple complete profiles explicitly:
+
+```rust
+use steve_sdk::{Client, PcrPolicy};
+
+let policy = PcrPolicy::pinned([current_release, next_release])?;
+let client = Client::new_with_policy("https://secure.example", policy).await?;
+```
+
+PCR0, PCR1, and PCR2 are mandatory, nonzero, and 48 bytes. A pinned policy
+accepts only when every configured PCR in one profile matches; profiles are
+never mixed. Extra PCRs in the attestation are ignored unless included in a
+profile.
+
+## Trust on first use
+
+TOFU requires application-owned durable storage. The SDK provides no built-in
+store:
+
+```rust
+use async_trait::async_trait;
+use std::sync::Arc;
+use steve_sdk::{
+    Client, ExpectedPcrs, PcrPolicy, PcrTrustKey, PcrTrustRecord,
+    PcrTrustStore, PcrTrustStoreError,
+};
+
+#[derive(Debug)]
+struct DurableStore;
+
+#[async_trait]
+impl PcrTrustStore for DurableStore {
+    async fn load_or_insert(
+        &self,
+        key: PcrTrustKey,
+        observed: ExpectedPcrs,
+    ) -> Result<PcrTrustRecord, PcrTrustStoreError> {
+        // Atomically insert `observed` if absent; otherwise return the stored value.
+        todo!()
+    }
+}
+
+let policy = PcrPolicy::trust_on_first_use(Arc::new(DurableStore));
+let client = Client::new_with_policy("https://secure.example", policy).await?;
+```
+
+Enrollment happens only after the Nitro evidence, nonce, suite, transcript,
+binder, and session confirmation have been verified. The store operation must
+be atomic: return `Inserted` only after persisting the supplied PCR0/1/2, or
+`Existing(stored_pcrs)` without replacing it. Store errors and changed PCRs fail
+before application traffic. `AttestationInfo::pcr_trust` reports
+`TofuEnrolled`, `TofuMatched`, or `Pinned`.
+
+TOFU provides continuity, not independently authenticated workload identity on
+first use. Deleting its record reopens enrollment. PCR-changing upgrades are
+therefore automatic only with a pinned allowlist; a TOFU deployment requires
+the application to authorize and replace its durable record out of band. The
+SDK never replaces a record or offers an unpinned mode.
 
 X25519 is the permanent default. X-Wing deployments must be pinned explicitly:
 

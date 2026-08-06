@@ -6,9 +6,11 @@ readme = "README.md"
 
 [dependencies]
 aes-gcm = "0.10.3"
+async-trait = "=0.1.89"
 base64 = "0.22"
 bootproof-sdk = { git = "https://git.distrust.co/public/bootproof.git", rev = "78f531a2c245404a9d8879fb71cc397096ae0077", version = "0.1.0" }
 ciborium = "0.2"
+coset = "0.4"
 hkdf = "0.12.4"
 rand = "0.8"
 reqwest = { version = "0.12.26", default-features = false, features = ["rustls-tls"] }
@@ -28,7 +30,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 axum = "0.8"
-coset = "0.4"
 p384 = { version = "0.13.1", features = ["ecdsa", "pem", "pkcs8"] }
 steve = { path = "../steve", features = ["eval-attestation"] }
 tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "time"] }

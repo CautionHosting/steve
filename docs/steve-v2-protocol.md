@@ -451,8 +451,30 @@ protocol.
               || 0x00 || application_context)
   ```
 
-- The SDK requires independently supplied PCR0, PCR1, and PCR2. Each expected
-  PCR is 48 bytes and all-zero debug PCRs are rejected.
+- `Client::new` and `Client::builder` require one independently supplied PCR
+  profile. Policy-aware constructors additionally support either a nonempty
+  allowlist of complete profiles or persistent trust on first use (TOFU).
+- Every profile requires nonzero, 48-byte PCR0, PCR1, and PCR2 values. Pinned
+  policy accepts only one whole profile; values from different profiles cannot
+  be mixed. Attested PCRs not configured in that profile are ignored.
+- TOFU stores verified PCR0, PCR1, and PCR2 under an opaque key derived as:
+
+  ```text
+  SHA-256("STEVE-E2P-V2-PCR-TOFU\0" || context_hash
+          || UTF8(pinned_suite))
+  ```
+
+  The embedding application supplies durable storage with atomic
+  load-or-insert semantics. Enrollment occurs only after Nitro evidence,
+  nonce, suite, transcript, binder, and session confirmation succeed. An
+  existing different value or storage failure aborts before application
+  traffic. The SDK never replaces the record.
+- Attestation results report `Pinned`, `TofuEnrolled`, or `TofuMatched`. TOFU
+  establishes continuity after first use, not independently pinned workload
+  identity on first use. A PCR-changing upgrade requires either a preapproved
+  pinned profile or explicit out-of-band replacement of the TOFU record.
+- There is no unpinned policy, automatic policy downgrade, or plaintext
+  fallback in the native SDK.
 - The SDK caps session, confirmation, and application protocol responses at
   65,536 bytes, 4,096 bytes, and 33,619,968 bytes respectively.
 - Redirects are disabled and protocol responses must remain on the configured

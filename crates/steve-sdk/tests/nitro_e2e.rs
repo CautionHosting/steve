@@ -4,7 +4,7 @@ use std::{
 };
 
 use serde::Deserialize;
-use steve_sdk::{Client, Error, ExpectedPcrs, KeyExchangeSuite};
+use steve_sdk::{Client, Error, ExpectedPcrs, KeyExchangeSuite, PcrTrustStatus};
 
 const FIXTURE_CONTRACT: &str = "steve-test-fixture/v1";
 const MAX_ECHO_BYTES: usize = 1024 * 1024;
@@ -99,7 +99,7 @@ async fn remote_nitro_e2e() {
         .connect()
         .await;
     assert!(
-        matches!(pcr_mismatch, Err(Error::AttestationVerification(_))),
+        matches!(pcr_mismatch, Err(Error::UnapprovedPcrProfile)),
         "the remote enclave did not reject a mutated PCR policy: {pcr_mismatch:?}"
     );
 
@@ -130,6 +130,7 @@ async fn remote_nitro_e2e() {
     );
     let first = client.verify_attestation().await.unwrap();
     assert_expected_pcrs(&first.pcrs, &expected_pcrs);
+    assert_eq!(first.pcr_trust, PcrTrustStatus::Pinned);
 
     let fixture = client
         .get("/.well-known/steve-test-fixture")

@@ -21,7 +21,13 @@ use axum::{
 };
 use base64::engine::general_purpose::STANDARD as BASE64;
 use coset::{CborSerializable, CoseSign1, TaggedCborSerializable};
-use p384::ecdsa::{Signature, VerifyingKey, signature::Verifier as SignatureVerifier};
+use p384::{
+    ecdsa::{
+        Signature, SigningKey, VerifyingKey,
+        signature::{Signer as SignatureSigner, Verifier as SignatureVerifier},
+    },
+    pkcs8::DecodePrivateKey,
+};
 use serde_cbor::Value;
 use steve::{
     ServerConfig,
@@ -33,6 +39,7 @@ use tokio::{net::TcpListener, time::sleep};
 use x509_parser::{certificate::X509Certificate, prelude::FromDer};
 
 const EVAL_LEAF_CERT_PEM: &str = include_str!("../../../tests/e2e/fixtures/eval-leaf-cert.pem");
+const EVAL_LEAF_KEY_PEM: &str = include_str!("../../../tests/e2e/fixtures/eval-leaf-key.pem");
 
 fn expected_pcrs() -> NitroPcrs {
     HashMap::from([
@@ -156,6 +163,18 @@ fn missing_attestation(message: &'static str) -> bootproof_sdk::format::Error {
 struct ControlledProvider {
     calls: AtomicUsize,
     fail: AtomicBool,
+    corrupt_signature: AtomicBool,
+    corrupt_binding: AtomicBool,
+    evidence_mutation: StdMutex<Option<EvidenceMutation>>,
+}
+
+#[derive(Clone, Copy)]
+enum EvidenceMutation {
+    Certificate,
+    Nonce,
+    MissingPcr,
+    ZeroPcr,
+    ShortPcr,
 }
 
 impl AttestationProvider for ControlledProvider {
@@ -168,7 +187,117 @@ impl AttestationProvider for ControlledProvider {
         if self.fail.load(AtomicOrdering::Relaxed) {
             return Err(AttestationError::Eval("forced attestation failure".into()));
         }
-        EvalAttestationProvider.attest(nonce, user_data)
+        let user_data = if self.corrupt_binding.load(AtomicOrdering::Relaxed) {
+            b"{}".as_slice()
+        } else {
+            user_data
+        };
+        let mut document = EvalAttestationProvider.attest(nonce, user_data)?;
+        if let Some(mutation) = *self.evidence_mutation.lock().unwrap() {
+            document = mutate_eval_evidence(&document, mutation)?;
+        }
+        if !self.corrupt_signature.load(AtomicOrdering::Relaxed) {
+            return Ok(document);
+        }
+        let mut cose = CoseSign1::from_tagged_slice(&document)
+            .map_err(|error| AttestationError::Eval(error.to_string()))?;
+        cose.signature[0] ^= 1;
+        cose.to_tagged_vec()
+            .map_err(|error| AttestationError::Eval(error.to_string()))
+    }
+}
+
+fn mutate_eval_evidence(
+    document: &[u8],
+    mutation: EvidenceMutation,
+) -> std::result::Result<Vec<u8>, AttestationError> {
+    let mut cose = CoseSign1::from_tagged_slice(document)
+        .map_err(|error| AttestationError::Eval(error.to_string()))?;
+    let mut payload: Value = serde_cbor::from_slice(
+        cose.payload
+            .as_deref()
+            .ok_or_else(|| AttestationError::Eval("missing payload".into()))?,
+    )
+    .map_err(|error| AttestationError::Eval(error.to_string()))?;
+    let Value::Map(payload) = &mut payload else {
+        return Err(AttestationError::Eval("payload is not a map".into()));
+    };
+
+    match mutation {
+        EvidenceMutation::Certificate | EvidenceMutation::Nonce => {
+            let name = match mutation {
+                EvidenceMutation::Certificate => "certificate",
+                EvidenceMutation::Nonce => "nonce",
+                _ => unreachable!(),
+            };
+            let Some(Value::Bytes(value)) = payload.get_mut(&Value::Text(name.into())) else {
+                return Err(AttestationError::Eval(format!("missing {name}")));
+            };
+            value[0] ^= 1;
+        }
+        EvidenceMutation::MissingPcr | EvidenceMutation::ZeroPcr | EvidenceMutation::ShortPcr => {
+            let Some(Value::Map(pcrs)) = payload.get_mut(&Value::Text("pcrs".into())) else {
+                return Err(AttestationError::Eval("missing PCRs".into()));
+            };
+            let index = Value::Integer(2.into());
+            match mutation {
+                EvidenceMutation::MissingPcr => {
+                    pcrs.remove(&index);
+                }
+                EvidenceMutation::ZeroPcr => {
+                    pcrs.insert(index, Value::Bytes(vec![0; 48]));
+                }
+                EvidenceMutation::ShortPcr => {
+                    pcrs.insert(index, Value::Bytes(vec![1; 47]));
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    cose.payload = Some(
+        serde_cbor::to_vec(&payload).map_err(|error| AttestationError::Eval(error.to_string()))?,
+    );
+    let signing_key = SigningKey::from_pkcs8_pem(EVAL_LEAF_KEY_PEM)
+        .map_err(|error| AttestationError::Eval(error.to_string()))?;
+    let signature: Signature = signing_key.sign(&cose.tbs_data(&[]));
+    cose.signature = signature.to_bytes().to_vec();
+    cose.to_tagged_vec()
+        .map_err(|error| AttestationError::Eval(error.to_string()))
+}
+
+#[derive(Debug, Default)]
+struct MemoryPcrTrustStore {
+    records: StdMutex<HashMap<PcrTrustKey, ExpectedPcrs>>,
+    calls: AtomicUsize,
+    fail: AtomicBool,
+}
+
+impl MemoryPcrTrustStore {
+    fn replace_records(&self, pcrs: ExpectedPcrs) {
+        for record in self.records.lock().unwrap().values_mut() {
+            *record = pcrs.clone();
+        }
+    }
+}
+
+#[async_trait]
+impl PcrTrustStore for MemoryPcrTrustStore {
+    async fn load_or_insert(
+        &self,
+        key: PcrTrustKey,
+        observed: ExpectedPcrs,
+    ) -> std::result::Result<PcrTrustRecord, PcrTrustStoreError> {
+        self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+        if self.fail.load(AtomicOrdering::Relaxed) {
+            return Err(std::io::Error::other("forced trust store failure").into());
+        }
+        let mut records = self.records.lock().unwrap();
+        if let Some(existing) = records.get(&key) {
+            return Ok(PcrTrustRecord::Existing(existing.clone()));
+        }
+        records.insert(key, observed);
+        Ok(PcrTrustRecord::Inserted)
     }
 }
 
@@ -281,11 +410,56 @@ async fn test_server(
     (steve_url, upstream_state)
 }
 
+fn test_client_with_policy(
+    steve_url: &str,
+    policy: PcrPolicy,
+    key_exchange: KeyExchangeSuite,
+) -> Client {
+    let mut builder = Client::builder_with_policy(steve_url, policy)
+        .unwrap()
+        .expected_key_exchange(key_exchange)
+        .request_timeout(Duration::from_secs(2));
+    builder.attestation_verifier = Arc::new(EvalAttestationVerifier);
+    builder.build().unwrap()
+}
+
 #[derive(Clone)]
 struct OversizedOnceProxy {
     target: String,
     http: HttpClient,
     protected_requests: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct RejectConfirmationProxy {
+    target: String,
+    http: HttpClient,
+}
+
+async fn proxy_reject_confirmation(
+    State(state): State<RejectConfirmationProxy>,
+    uri: Uri,
+    body: Bytes,
+) -> AxumResponse {
+    if uri.path() == CONFIRM_ENDPOINT {
+        return (AxumStatus::BAD_GATEWAY, "confirmation rejected").into_response();
+    }
+    let target = format!("{}{}", state.target, uri.path());
+    let response = state
+        .http
+        .post(target)
+        .header("content-type", "application/cbor")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.bytes().await.unwrap();
+    AxumResponse::builder()
+        .status(status)
+        .header("content-type", "application/cbor")
+        .body(Body::from(body))
+        .unwrap()
 }
 
 async fn proxy_with_oversized_first_request(
@@ -344,6 +518,7 @@ fn dummy_session(generation: u64, id: [u8; 16]) -> Arc<SessionState> {
             session_id: id,
             module_id: "dummy".into(),
             pcrs: expected_pcrs(),
+            pcr_trust: PcrTrustStatus::Pinned,
         },
         activated_at: Instant::now(),
         sequences: SequenceTracker::default(),
@@ -405,6 +580,11 @@ async fn response_body_reader_rejects_chunked_overflow() {
 
 #[test]
 fn expected_pcrs_require_nonzero_pcr_zero_one_and_two() {
+    assert!(matches!(
+        PcrPolicy::pinned(Vec::<ExpectedPcrs>::new()),
+        Err(Error::EmptyPcrPolicy)
+    ));
+
     let mut missing = expected_pcrs();
     missing.remove(&2);
     assert!(matches!(
@@ -427,6 +607,33 @@ fn expected_pcrs_require_nonzero_pcr_zero_one_and_two() {
     assert!(matches!(
         Client::builder("https://example.com", short),
         Err(Error::InvalidExpectedPcr { index: 0, .. })
+    ));
+}
+
+#[test]
+fn attested_pcrs_require_nonzero_pcr_zero_one_and_two() {
+    let mut missing = expected_pcrs();
+    missing.remove(&2);
+    assert!(matches!(
+        extract_required_attested_pcrs(&missing),
+        Err(Error::InvalidAttestedPcr {
+            index: 2,
+            reason: "missing"
+        })
+    ));
+
+    let mut zero = expected_pcrs();
+    zero.insert(1, vec![0; 48]);
+    assert!(matches!(
+        extract_required_attested_pcrs(&zero),
+        Err(Error::InvalidAttestedPcr { index: 1, .. })
+    ));
+
+    let mut short = expected_pcrs();
+    short.insert(0, vec![1; 47]);
+    assert!(matches!(
+        extract_required_attested_pcrs(&short),
+        Err(Error::InvalidAttestedPcr { index: 0, .. })
     ));
 }
 
@@ -549,6 +756,16 @@ fn normalizes_origin_and_binds_optional_application_context() {
     assert_ne!(
         native_context_hash(&base, Some(b"application-a")),
         native_context_hash(&base, Some(b"application-b"))
+    );
+
+    let context = native_context_hash(&base, Some(b"application-a"));
+    assert_eq!(
+        pcr_trust_key(&context, KeyExchangeSuite::X25519),
+        pcr_trust_key(&context, KeyExchangeSuite::X25519)
+    );
+    assert_ne!(
+        pcr_trust_key(&context, KeyExchangeSuite::X25519),
+        pcr_trust_key(&context, KeyExchangeSuite::XWingDraft10)
     );
 }
 
@@ -765,6 +982,7 @@ async fn signed_eval_server_round_trip_and_rotation() {
     let first = client.initialize().await.unwrap();
     assert_eq!(first.module_id, "steve-local-eval");
     assert_eq!(first.pcrs, expected_pcrs());
+    assert_eq!(first.pcr_trust, PcrTrustStatus::Pinned);
 
     let response = client
         .post("/hello?query=1")
@@ -784,6 +1002,188 @@ async fn signed_eval_server_round_trip_and_rotation() {
     let second = client.rotate_session().await.unwrap();
     assert_ne!(first.session_id, second.session_id);
     assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn pinned_policy_accepts_one_complete_profile_and_rejects_mixed_profiles() {
+    let provider = Arc::new(ControlledProvider::default());
+    let (steve_url, _) = test_server(provider.clone(), KeyExchangeSuite::X25519).await;
+    let mut obsolete = expected_pcrs();
+    obsolete.insert(2, vec![0x44; 48]);
+    for profiles in [
+        [expected_pcrs(), obsolete.clone()],
+        [obsolete, expected_pcrs()],
+    ] {
+        let policy = PcrPolicy::pinned(profiles).unwrap();
+        let client = test_client_with_policy(&steve_url, policy, KeyExchangeSuite::X25519);
+        assert_eq!(
+            client.initialize().await.unwrap().pcr_trust,
+            PcrTrustStatus::Pinned
+        );
+    }
+
+    let mut first_mixed = expected_pcrs();
+    first_mixed.insert(1, vec![0x55; 48]);
+    let mut second_mixed = expected_pcrs();
+    second_mixed.insert(0, vec![0x66; 48]);
+    let policy = PcrPolicy::pinned([first_mixed, second_mixed]).unwrap();
+    let client = test_client_with_policy(&steve_url, policy, KeyExchangeSuite::X25519);
+    assert!(matches!(
+        client.initialize().await,
+        Err(Error::UnapprovedPcrProfile)
+    ));
+}
+
+#[tokio::test]
+async fn tofu_enrolls_after_confirmation_and_matches_on_rotation() {
+    let provider = Arc::new(ControlledProvider::default());
+    let (steve_url, _) = test_server(provider.clone(), KeyExchangeSuite::X25519).await;
+    let store = Arc::new(MemoryPcrTrustStore::default());
+    let policy = PcrPolicy::trust_on_first_use(store.clone());
+    let client = test_client_with_policy(&steve_url, policy, KeyExchangeSuite::X25519);
+
+    let first = client.initialize().await.unwrap();
+    assert_eq!(first.pcr_trust, PcrTrustStatus::TofuEnrolled);
+    assert_eq!(store.calls.load(AtomicOrdering::Relaxed), 1);
+    assert_eq!(store.records.lock().unwrap().len(), 1);
+
+    let second = client.rotate_session().await.unwrap();
+    assert_eq!(second.pcr_trust, PcrTrustStatus::TofuMatched);
+    assert_ne!(first.session_id, second.session_id);
+    assert_eq!(store.calls.load(AtomicOrdering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn tofu_mismatch_fails_rotation_and_preserves_the_previous_session() {
+    let provider = Arc::new(ControlledProvider::default());
+    let (steve_url, _) = test_server(provider, KeyExchangeSuite::X25519).await;
+    let store = Arc::new(MemoryPcrTrustStore::default());
+    let policy = PcrPolicy::trust_on_first_use(store.clone());
+    let client = test_client_with_policy(&steve_url, policy, KeyExchangeSuite::X25519);
+    let first = client.initialize().await.unwrap();
+
+    let mut wrong = expected_pcrs();
+    wrong.insert(2, vec![0x77; 48]);
+    store.replace_records(wrong);
+    assert!(matches!(
+        client.rotate_session().await,
+        Err(Error::PcrTrustMismatch)
+    ));
+    assert_eq!(
+        client.verify_attestation().await.unwrap().session_id,
+        first.session_id
+    );
+}
+
+#[tokio::test]
+async fn concurrent_tofu_initialization_has_one_atomic_enrollment() {
+    let provider = Arc::new(ControlledProvider::default());
+    let (steve_url, _) = test_server(provider.clone(), KeyExchangeSuite::X25519).await;
+    let store = Arc::new(MemoryPcrTrustStore::default());
+    let first = test_client_with_policy(
+        &steve_url,
+        PcrPolicy::trust_on_first_use(store.clone()),
+        KeyExchangeSuite::X25519,
+    );
+    let second = test_client_with_policy(
+        &steve_url,
+        PcrPolicy::trust_on_first_use(store.clone()),
+        KeyExchangeSuite::X25519,
+    );
+
+    let (first, second) = tokio::join!(first.initialize(), second.initialize());
+    let statuses = [first.unwrap().pcr_trust, second.unwrap().pcr_trust];
+    assert!(statuses.contains(&PcrTrustStatus::TofuEnrolled));
+    assert!(statuses.contains(&PcrTrustStatus::TofuMatched));
+    assert_eq!(store.records.lock().unwrap().len(), 1);
+    assert_eq!(store.calls.load(AtomicOrdering::Relaxed), 2);
+    assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn tofu_store_failure_prevents_application_traffic() {
+    let provider = Arc::new(ControlledProvider::default());
+    let (steve_url, upstream) = test_server(provider, KeyExchangeSuite::X25519).await;
+    let store = Arc::new(MemoryPcrTrustStore::default());
+    store.fail.store(true, AtomicOrdering::Relaxed);
+    let client = test_client_with_policy(
+        &steve_url,
+        PcrPolicy::trust_on_first_use(store.clone()),
+        KeyExchangeSuite::X25519,
+    );
+
+    assert!(matches!(
+        client.initialize().await,
+        Err(Error::PcrTrustStore(_))
+    ));
+    assert_eq!(store.calls.load(AtomicOrdering::Relaxed), 1);
+    assert_eq!(upstream.executions.load(AtomicOrdering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn invalid_attestation_and_binding_do_not_write_tofu() {
+    let cases = [
+        (true, false, None),
+        (false, true, None),
+        (false, false, Some(EvidenceMutation::Certificate)),
+        (false, false, Some(EvidenceMutation::Nonce)),
+        (false, false, Some(EvidenceMutation::MissingPcr)),
+        (false, false, Some(EvidenceMutation::ZeroPcr)),
+        (false, false, Some(EvidenceMutation::ShortPcr)),
+    ];
+    for (corrupt_signature, corrupt_binding, mutation) in cases {
+        let provider = Arc::new(ControlledProvider::default());
+        provider
+            .corrupt_signature
+            .store(corrupt_signature, AtomicOrdering::Relaxed);
+        provider
+            .corrupt_binding
+            .store(corrupt_binding, AtomicOrdering::Relaxed);
+        if mutation.is_some() {
+            *provider.evidence_mutation.lock().unwrap() = mutation;
+        }
+        let (steve_url, _) = test_server(provider, KeyExchangeSuite::X25519).await;
+        let store = Arc::new(MemoryPcrTrustStore::default());
+        let client = test_client_with_policy(
+            &steve_url,
+            PcrPolicy::trust_on_first_use(store.clone()),
+            KeyExchangeSuite::X25519,
+        );
+
+        assert!(client.initialize().await.is_err());
+        assert_eq!(store.calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(store.records.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn failed_confirmation_does_not_write_tofu() {
+    let provider = Arc::new(ControlledProvider::default());
+    let (steve_url, upstream) = test_server(provider, KeyExchangeSuite::X25519).await;
+    let proxy = Router::new()
+        .fallback(any(proxy_reject_confirmation))
+        .with_state(RejectConfirmationProxy {
+            target: steve_url,
+            http: HttpClient::new(),
+        });
+    let proxy_url = spawn_router(proxy).await;
+    let store = Arc::new(MemoryPcrTrustStore::default());
+    let client = test_client_with_policy(
+        &proxy_url,
+        PcrPolicy::trust_on_first_use(store.clone()),
+        KeyExchangeSuite::X25519,
+    );
+
+    assert!(matches!(
+        client.initialize().await,
+        Err(Error::ProtocolStatus {
+            operation: "session confirmation",
+            status: StatusCode::BAD_GATEWAY,
+            ..
+        })
+    ));
+    assert_eq!(store.calls.load(AtomicOrdering::Relaxed), 0);
+    assert_eq!(upstream.executions.load(AtomicOrdering::Relaxed), 0);
 }
 
 #[test]
