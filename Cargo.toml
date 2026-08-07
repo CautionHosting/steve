@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
 	"crates/steve",
+	"crates/steve-cli",
 	"crates/steve-sdk",
 	"crates/steve-xwing-wasm",
 ]
@@ -10,3 +11,4 @@ members = [
 # Logging
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+bootproof-sdk = { git = "https://git.distrust.co/public/bootproof.git", rev = "78f531a2c245404a9d8879fb71cc397096ae0077", version = "0.1.0" }
