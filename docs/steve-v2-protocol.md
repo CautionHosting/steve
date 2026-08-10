@@ -480,6 +480,20 @@ protocol.
 - Redirects are disabled and protocol responses must remain on the configured
   base origin.
 
+### 10.3 Reference CLI (non-normative)
+
+`steve-cli` maps its trust flags directly to the native policies above; it does
+not change E2P v2. Repeated `--pcrs FILE` values select a pinned allowlist
+(`--trusted-hashes-file` is an alias). With no trust flag, the CLI pins
+`.caution/trusted_hashes.json`. The mutually exclusive `--tofu-store FILE`
+selects TOFU backed by a versioned, atomic local file.
+
+The CLI never auto-updates PCRs. Deleting or replacing its TOFU file reopens
+first-use enrollment, so that file is a caller-controlled trust boundary rather
+than an independently authenticated initial identity. `--dry-run` validates the
+selected pinned files or existing TOFU state without networking or modifying
+TOFU state.
+
 In both profiles, `context_hash` is a client commitment included in the
 transcript. The server does not authenticate how it was constructed, so it is
 not server-side origin authorization.

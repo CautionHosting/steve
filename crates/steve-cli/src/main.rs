@@ -1,9 +1,14 @@
 mod cli;
 
 use clap::Parser;
-use cli::App;
-use std::error::Error;
-use std::process;
+use cli::{App, FilePcrTrustStore, PolicyInput};
+use std::{
+    error::Error,
+    io::{self, Write},
+    process,
+    sync::Arc,
+};
+use steve_sdk::PcrPolicy;
 use thiserror::Error;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -67,6 +72,14 @@ enum RunError {
     /// Steve SDK error.
     #[error(transparent)]
     Steve(#[from] steve_sdk::Error),
+
+    /// Error reading or validating the TOFU store.
+    #[error("Failed to validate TOFU store")]
+    TrustStore(#[from] cli::TrustStoreError),
+
+    /// Error writing the response body.
+    #[error("Failed to write response body")]
+    Output(#[source] io::Error),
 }
 
 /// Log an error and its full cause chain using tracing.
@@ -88,7 +101,11 @@ async fn run() -> Result<(), RunError> {
 
     let headers = app.parse_headers()?;
     let key_exchange = app.parse_key_exchange()?;
-    let url = reqwest::Url::parse(&app.url).map_err(RunError::InvalidUrl)?;
+    let url = url::Url::parse(&app.url).map_err(RunError::InvalidUrl)?;
+    let (policy, policy_description) = resolve_policy(&app)?;
+    let client_builder =
+        steve_sdk::Client::builder_with_policy(url.origin().ascii_serialization(), policy)?
+            .expected_key_exchange(key_exchange);
 
     let method = if app.body().is_some() {
         http::Method::POST
@@ -104,7 +121,7 @@ async fn run() -> Result<(), RunError> {
         println!("  URL: {}", app.url);
         println!("  Method: {method}");
         println!("  Key exchange: {key_exchange}");
-        println!("  Trusted hashes file: {}", app.trusted_hashes_file);
+        println!("  PCR policy: {policy_description}");
 
         if let Some(body) = app.body() {
             println!("  Body: {} bytes", body.len());
@@ -133,27 +150,27 @@ async fn run() -> Result<(), RunError> {
         return Ok(());
     }
 
-    // Load trusted hashes from file (only for non-dry-run)
-    let trusted_hashes = cli::TrustedHashes::load(&app.trusted_hashes_file)?;
-    let expected_pcrs = trusted_hashes.to_nitro_pcrs()?;
-
-    tracing::debug!("Loaded PCRs from {}", app.trusted_hashes_file);
-
     // Create and connect Steve SDK client
-    let client = steve_sdk::Client::builder(url.origin().ascii_serialization(), expected_pcrs)?
-        .expected_key_exchange(key_exchange)
-        .connect()
-        .await?;
+    let client = client_builder.connect().await?;
+    let attestation = client.verify_attestation().await?;
+    eprintln!("PCR trust: {:?}", attestation.pcr_trust);
+
+    let target = request_target(&url);
 
     let mut request_builder = match method {
-        http::Method::GET => client.get(url.path()),
-        http::Method::POST => client.post(url.path()),
+        http::Method::GET => client.get(target),
+        http::Method::POST => client.post(target),
         _ => return Err(RunError::UnsupportedMethod(method.to_string())),
     };
 
     for (name, value) in &headers {
         request_builder = request_builder
-            .header(name, value)
+            .header(
+                name.as_str(),
+                value
+                    .to_str()
+                    .expect("ASCII checked during argument parsing"),
+            )
             .expect("infallible conversion");
     }
 
@@ -172,7 +189,90 @@ async fn run() -> Result<(), RunError> {
     // Print response body to stdout (script-compatible)
     let body = response.text().map_err(RunError::InvalidResponseBody)?;
 
-    println!("{body}");
+    io::stdout()
+        .write_all(body.as_bytes())
+        .map_err(RunError::Output)?;
 
     Ok(())
+}
+
+fn resolve_policy(app: &App) -> Result<(PcrPolicy, String), RunError> {
+    match app.policy_input() {
+        PolicyInput::Pinned(paths) => {
+            let profiles = cli::load_profiles(&paths)?;
+            let description = if paths.len() == 1 {
+                let mut description = String::from("pinned (");
+                description.push_str(&paths[0].display().to_string());
+                description.push(')');
+                description
+            } else {
+                let mut description = String::from("pinned allowlist (");
+                description.push_str(&paths.len().to_string());
+                description.push_str(" profiles)");
+                description
+            };
+            Ok((PcrPolicy::pinned(profiles)?, description))
+        }
+        PolicyInput::Tofu(path) => {
+            let store = Arc::new(FilePcrTrustStore::new(path.clone()));
+            store.validate()?;
+            let mut description = String::from("TOFU (");
+            description.push_str(&path.display().to_string());
+            description.push(')');
+            Ok((PcrPolicy::trust_on_first_use(store), description))
+        }
+    }
+}
+
+fn request_target(url: &url::Url) -> String {
+    let mut target = url.path().to_owned();
+    if let Some(query) = url.query() {
+        target.push('?');
+        target.push_str(query);
+    }
+    target
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_with_policy(
+        pcrs_files: Vec<std::path::PathBuf>,
+        tofu_store: Option<std::path::PathBuf>,
+    ) -> App {
+        App {
+            url: "https://example.com/health".into(),
+            pcrs_files,
+            tofu_store,
+            key_exchange: "X25519".into(),
+            dry_run: true,
+            data: None,
+            json: None,
+            headers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn request_target_preserves_query_and_ignores_fragment() {
+        let url = url::Url::parse("https://example.com/items?limit=2#ignored").unwrap();
+        assert_eq!(request_target(&url), "/items?limit=2");
+    }
+
+    #[test]
+    fn policy_resolution_validates_pinned_input_before_networking() {
+        let missing = tempfile::tempdir().unwrap().path().join("missing.json");
+        assert!(matches!(
+            resolve_policy(&app_with_policy(vec![missing], None)),
+            Err(RunError::TrustedHashes(_))
+        ));
+    }
+
+    #[test]
+    fn policy_resolution_does_not_create_a_missing_tofu_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trust.json");
+        resolve_policy(&app_with_policy(Vec::new(), Some(path.clone()))).unwrap();
+        assert!(!path.exists());
+    }
 }

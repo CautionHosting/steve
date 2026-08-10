@@ -2,26 +2,43 @@
 //!
 //! This module provides the CLI argument parsing using Clap.
 
+use async_trait::async_trait;
 use clap::Parser;
+use fs2::FileExt;
 use http::header::HeaderMap;
-use std::fs;
-use std::path::Path;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
+use steve_sdk::{ExpectedPcrs, PcrTrustKey, PcrTrustRecord, PcrTrustStore, PcrTrustStoreError};
 use thiserror::Error;
 
-/// Steve CLI - A curl-like HTTP client
+pub const DEFAULT_PCRS_FILE: &str = ".caution/trusted_hashes.json";
+const TRUST_STORE_VERSION: u32 = 1;
+
+/// Make one attested, end-to-end encrypted HTTP request
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct App {
     /// The URL to request
     pub url: String,
 
-    /// Path to the Caution trusted-hashes file
+    /// Approved Caution trusted-hashes file; repeat for a pinned allowlist
     #[arg(
-        long,
+        long = "pcrs",
+        visible_alias = "trusted-hashes-file",
         value_name = "PATH",
-        default_value = ".caution/trusted-hashes.json"
+        action = clap::ArgAction::Append,
+        conflicts_with = "tofu_store"
     )]
-    pub trusted_hashes_file: String,
+    pub pcrs_files: Vec<PathBuf>,
+
+    /// Durable JSON trust store for trust on first use
+    #[arg(long, value_name = "PATH", conflicts_with = "pcrs_files")]
+    pub tofu_store: Option<PathBuf>,
 
     /// Key exchange suite (X25519 or XWING-DRAFT10)
     #[arg(long, value_name = "SUITE", default_value = "X25519")]
@@ -88,6 +105,10 @@ pub enum ParseHeadersError {
     /// Error appending a header to the map.
     #[error("Failed to append header")]
     AppendHeader(#[from] AppendHeaderError),
+
+    /// A duplicate header name cannot be represented by E2P v2.
+    #[error("Duplicate header name is not supported: {0}")]
+    DuplicateName(String),
 }
 
 /// Error from parsing the key exchange suite string.
@@ -101,6 +122,10 @@ pub enum ParseKeyExchangeError {
 /// Error from parsing a single PCR value.
 #[derive(Error, Debug)]
 pub enum ParsePcrError {
+    /// The PCR value is missing.
+    #[error("missing")]
+    Missing,
+
     /// The PCR value is not valid hex.
     #[error("not valid hex")]
     InvalidHex(#[source] hex::FromHexError),
@@ -108,6 +133,10 @@ pub enum ParsePcrError {
     /// The PCR value has invalid length.
     #[error("invalid length: expected {expected} bytes, got {actual}")]
     InvalidLength { expected: usize, actual: usize },
+
+    /// Debug PCRs cannot establish workload identity.
+    #[error("all-zero debug PCRs are not accepted")]
+    AllZero,
 }
 
 /// Error from loading the trusted hashes file.
@@ -131,7 +160,7 @@ pub enum TrustedHashesError {
 }
 
 /// Trusted hashes file format from Caution.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TrustedHashes {
     #[serde(rename = "pcr0")]
     pub pcr0: String,
@@ -140,7 +169,7 @@ pub struct TrustedHashes {
     #[serde(rename = "pcr2")]
     pub pcr2: String,
     #[allow(dead_code)]
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_at: Option<String>,
 }
 
@@ -153,11 +182,9 @@ impl TrustedHashes {
     }
 
     /// Convert to steve-sdk's `NitroPcrs` format.
-    pub fn to_nitro_pcrs(
-        &self,
-    ) -> Result<bootproof_sdk::format::nitro::NitroPcrs, TrustedHashesError> {
+    pub fn to_nitro_pcrs(&self) -> Result<ExpectedPcrs, TrustedHashesError> {
         const PCR_LENGTH: usize = 48;
-        let mut pcrs = bootproof_sdk::format::nitro::NitroPcrs::new();
+        let mut pcrs = ExpectedPcrs::new();
 
         pcrs.insert(0, parse_pcr(0, &self.pcr0, PCR_LENGTH)?);
         pcrs.insert(1, parse_pcr(1, &self.pcr1, PCR_LENGTH)?);
@@ -165,6 +192,192 @@ impl TrustedHashes {
 
         Ok(pcrs)
     }
+
+    fn from_pcrs(pcrs: &ExpectedPcrs) -> Result<Self, TrustedHashesError> {
+        let read = |index| {
+            pcrs.get(&index)
+                .map(hex::encode)
+                .ok_or_else(|| invalid_pcr(index, ParsePcrError::Missing))
+        };
+        Ok(Self {
+            pcr0: read(0)?,
+            pcr1: read(1)?,
+            pcr2: read(2)?,
+            verified_at: None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PolicyInput {
+    Pinned(Vec<PathBuf>),
+    Tofu(PathBuf),
+}
+
+pub fn load_profiles(paths: &[PathBuf]) -> Result<Vec<ExpectedPcrs>, TrustedHashesError> {
+    paths
+        .iter()
+        .map(|path| TrustedHashes::load(path)?.to_nitro_pcrs())
+        .collect()
+}
+
+#[derive(Debug, Error)]
+pub enum TrustStoreError {
+    #[error("TOFU store I/O failed")]
+    Io(#[from] io::Error),
+
+    #[error("TOFU store contains invalid JSON")]
+    Json(#[from] serde_json::Error),
+
+    #[error("TOFU store contains invalid PCRs")]
+    Pcr(#[from] TrustedHashesError),
+
+    #[error("unsupported TOFU store version {actual}; expected {expected}")]
+    UnsupportedVersion { actual: u32, expected: u32 },
+
+    #[error("TOFU store contains an invalid trust key")]
+    InvalidKey,
+
+    #[error("TOFU store path has no file name")]
+    MissingFileName,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct TrustDatabase {
+    version: u32,
+    records: BTreeMap<String, TrustedHashes>,
+}
+
+impl Default for TrustDatabase {
+    fn default() -> Self {
+        Self {
+            version: TRUST_STORE_VERSION,
+            records: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct FilePcrTrustStore {
+    path: PathBuf,
+}
+
+impl FilePcrTrustStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Validate existing state without creating or modifying the store.
+    pub fn validate(&self) -> Result<(), TrustStoreError> {
+        if self.path.file_name().is_none() {
+            return Err(TrustStoreError::MissingFileName);
+        }
+        let Some(database) = read_database_if_present(&self.path)? else {
+            return Ok(());
+        };
+        validate_database(&database)
+    }
+}
+
+#[async_trait]
+impl PcrTrustStore for FilePcrTrustStore {
+    async fn load_or_insert(
+        &self,
+        key: PcrTrustKey,
+        observed: ExpectedPcrs,
+    ) -> std::result::Result<PcrTrustRecord, PcrTrustStoreError> {
+        let path = self.path.clone();
+        match tokio::task::spawn_blocking(move || load_or_insert(&path, key, observed)).await {
+            Ok(result) => result.map_err(|error| Box::new(error) as PcrTrustStoreError),
+            Err(error) => Err(Box::new(error)),
+        }
+    }
+}
+
+fn load_or_insert(
+    path: &Path,
+    key: PcrTrustKey,
+    observed: ExpectedPcrs,
+) -> Result<PcrTrustRecord, TrustStoreError> {
+    load_or_insert_key(path, hex::encode(key.as_bytes()), observed)
+}
+
+fn load_or_insert_key(
+    path: &Path,
+    key: String,
+    observed: ExpectedPcrs,
+) -> Result<PcrTrustRecord, TrustStoreError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    let file_name = path.file_name().ok_or(TrustStoreError::MissingFileName)?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(parent.join(lock_name))?;
+    lock.lock_exclusive()?;
+
+    let mut database = read_database_if_present(path)?.unwrap_or_default();
+    validate_database(&database)?;
+    if let Some(existing) = database.records.get(&key) {
+        return Ok(PcrTrustRecord::Existing(existing.to_nitro_pcrs()?));
+    }
+
+    database
+        .records
+        .insert(key, TrustedHashes::from_pcrs(&observed)?);
+    persist_database(path, parent, &database)?;
+    Ok(PcrTrustRecord::Inserted)
+}
+
+fn read_database_if_present(path: &Path) -> Result<Option<TrustDatabase>, TrustStoreError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_database(database: &TrustDatabase) -> Result<(), TrustStoreError> {
+    if database.version != TRUST_STORE_VERSION {
+        return Err(TrustStoreError::UnsupportedVersion {
+            actual: database.version,
+            expected: TRUST_STORE_VERSION,
+        });
+    }
+    for (key, record) in &database.records {
+        if key.len() != 64
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(TrustStoreError::InvalidKey);
+        }
+        record.to_nitro_pcrs()?;
+    }
+    Ok(())
+}
+
+fn persist_database(
+    path: &Path,
+    parent: &Path,
+    database: &TrustDatabase,
+) -> Result<(), TrustStoreError> {
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temporary, database)?;
+    temporary.write_all(b"\n")?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// Parse a single PCR value from a hex string.
@@ -180,25 +393,45 @@ impl TrustedHashes {
 /// # Errors
 /// Returns [`ParsePcrError`] if the hex is invalid or the length is incorrect.
 fn parse_pcr(index: u8, value: &str, expected_len: usize) -> Result<Vec<u8>, TrustedHashesError> {
-    let bytes = hex::decode(value).map_err(|e| TrustedHashesError::InvalidPcr {
-        index,
-        source: Box::new(ParsePcrError::InvalidHex(e)),
-    })?;
+    let bytes =
+        hex::decode(value).map_err(|error| invalid_pcr(index, ParsePcrError::InvalidHex(error)))?;
 
     if bytes.len() != expected_len {
-        return Err(TrustedHashesError::InvalidPcr {
+        return Err(invalid_pcr(
             index,
-            source: Box::new(ParsePcrError::InvalidLength {
+            ParsePcrError::InvalidLength {
                 expected: expected_len,
                 actual: bytes.len(),
-            }),
-        });
+            },
+        ));
+    }
+    if bytes.iter().all(|byte| *byte == 0) {
+        return Err(invalid_pcr(index, ParsePcrError::AllZero));
     }
 
     Ok(bytes)
 }
 
+fn invalid_pcr(index: u8, source: ParsePcrError) -> TrustedHashesError {
+    TrustedHashesError::InvalidPcr {
+        index,
+        source: Box::new(source),
+    }
+}
+
 impl App {
+    /// Resolve the explicit policy flags or the default Caution PCR file.
+    #[must_use]
+    pub fn policy_input(&self) -> PolicyInput {
+        match &self.tofu_store {
+            Some(path) => PolicyInput::Tofu(path.clone()),
+            None if self.pcrs_files.is_empty() => {
+                PolicyInput::Pinned(vec![PathBuf::from(DEFAULT_PCRS_FILE)])
+            }
+            None => PolicyInput::Pinned(self.pcrs_files.clone()),
+        }
+    }
+
     /// Parse the headers from the raw string vector into a [`HeaderMap`].
     ///
     /// # Errors
@@ -208,7 +441,12 @@ impl App {
 
         for header in &self.headers {
             let (name, value) = parse_header(header)?;
-            append_header(&mut headers, name, value)?;
+            let header_name: http::header::HeaderName =
+                name.parse().map_err(AppendHeaderError::ParseName)?;
+            if headers.contains_key(&header_name) {
+                return Err(ParseHeadersError::DuplicateName(name.to_owned()));
+            }
+            append_header(&mut headers, header_name, value)?;
         }
 
         Ok(headers)
@@ -280,12 +518,9 @@ fn parse_header(header: &str) -> Result<(&str, &str), ParseHeaderError> {
 /// Returns [`AppendHeaderError`] if the header name or value is invalid.
 fn append_header(
     headers: &mut HeaderMap,
-    name: &str,
+    name: http::header::HeaderName,
     value: &str,
 ) -> Result<(), AppendHeaderError> {
-    let header_name: http::header::HeaderName =
-        name.parse().map_err(AppendHeaderError::ParseName)?;
-
     // HTTP headers must be ASCII-only; reject non-ASCII characters
     if !value.is_ascii() {
         return Err(AppendHeaderError::NonAsciiValue);
@@ -293,18 +528,28 @@ fn append_header(
 
     let header_value =
         http::header::HeaderValue::from_str(value).map_err(AppendHeaderError::ParseValue)?;
-    headers.append(header_name, header_value);
+    headers.insert(name, header_value);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    fn expected_pcrs(seed: u8) -> ExpectedPcrs {
+        ExpectedPcrs::from([
+            (0, vec![seed; 48]),
+            (1, vec![seed.wrapping_add(1); 48]),
+            (2, vec![seed.wrapping_add(2); 48]),
+        ])
+    }
 
     fn make_app(url: &str, data: Option<&str>, json: Option<&str>, headers: Vec<&str>) -> App {
         App {
             url: url.to_string(),
-            trusted_hashes_file: ".caution/trusted-hashes.json".to_string(),
+            pcrs_files: Vec::new(),
+            tofu_store: None,
             key_exchange: "X25519".to_string(),
             dry_run: false,
             data: data.map(String::from),
@@ -411,6 +656,56 @@ mod tests {
     }
 
     #[test]
+    fn policy_flags_support_allowlists_aliases_and_tofu_exclusivity() {
+        let pinned = App::try_parse_from([
+            "steve",
+            "--pcrs",
+            "current.json",
+            "--pcrs",
+            "next.json",
+            "http://example.com",
+        ])
+        .unwrap();
+        assert_eq!(
+            pinned.policy_input(),
+            PolicyInput::Pinned(vec!["current.json".into(), "next.json".into()])
+        );
+
+        let alias = App::try_parse_from([
+            "steve",
+            "--trusted-hashes-file",
+            "trusted.json",
+            "http://example.com",
+        ])
+        .unwrap();
+        assert_eq!(
+            alias.policy_input(),
+            PolicyInput::Pinned(vec!["trusted.json".into()])
+        );
+
+        assert!(
+            App::try_parse_from([
+                "steve",
+                "--pcrs",
+                "trusted.json",
+                "--tofu-store",
+                "trust.json",
+                "http://example.com",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn default_policy_uses_the_caution_trusted_hashes_path() {
+        let app = make_app("http://example.com", None, None, vec![]);
+        assert_eq!(
+            app.policy_input(),
+            PolicyInput::Pinned(vec![PathBuf::from(DEFAULT_PCRS_FILE)])
+        );
+    }
+
+    #[test]
     fn test_parse_header_with_multiple_colons() {
         let app = make_app("http://example.com", None, None, vec!["X-Time: 12:30:45"]);
 
@@ -419,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_headers_duplicate_names() {
+    fn test_parse_headers_rejects_duplicate_names() {
         let app = make_app(
             "http://example.com",
             None,
@@ -427,13 +722,10 @@ mod tests {
             vec!["X-Custom: value1", "X-Custom: value2"],
         );
 
-        let headers = app.parse_headers().unwrap();
-        // Verify we have 2 entries for X-Custom
-        let count = headers
-            .iter()
-            .filter(|(name, _)| name.as_str() == "x-custom")
-            .count();
-        assert_eq!(count, 2);
+        assert!(matches!(
+            app.parse_headers(),
+            Err(ParseHeadersError::DuplicateName(name)) if name == "X-Custom"
+        ));
     }
 
     #[test]
@@ -456,15 +748,19 @@ mod tests {
 
     #[test]
     fn test_append_header_error_invalid_name() {
-        let mut headers = HeaderMap::new();
-        let result = append_header(&mut headers, "\0invalid", "value");
-        assert!(matches!(result, Err(AppendHeaderError::ParseName(_))));
+        let app = make_app("http://example.com", None, None, vec!["\0invalid: value"]);
+        assert!(matches!(
+            app.parse_headers(),
+            Err(ParseHeadersError::AppendHeader(
+                AppendHeaderError::ParseName(_)
+            ))
+        ));
     }
 
     #[test]
     fn test_append_header_error_invalid_value() {
         let mut headers = HeaderMap::new();
-        let result = append_header(&mut headers, "X-Custom", "\0invalid");
+        let result = append_header(&mut headers, "X-Custom".parse().unwrap(), "\0invalid");
         assert!(matches!(result, Err(AppendHeaderError::ParseValue(_))));
     }
 
@@ -490,7 +786,7 @@ mod tests {
     fn test_append_header_valid_ascii_utf8_to_str() {
         let mut headers = HeaderMap::new();
         // ASCII header values work with to_str()
-        let result = append_header(&mut headers, "X-Custom", "hello world");
+        let result = append_header(&mut headers, "X-Custom".parse().unwrap(), "hello world");
         assert!(result.is_ok());
         let value = headers.get("x-custom").unwrap();
         assert_eq!(value.to_str().unwrap(), "hello world");
@@ -512,7 +808,7 @@ mod tests {
     #[test]
     fn test_trusted_hashes_valid() {
         let json = r#"{
-            "pcr0": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "pcr0": "101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010",
             "pcr1": "111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
             "pcr2": "222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222"
         }"#;
@@ -534,7 +830,7 @@ mod tests {
     #[test]
     fn test_trusted_hashes_to_nitro_pcrs() {
         let json = r#"{
-            "pcr0": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "pcr0": "101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010",
             "pcr1": "111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
             "pcr2": "222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222"
         }"#;
@@ -546,7 +842,7 @@ mod tests {
     #[test]
     fn test_trusted_hashes_to_nitro_pcrs_invalid_length() {
         let json = r#"{
-            "pcr0": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "pcr0": "101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010",
             "pcr1": "111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
             "pcr2": "2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222"
         }"#;
@@ -560,7 +856,7 @@ mod tests {
 
     #[test]
     fn test_parse_pcr_valid() {
-        let valid_hex = "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+        let valid_hex = "101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010";
         let result = parse_pcr(0, valid_hex, 48);
         assert!(result.is_ok());
     }
@@ -594,6 +890,129 @@ mod tests {
             }
             _ => panic!("Expected InvalidPcr with index 2 and InvalidLength source"),
         }
+    }
+
+    #[test]
+    fn test_parse_pcr_rejects_all_zero_debug_values() {
+        let result = parse_pcr(0, &"00".repeat(48), 48);
+        assert!(matches!(
+            result,
+            Err(TrustedHashesError::InvalidPcr { source, .. })
+                if matches!(*source, ParsePcrError::AllZero)
+        ));
+    }
+
+    #[test]
+    fn loads_multiple_complete_pcr_profiles() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first.json");
+        let second_path = directory.path().join("second.json");
+        let first = expected_pcrs(0x10);
+        let second = expected_pcrs(0x20);
+        fs::write(
+            &first_path,
+            serde_json::to_vec(&TrustedHashes::from_pcrs(&first).unwrap()).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &second_path,
+            serde_json::to_vec(&TrustedHashes::from_pcrs(&second).unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_profiles(&[first_path, second_path]).unwrap(),
+            [first, second]
+        );
+    }
+
+    #[test]
+    fn tofu_store_is_atomic_persistent_and_never_replaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Arc::new(directory.path().join("trust.json"));
+        let pcrs = expected_pcrs(0x10);
+        let key = "11".repeat(32);
+        let threads = (0..2)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let pcrs = pcrs.clone();
+                let key = key.clone();
+                std::thread::spawn(move || load_or_insert_key(&path, key, pcrs).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let outcomes = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == PcrTrustRecord::Inserted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, PcrTrustRecord::Existing(_)))
+                .count(),
+            1
+        );
+
+        let before = fs::read(path.as_ref()).unwrap();
+        assert_eq!(
+            load_or_insert_key(path.as_ref(), key, expected_pcrs(0x30)).unwrap(),
+            PcrTrustRecord::Existing(pcrs)
+        );
+        assert_eq!(fs::read(path.as_ref()).unwrap(), before);
+        FilePcrTrustStore::new(path.as_ref().clone())
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn tofu_store_validation_is_read_only_and_rejects_bad_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.json");
+        FilePcrTrustStore::new(missing.clone()).validate().unwrap();
+        assert!(!missing.exists());
+
+        assert!(matches!(
+            FilePcrTrustStore::new(PathBuf::new()).validate(),
+            Err(TrustStoreError::MissingFileName)
+        ));
+
+        let corrupt = directory.path().join("corrupt.json");
+        fs::write(&corrupt, b"not json").unwrap();
+        assert!(matches!(
+            FilePcrTrustStore::new(corrupt).validate(),
+            Err(TrustStoreError::Json(_))
+        ));
+
+        let unsupported = directory.path().join("unsupported.json");
+        fs::write(&unsupported, br#"{"version":2,"records":{}}"#).unwrap();
+        assert!(matches!(
+            FilePcrTrustStore::new(unsupported).validate(),
+            Err(TrustStoreError::UnsupportedVersion { actual: 2, .. })
+        ));
+
+        let invalid_key = directory.path().join("invalid-key.json");
+        fs::write(
+            &invalid_key,
+            serde_json::to_vec(&TrustDatabase {
+                version: TRUST_STORE_VERSION,
+                records: BTreeMap::from([(
+                    "not-a-key".into(),
+                    TrustedHashes::from_pcrs(&expected_pcrs(0x10)).unwrap(),
+                )]),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            FilePcrTrustStore::new(invalid_key).validate(),
+            Err(TrustStoreError::InvalidKey)
+        ));
     }
 
     #[test]

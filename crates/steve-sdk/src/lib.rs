@@ -955,15 +955,6 @@ async fn read_response_body(response: &mut reqwest::Response, limit: usize) -> R
     Ok(body)
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum RequestBuilderHeaderError {
-    #[error("invalid header name")]
-    Name(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
-
-    #[error("invalid header value")]
-    Value(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
-}
-
 pub struct RequestBuilder {
     client: Client,
     method: Method,
@@ -973,23 +964,12 @@ pub struct RequestBuilder {
 }
 
 impl RequestBuilder {
-    pub fn header<E1, E2>(
+    pub fn header(
         mut self,
-        key: impl TryInto<HeaderName, Error = E1>,
-        value: impl TryInto<HeaderValue, Error = E2>,
-    ) -> Result<Self, RequestBuilderHeaderError>
-        where
-            E1: std::error::Error + Send + Sync + 'static,
-            E2: std::error::Error + Send + Sync + 'static,
-    {
-        let key = key
-            .try_into()
-            .map_err(|err| RequestBuilderHeaderError::Name(Box::new(err)))?;
-        let value = value
-            .try_into()
-            .map_err(Box::new)
-            .map_err(|err| RequestBuilderHeaderError::Value(Box::new(err)))?;
-        self.headers.insert(key, value);
+        key: impl TryInto<HeaderName, Error = reqwest::header::InvalidHeaderName>,
+        value: impl TryInto<HeaderValue, Error = reqwest::header::InvalidHeaderValue>,
+    ) -> Result<Self> {
+        self.headers.insert(key.try_into()?, value.try_into()?);
         Ok(self)
     }
 
