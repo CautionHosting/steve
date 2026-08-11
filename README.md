@@ -11,8 +11,9 @@ See the [normative STEVE v2 protocol specification](docs/steve-v2-protocol.md).
 > selected suite into the transcript and Nitro evidence. X-Wing protects
 > session secrecy independently of expected-deployment identity, but does not
 > provide trusted first-load bootstrap or expected-PCR delivery. STEVE rejects
-> plaintext application routing by default. The native Rust SDK requires independently supplied
-> expected PCR0/1/2 values; the browser SDK does not yet enforce expected PCRs.
+> plaintext application routing by default. Native clients require an explicit
+> PCR policy: reviewed pinned profiles or caller-persisted trust on first use
+> (TOFU). The browser SDK does not yet enforce expected PCRs.
 
 ## Architecture
 
@@ -71,7 +72,8 @@ For requests intercepted by the active v2 worker, the host terminates TLS but on
 | Component | Location | Description |
 |-----------|----------|-------------|
 | `steve` | Enclave | Rust proxy - decrypts requests, encrypts responses |
-| `steve-sdk` | Client (Rust) | Rust SDK for native applications |
+| `steve-sdk` | Client (Rust) | Native SDK with pinned-allowlist and TOFU PCR policies |
+| `steve-cli` | Client (Rust) | One-request CLI using the native SDK policies |
 | `steve-js-sdk` | Client (Browser) | Service worker for web applications |
 
 At startup `steve` writes enclave metadata to `E2P_METADATA_FILE` (default
@@ -187,9 +189,11 @@ closed without a classic-worker or cryptographic fallback. See
 
 ### Native (Rust)
 
-The native SDK requires reviewed, nonzero 48-byte PCR0/1/2 values and verifies
-them together with the Nitro certificate chain, fresh nonce, session transcript,
-selected suite, and derived-key binder.
+The native SDK requires an explicit PCR policy. A pinned policy accepts one or
+more reviewed, complete PCR0/1/2 profiles. TOFU records the first fully verified
+profile in caller-owned durable storage and requires it on later sessions. PCRs
+are checked together with the Nitro certificate chain, fresh nonce, session
+transcript, selected suite, and derived-key binder.
 
 ```rust
 use steve_sdk::{Client, ExpectedPcrs};
@@ -214,6 +218,21 @@ their own binding with `Client::builder(...).application_context(...)`.
 Sessions rotate after 25 minutes. Requests have a 30-second deadline and are
 never automatically retried because an upstream operation may already have
 executed.
+
+### CLI
+
+`steve-cli` is a narrow one-request wrapper around those SDK policies. It uses
+`.caution/trusted_hashes.json` by default, accepts repeated `--pcrs` files for
+upgrade allowlists, or a mutually exclusive `--tofu-store` for continuity after
+first use:
+
+```bash
+cargo run -p steve-cli -- --pcrs current.json --pcrs next.json \
+  'https://secure.example/api/secret?required=true'
+```
+
+See the [`steve-cli` README](crates/steve-cli/README.md) for TOFU, dry-run, and
+X-Wing examples and the trust-file boundary.
 
 ## Validation
 

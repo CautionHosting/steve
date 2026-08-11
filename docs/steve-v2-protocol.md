@@ -454,12 +454,48 @@ protocol.
               || 0x00 || application_context)
   ```
 
-- The SDK requires independently supplied PCR0, PCR1, and PCR2. Each expected
-  PCR is 48 bytes and all-zero debug PCRs are rejected.
+- `Client::new` and `Client::builder` require one independently supplied PCR
+  profile. Policy-aware constructors additionally support either a nonempty
+  allowlist of complete profiles or persistent trust on first use (TOFU).
+- Every profile requires nonzero, 48-byte PCR0, PCR1, and PCR2 values. Pinned
+  policy accepts only one whole profile; values from different profiles cannot
+  be mixed. Attested PCRs not configured in that profile are ignored.
+- TOFU stores verified PCR0, PCR1, and PCR2 under an opaque key derived as:
+
+  ```text
+  SHA-256("STEVE-E2P-V2-PCR-TOFU\0" || context_hash
+          || UTF8(pinned_suite))
+  ```
+
+  The embedding application supplies durable storage with atomic
+  load-or-insert semantics. Enrollment occurs only after Nitro evidence,
+  nonce, suite, transcript, binder, and session confirmation succeed. An
+  existing different value or storage failure aborts before application
+  traffic. The SDK never replaces the record.
+- Attestation results report `Pinned`, `TofuEnrolled`, or `TofuMatched`. TOFU
+  establishes continuity after first use, not independently pinned workload
+  identity on first use. A PCR-changing upgrade requires either a preapproved
+  pinned profile or explicit out-of-band replacement of the TOFU record.
+- There is no unpinned policy, automatic policy downgrade, or plaintext
+  fallback in the native SDK.
 - The SDK caps session, confirmation, and application protocol responses at
   65,536 bytes, 4,096 bytes, and 33,619,968 bytes respectively.
 - Redirects are disabled and protocol responses must remain on the configured
   base origin.
+
+### 10.3 Reference CLI (non-normative)
+
+`steve-cli` maps its trust flags directly to the native policies above; it does
+not change E2P v2. Repeated `--pcrs FILE` values select a pinned allowlist
+(`--trusted-hashes-file` is an alias). With no trust flag, the CLI pins
+`.caution/trusted_hashes.json`. The mutually exclusive `--tofu-store FILE`
+selects TOFU backed by a versioned, atomic local file.
+
+The CLI never auto-updates PCRs. Deleting or replacing its TOFU file reopens
+first-use enrollment, so that file is a caller-controlled trust boundary rather
+than an independently authenticated initial identity. `--dry-run` validates the
+selected pinned files or existing TOFU state without networking or modifying
+TOFU state.
 
 In both profiles, `context_hash` is a client commitment included in the
 transcript. The server does not authenticate how it was constructed, so it is

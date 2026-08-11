@@ -12,11 +12,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bootproof_sdk::{
     VerifiableSignedAttestationFormat,
     format::nitro::{Nitro, NitroPcrs},
 };
+use coset::{CborSerializable, CoseSign1, TaggedCborSerializable};
 use protocol::{
     Direction, Envelope, MessageType, PROTOCOL_ID, ProtocolError, SessionRequest, SessionResponse,
     SessionSecrets, VERSION, build_transcript, decode_cbor, derive_secrets, encode_cbor, fixed,
@@ -52,8 +54,101 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLAY_WINDOW_SIZE: u128 = 64;
 const PCR_SIZE: usize = 48;
 const NATIVE_CONTEXT_MAGIC: &[u8] = b"STEVE-E2P-V2-NATIVE\0";
+const PCR_TRUST_KEY_MAGIC: &[u8] = b"STEVE-E2P-V2-PCR-TOFU\0";
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Error returned by a caller-owned PCR trust store.
+pub type PcrTrustStoreError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Stable, origin- and suite-bound key for a caller-owned PCR trust store.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PcrTrustKey([u8; 32]);
+
+impl PcrTrustKey {
+    /// Return the stable storage key bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Result of an atomic trust-on-first-use store operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PcrTrustRecord {
+    /// The supplied PCRs were durably inserted.
+    Inserted,
+    /// The key was already present with this value; it was not replaced.
+    Existing(ExpectedPcrs),
+}
+
+/// Durable storage used by trust-on-first-use PCR policy.
+#[async_trait]
+pub trait PcrTrustStore: Send + Sync {
+    /// Atomically insert `observed` when `key` is absent, or return the existing record.
+    async fn load_or_insert(
+        &self,
+        key: PcrTrustKey,
+        observed: ExpectedPcrs,
+    ) -> std::result::Result<PcrTrustRecord, PcrTrustStoreError>;
+}
+
+/// PCR acceptance policy applied to every attested session.
+#[derive(Clone)]
+pub struct PcrPolicy {
+    kind: PcrPolicyKind,
+}
+
+#[derive(Clone)]
+enum PcrPolicyKind {
+    Pinned(Vec<ExpectedPcrs>),
+    TrustOnFirstUse(Arc<dyn PcrTrustStore>),
+}
+
+impl PcrPolicy {
+    /// Require one complete approved PCR profile to match.
+    pub fn pinned(profiles: impl IntoIterator<Item = ExpectedPcrs>) -> Result<Self> {
+        let profiles = profiles.into_iter().collect::<Vec<_>>();
+        if profiles.is_empty() {
+            return Err(Error::EmptyPcrPolicy);
+        }
+        for profile in &profiles {
+            validate_expected_pcrs(profile)?;
+        }
+        Ok(Self {
+            kind: PcrPolicyKind::Pinned(profiles),
+        })
+    }
+
+    /// Enroll the first verified PCR0/1/2 profile in caller-owned durable storage.
+    pub fn trust_on_first_use(store: Arc<dyn PcrTrustStore>) -> Self {
+        Self {
+            kind: PcrPolicyKind::TrustOnFirstUse(store),
+        }
+    }
+}
+
+impl Debug for PcrPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            PcrPolicyKind::Pinned(profiles) => formatter
+                .debug_struct("PcrPolicy::Pinned")
+                .field("profiles", &profiles.len())
+                .finish(),
+            PcrPolicyKind::TrustOnFirstUse(_) => formatter.write_str("PcrPolicy::TrustOnFirstUse"),
+        }
+    }
+}
+
+/// PCR policy outcome for an established session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PcrTrustStatus {
+    /// The attested PCRs matched one complete approved profile.
+    Pinned,
+    /// This session atomically enrolled its verified PCR0/1/2 values.
+    TofuEnrolled,
+    /// This session matched PCR0/1/2 values enrolled previously.
+    TofuMatched,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum KeyExchangeSuite {
@@ -102,6 +197,21 @@ pub enum Error {
 
     #[error("expected PCR {index} is invalid: {reason}")]
     InvalidExpectedPcr { index: u8, reason: &'static str },
+
+    #[error("pinned PCR policy must contain at least one profile")]
+    EmptyPcrPolicy,
+
+    #[error("attested PCR {index} is invalid: {reason}")]
+    InvalidAttestedPcr { index: u8, reason: &'static str },
+
+    #[error("attested PCRs do not match any approved profile")]
+    UnapprovedPcrProfile,
+
+    #[error("attested PCRs do not match the trust-on-first-use record")]
+    PcrTrustMismatch,
+
+    #[error("PCR trust store failed: {0}")]
+    PcrTrustStore(#[source] PcrTrustStoreError),
 
     #[error("request path escapes the configured base origin")]
     UrlEscapesBase,
@@ -202,7 +312,7 @@ struct Inner {
     http: HttpClient,
     base_url: Url,
     context_hash: [u8; 32],
-    expected_pcrs: NitroPcrs,
+    pcr_policy: PcrPolicy,
     expected_key_exchange: KeyExchangeSuite,
     session_rotation_interval: Duration,
     session_establishment_timeout: Duration,
@@ -261,6 +371,13 @@ pub struct AttestationInfo {
     pub session_id: [u8; 16],
     pub module_id: String,
     pub pcrs: NitroPcrs,
+    pub pcr_trust: PcrTrustStatus,
+}
+
+struct VerifiedAttestation {
+    session_id: [u8; 16],
+    module_id: String,
+    pcrs: NitroPcrs,
 }
 
 struct SessionState {
@@ -363,7 +480,7 @@ pub struct ClientBuilder {
     transport_builder: reqwest::ClientBuilder,
     base_url: Url,
     application_context: Option<Vec<u8>>,
-    expected_pcrs: NitroPcrs,
+    pcr_policy: PcrPolicy,
     expected_key_exchange: KeyExchangeSuite,
     session_rotation_interval: Duration,
     session_establishment_timeout: Duration,
@@ -377,7 +494,7 @@ impl Debug for ClientBuilder {
             .debug_struct("ClientBuilder")
             .field("base_url", &self.base_url)
             .field("application_context", &self.application_context.is_some())
-            .field("expected_pcrs", &self.expected_pcrs)
+            .field("pcr_policy", &self.pcr_policy)
             .field("expected_key_exchange", &self.expected_key_exchange)
             .field("session_rotation_interval", &self.session_rotation_interval)
             .field(
@@ -438,7 +555,7 @@ impl ClientBuilder {
                 http,
                 base_url: self.base_url,
                 context_hash,
-                expected_pcrs: self.expected_pcrs,
+                pcr_policy: self.pcr_policy,
                 expected_key_exchange: self.expected_key_exchange,
                 session_rotation_interval: self.session_rotation_interval,
                 session_establishment_timeout: self.session_establishment_timeout,
@@ -460,13 +577,19 @@ impl ClientBuilder {
 
 impl Client {
     pub fn builder(base_url: impl AsRef<str>, expected_pcrs: NitroPcrs) -> Result<ClientBuilder> {
-        validate_expected_pcrs(&expected_pcrs)?;
+        Self::builder_with_policy(base_url, PcrPolicy::pinned([expected_pcrs])?)
+    }
+
+    pub fn builder_with_policy(
+        base_url: impl AsRef<str>,
+        pcr_policy: PcrPolicy,
+    ) -> Result<ClientBuilder> {
         let base_url = normalize_base_url(base_url.as_ref())?;
         Ok(ClientBuilder {
             transport_builder: HttpClient::builder(),
             base_url,
             application_context: None,
-            expected_pcrs,
+            pcr_policy,
             expected_key_exchange: KeyExchangeSuite::X25519,
             session_rotation_interval: DEFAULT_SESSION_ROTATION_INTERVAL,
             session_establishment_timeout: DEFAULT_SESSION_ESTABLISHMENT_TIMEOUT,
@@ -477,6 +600,12 @@ impl Client {
 
     pub async fn new(base_url: impl AsRef<str>, expected_pcrs: NitroPcrs) -> Result<Self> {
         Self::builder(base_url, expected_pcrs)?.connect().await
+    }
+
+    pub async fn new_with_policy(base_url: impl AsRef<str>, pcr_policy: PcrPolicy) -> Result<Self> {
+        Self::builder_with_policy(base_url, pcr_policy)?
+            .connect()
+            .await
     }
 
     pub async fn initialize(&self) -> Result<AttestationInfo> {
@@ -619,6 +748,7 @@ impl Client {
             &transcript_hash,
             secrets.binder(),
         )?;
+        let pinned_trust = self.verify_pinned_pcr_policy(&attestation.pcrs)?;
 
         let confirmation_ciphertext = secrets.seal(
             Direction::ClientToServer,
@@ -657,6 +787,20 @@ impl Client {
             return Err(Error::Protocol("session confirmation mismatch"));
         }
 
+        let pcr_trust = match pinned_trust {
+            Some(status) => status,
+            None => {
+                self.enroll_or_match_tofu(&attestation.pcrs, key_exchange)
+                    .await?
+            }
+        };
+        let attestation = AttestationInfo {
+            session_id: attestation.session_id,
+            module_id: attestation.module_id,
+            pcrs: attestation.pcrs,
+            pcr_trust,
+        };
+
         Ok(Arc::new(SessionState {
             generation: self.inner.next_generation.fetch_add(1, Ordering::Relaxed),
             id: session_id,
@@ -675,24 +819,72 @@ impl Client {
         session_id: &[u8; 16],
         transcript_hash: &[u8; 32],
         binder: &[u8; 32],
-    ) -> Result<AttestationInfo> {
+    ) -> Result<VerifiedAttestation> {
+        let candidate_pcrs = extract_unverified_required_pcrs(document)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
-        let payload = self.inner.attestation_verifier.verify(
-            document,
-            &self.inner.expected_pcrs,
-            now,
-            client_nonce,
-        )?;
+        let payload =
+            self.inner
+                .attestation_verifier
+                .verify(document, &candidate_pcrs, now, client_nonce)?;
+        let pcrs = extract_pcrs(&payload)?;
+        if extract_required_attested_pcrs(&pcrs)? != candidate_pcrs {
+            return Err(Error::MalformedAttestation(
+                "verified PCRs differ from the signed COSE payload",
+            ));
+        }
         let user_data = extract_bytes(&payload, "user_data")?;
         let binding: AttestedBinding = serde_json::from_slice(user_data)?;
         verify_attested_binding(&binding, key_exchange, session_id, transcript_hash, binder)?;
-        Ok(AttestationInfo {
+        Ok(VerifiedAttestation {
             session_id: *session_id,
             module_id: extract_text(&payload, "module_id")?.to_owned(),
-            pcrs: extract_pcrs(&payload)?,
+            pcrs,
         })
+    }
+
+    fn verify_pinned_pcr_policy(&self, observed: &NitroPcrs) -> Result<Option<PcrTrustStatus>> {
+        let PcrPolicyKind::Pinned(profiles) = &self.inner.pcr_policy.kind else {
+            return Ok(None);
+        };
+        if profiles
+            .iter()
+            .any(|profile| pcr_profile_matches(profile, observed))
+        {
+            Ok(Some(PcrTrustStatus::Pinned))
+        } else {
+            Err(Error::UnapprovedPcrProfile)
+        }
+    }
+
+    async fn enroll_or_match_tofu(
+        &self,
+        observed: &NitroPcrs,
+        key_exchange: KeyExchangeSuite,
+    ) -> Result<PcrTrustStatus> {
+        let PcrPolicyKind::TrustOnFirstUse(store) = &self.inner.pcr_policy.kind else {
+            unreachable!("pinned PCR policy was already handled")
+        };
+        let observed = extract_required_attested_pcrs(observed)?;
+        let record = store
+            .load_or_insert(
+                pcr_trust_key(&self.inner.context_hash, key_exchange),
+                observed.clone(),
+            )
+            .await
+            .map_err(Error::PcrTrustStore)?;
+        match record {
+            PcrTrustRecord::Inserted => Ok(PcrTrustStatus::TofuEnrolled),
+            PcrTrustRecord::Existing(existing) => {
+                let existing = extract_required_expected_pcrs(&existing)?;
+                if existing == observed {
+                    Ok(PcrTrustStatus::TofuMatched)
+                } else {
+                    Err(Error::PcrTrustMismatch)
+                }
+            }
+        }
     }
 
     async fn send_protocol(
@@ -1009,6 +1201,65 @@ fn native_context_hash(base_url: &Url, application_context: Option<&[u8]>) -> [u
         hash.update(origin);
     }
     hash.finalize().into()
+}
+
+fn pcr_trust_key(context_hash: &[u8; 32], key_exchange: KeyExchangeSuite) -> PcrTrustKey {
+    let mut hash = Sha256::new();
+    hash.update(PCR_TRUST_KEY_MAGIC);
+    hash.update(context_hash);
+    hash.update(key_exchange.as_wire().as_bytes());
+    PcrTrustKey(hash.finalize().into())
+}
+
+fn extract_unverified_required_pcrs(document: &[u8]) -> Result<NitroPcrs> {
+    let cose = CoseSign1::from_tagged_slice(document)
+        .or_else(|_| CoseSign1::from_slice(document))
+        .map_err(|_| Error::MalformedAttestation("COSE Sign1"))?;
+    let payload = cose
+        .payload
+        .as_deref()
+        .ok_or(Error::MalformedAttestation("COSE payload"))?;
+    let payload = serde_cbor::from_slice(payload)
+        .map_err(|_| Error::MalformedAttestation("COSE payload CBOR"))?;
+    extract_required_attested_pcrs(&extract_pcrs(&payload)?)
+}
+
+fn extract_required_attested_pcrs(pcrs: &NitroPcrs) -> Result<NitroPcrs> {
+    let mut required = NitroPcrs::with_capacity(3);
+    for index in [0, 1, 2] {
+        let value = pcrs.get(&index).ok_or(Error::InvalidAttestedPcr {
+            index,
+            reason: "missing",
+        })?;
+        if value.len() != PCR_SIZE {
+            return Err(Error::InvalidAttestedPcr {
+                index,
+                reason: "must be 48 bytes",
+            });
+        }
+        if value.iter().all(|byte| *byte == 0) {
+            return Err(Error::InvalidAttestedPcr {
+                index,
+                reason: "all-zero debug PCRs are not accepted",
+            });
+        }
+        required.insert(index, value.clone());
+    }
+    Ok(required)
+}
+
+fn extract_required_expected_pcrs(pcrs: &NitroPcrs) -> Result<NitroPcrs> {
+    validate_expected_pcrs(pcrs)?;
+    Ok([0, 1, 2]
+        .into_iter()
+        .map(|index| (index, pcrs[&index].clone()))
+        .collect())
+}
+
+fn pcr_profile_matches(profile: &NitroPcrs, observed: &NitroPcrs) -> bool {
+    profile
+        .iter()
+        .all(|(index, expected)| observed.get(index) == Some(expected))
 }
 
 fn validate_expected_pcrs(pcrs: &NitroPcrs) -> Result<()> {
