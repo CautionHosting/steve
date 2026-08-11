@@ -1,3 +1,5 @@
+const CONTROLLER_TIMEOUT_MS = 5000;
+
 export async function registerEnclaveServiceWorker(options = {}) {
   if (!('serviceWorker' in navigator)) {
     throw new Error('Service workers not supported');
@@ -6,17 +8,14 @@ export async function registerEnclaveServiceWorker(options = {}) {
   const swPath = options.swPath || '/enclave-sw.js';
   const scope = options.scope || '/';
 
-  const registration = await navigator.serviceWorker.register(swPath, { scope });
-
-  if (registration.installing) {
-    await new Promise((resolve) => {
-      registration.installing.addEventListener('statechange', (e) => {
-        if (e.target.state === 'activated') resolve();
-      });
-    });
-  }
-
-  await navigator.serviceWorker.ready;
+  const registration = await navigator.serviceWorker.register(swPath, {
+    scope,
+    type: 'module'
+  });
+  const worker = registration.installing || registration.waiting || registration.active;
+  if (!worker) throw new Error('Service worker registration has no worker');
+  await waitForActivation(worker);
+  await waitForController(worker);
 
   const client = new EnclaveClient(registration);
 
@@ -25,6 +24,56 @@ export async function registerEnclaveServiceWorker(options = {}) {
   }
 
   return client;
+}
+
+function waitForActivation(worker) {
+  if (worker.state === 'activated') return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let timer;
+    const finish = callback => {
+      clearTimeout(timer);
+      worker.removeEventListener('statechange', onStateChange);
+      callback();
+    };
+    const onStateChange = () => {
+      if (worker.state === 'activated') {
+        finish(resolve);
+      } else if (worker.state === 'redundant') {
+        finish(() => reject(new Error('Service worker installation failed')));
+      }
+    };
+    timer = setTimeout(
+      () => finish(() => reject(
+        new Error('Service worker activation timed out')
+      )),
+      CONTROLLER_TIMEOUT_MS
+    );
+    worker.addEventListener('statechange', onStateChange);
+    onStateChange();
+  });
+}
+
+function waitForController(worker) {
+  if (navigator.serviceWorker.controller === worker) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let timer;
+    const finish = callback => {
+      clearTimeout(timer);
+      navigator.serviceWorker.removeEventListener('controllerchange', onControllerChange);
+      callback();
+    };
+    const onControllerChange = () => {
+      if (navigator.serviceWorker.controller === worker) finish(resolve);
+    };
+    timer = setTimeout(
+      () => finish(() => reject(
+        new Error('Service worker is active but does not control this page')
+      )),
+      CONTROLLER_TIMEOUT_MS
+    );
+    navigator.serviceWorker.addEventListener('controllerchange', onControllerChange);
+    onControllerChange();
+  });
 }
 
 export class EnclaveClient {
@@ -57,24 +106,40 @@ export class EnclaveClient {
     this.listeners.get('*')?.forEach(cb => cb(event, data));
   }
 
-  async sendMessage(type, data = {}) {
+  async sendMessage(type, data = {}, timeout = 10000) {
+    const controller = navigator.serviceWorker.controller;
+    if (!controller) {
+      throw new Error('Service worker does not control this page');
+    }
     return new Promise((resolve, reject) => {
       const channel = new MessageChannel();
+      let settled = false;
+      const settle = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        channel.port1.onmessage = null;
+        channel.port1.close?.();
+        callback(value);
+      };
 
       channel.port1.onmessage = (event) => {
         if (event.data.error) {
-          reject(new Error(event.data.error));
+          settle(reject, new Error(event.data.error));
         } else {
-          resolve(event.data);
+          settle(resolve, event.data);
         }
       };
 
-      navigator.serviceWorker.controller?.postMessage(
+      const timer = setTimeout(
+        () => settle(reject, new Error('Message timeout')),
+        timeout
+      );
+
+      controller.postMessage(
         { type, ...data },
         [channel.port2]
       );
-
-      setTimeout(() => reject(new Error('Message timeout')), 10000);
     });
   }
 
@@ -83,11 +148,11 @@ export class EnclaveClient {
   }
 
   async initialize() {
-    return this.sendMessage('initialize');
+    return this.sendMessage('initialize', {}, 15000);
   }
 
   async rotateKey() {
-    return this.sendMessage('rotate-key');
+    return this.sendMessage('rotate-key', {}, 15000);
   }
 
   async reset() {

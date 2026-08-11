@@ -1,1 +1,9 @@
 Containerfile
+.git
+.omx
+target
+steve-js-sdk/.stagex-output
+steve-js-sdk/node_modules
+steve-js-sdk/test-results
+steve-js-sdk/wasm-pkg
+tests/e2e/test-results
