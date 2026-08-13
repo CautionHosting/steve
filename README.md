@@ -73,6 +73,7 @@ For requests intercepted by the active v2 worker, the host terminates TLS but on
 |-----------|----------|-------------|
 | `steve` | Enclave | Rust proxy - decrypts requests, encrypts responses |
 | `steve-sdk` | Client (Rust) | Native SDK with pinned-allowlist and TOFU PCR policies |
+| `steve-sdk-uniffi` | Client (Swift) | Generated Swift facade over the native Rust SDK |
 | `steve-cli` | Client (Rust) | One-request CLI using the native SDK policies |
 | `steve-js-sdk` | Client (Browser) | Service worker for web applications |
 
@@ -219,6 +220,18 @@ Sessions rotate after 25 minutes. Requests have a 30-second deadline and are
 never automatically retried because an upstream operation may already have
 executed.
 
+### Native (Swift via UniFFI)
+
+`steve-sdk-uniffi` exposes the native SDK's pinned and TOFU policies,
+attestation, rotation, X25519/X-Wing selection, and binary HTTP requests through
+generated Swift bindings. Rust continues to own the network stack, Tokio
+runtime, attestation, protocol state, cryptography, and session keys.
+
+Bindings and the static library are generated under `target/`, not committed.
+See [`crates/steve-sdk-uniffi/README.md`](crates/steve-sdk-uniffi/README.md) for
+the API, generation/linking commands, TOFU callback contract, concurrency, and
+security boundary.
+
 ### CLI
 
 `steve-cli` is a narrow one-request wrapper around those SDK policies. It uses
@@ -248,6 +261,7 @@ npm --prefix steve-js-sdk ci --ignore-scripts
 
 make test
 make test-e2e
+make test-swift # macOS-only generated-binding smoke test
 ```
 
 Manual UI:

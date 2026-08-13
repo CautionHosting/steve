@@ -9,6 +9,9 @@ REQUESTED_KEY_EXCHANGE=${STEVE_KEY_EXCHANGE:-}
 STEVE_KEY_EXCHANGE=${REQUESTED_KEY_EXCHANGE:-X25519}
 STEVE_ALLOW_PLAINTEXT_FALLBACK=${STEVE_ALLOW_PLAINTEXT_FALLBACK:-false}
 SERVICES_RUNNING=0
+SWIFT_BUILD_DIR="$ROOT_DIR/target/steve-sdk-uniffi"
+SWIFT_BINDINGS_DIR="$SWIFT_BUILD_DIR/swift"
+SWIFT_SMOKE_BINARY="$SWIFT_BUILD_DIR/steve-sdk-swift-smoke"
 
 validate_key_exchange() {
   case "$1" in
@@ -37,6 +40,62 @@ compose() {
 
 build_assets() {
   make -C "$ROOT_DIR/steve-js-sdk" build-test-assets
+}
+
+build_swift_smoke() {
+  if ! command -v swiftc >/dev/null 2>&1 || ! command -v xcrun >/dev/null 2>&1; then
+    echo "make test-swift requires the macOS Command Line Tools" >&2
+    return 1
+  fi
+  mkdir -p "$SWIFT_BINDINGS_DIR" "$SWIFT_BUILD_DIR/module-cache" \
+    "$SWIFT_BUILD_DIR/sdk-module-cache"
+
+  swift_target=$(swiftc -print-target-info | sed -n \
+    's/.*"triple": "\([^"]*\)".*/\1/p')
+  if [ -z "$swift_target" ]; then
+    echo "swiftc did not report a target triple" >&2
+    return 1
+  fi
+  compiler_deployment_target=${swift_target##*macosx}
+  deployment_target=${MACOSX_DEPLOYMENT_TARGET:-$compiler_deployment_target}
+  MACOSX_DEPLOYMENT_TARGET=$deployment_target \
+    cargo build --release --locked --manifest-path "$ROOT_DIR/Cargo.toml" \
+      -p steve-sdk-uniffi --features synthetic-testing,bindgen
+
+  "$ROOT_DIR/target/release/uniffi-bindgen-swift" \
+    --metadata-no-deps \
+    --module-name SteveSDKFFI \
+    --modulemap-filename SteveSDKFFI.modulemap \
+    --swift-sources --headers --modulemap \
+    "$ROOT_DIR/target/release/libsteve_sdk_uniffi.a" \
+    "$SWIFT_BINDINGS_DIR"
+
+  set --
+  sdk_path=$(xcrun --show-sdk-path)
+  case "$(uname -m)" in
+    arm64) swift_interface_arch=arm64e ;;
+    *) swift_interface_arch=x86_64 ;;
+  esac
+  swift_interface="$sdk_path/usr/lib/swift/Swift.swiftmodule/$swift_interface_arch-apple-macos.swiftinterface"
+  if [ -f "$swift_interface" ]; then
+    interface_version=$(sed -n \
+      's/.*-user-module-version \([^ ]*\).*/\1/p' "$swift_interface")
+    if [ -n "$interface_version" ]; then
+      set -- -interface-compiler-version "$interface_version"
+    fi
+  fi
+
+  swiftc -parse-as-library \
+    -target "$(uname -m)-apple-macosx$deployment_target" \
+    -module-cache-path "$SWIFT_BUILD_DIR/module-cache" \
+    -sdk-module-cache-path "$SWIFT_BUILD_DIR/sdk-module-cache" \
+    "$@" \
+    -I "$SWIFT_BINDINGS_DIR" \
+    -Xcc -fmodule-map-file="$SWIFT_BINDINGS_DIR/SteveSDKFFI.modulemap" \
+    "$SWIFT_BINDINGS_DIR/SteveSDK.swift" \
+    "$ROOT_DIR/crates/steve-sdk-uniffi/tests/swift/Smoke.swift" \
+    "$ROOT_DIR/target/release/libsteve_sdk_uniffi.a" \
+    -o "$SWIFT_SMOKE_BINARY"
 }
 
 prepare() {
@@ -146,6 +205,21 @@ run_plaintext_compatibility() {
   stop
 }
 
+run_swift() {
+  build_swift_smoke
+  prepare
+
+  echo "Running Swift UniFFI smoke: X25519 pinned"
+  start_suite X25519 false
+  "$SWIFT_SMOKE_BINARY" pinned-x25519
+  stop
+
+  echo "Running Swift UniFFI smoke: XWING-DRAFT10 TOFU"
+  start_suite XWING-DRAFT10 false
+  "$SWIFT_SMOKE_BINARY" tofu-xwing
+  stop
+}
+
 case "$ACTION" in
   test)
     trap cleanup_test EXIT
@@ -161,6 +235,12 @@ case "$ACTION" in
     fi
     run_plaintext_compatibility
     ;;
+  swift)
+    trap cleanup_test EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    run_swift
+    ;;
   up)
     prepare
     start_suite "$STEVE_KEY_EXCHANGE" "$STEVE_ALLOW_PLAINTEXT_FALLBACK"
@@ -174,7 +254,7 @@ case "$ACTION" in
     compose logs --follow --tail 100
     ;;
   *)
-    echo "usage: $0 [test|up|down|logs]" >&2
+    echo "usage: $0 [test|swift|up|down|logs]" >&2
     exit 2
     ;;
 esac

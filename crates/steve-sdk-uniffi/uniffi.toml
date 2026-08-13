@@ -1,0 +1,4 @@
+[bindings.swift]
+module_name = "SteveSDK"
+ffi_module_name = "SteveSDKFFI"
+generate_immutable_records = true

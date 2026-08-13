@@ -114,6 +114,10 @@ Run the protocol/vector and signed synthetic server tests with:
 cargo test -p steve-sdk
 ```
 
+The signed fixture verifier is compiled only for Rust tests or with the
+non-default `eval-attestation` feature. That feature exists for integration
+testing and must not be enabled in release clients.
+
 Synthetic evidence validates client/server interoperability, not Nitro hardware.
 Before release, repeat session establishment, a protected request, rotation, and
 restart recovery on real Nitro hardware using PCRs from the production EIF.

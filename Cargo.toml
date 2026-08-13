@@ -4,6 +4,7 @@ members = [
 	"crates/steve",
 	"crates/steve-cli",
 	"crates/steve-sdk",
+	"crates/steve-sdk-uniffi",
 	"crates/steve-xwing-wasm",
 ]
 

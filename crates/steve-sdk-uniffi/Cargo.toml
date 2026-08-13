@@ -1,0 +1,29 @@
+[package]
+name = "steve-sdk-uniffi"
+version = "0.1.0"
+edition = "2024"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib", "staticlib"]
+
+[features]
+default = []
+bindgen = ["uniffi/cli"]
+synthetic-testing = ["steve-sdk/eval-attestation"]
+
+[[bin]]
+name = "uniffi-bindgen-swift"
+path = "src/bin/uniffi-bindgen-swift.rs"
+required-features = ["bindgen"]
+
+[dependencies]
+async-trait = "=0.1.89"
+http = "1.5.0"
+steve-sdk = { path = "../steve-sdk" }
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
+uniffi = { version = "=0.32.0", features = ["tokio"] }
+
+[dev-dependencies]
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }

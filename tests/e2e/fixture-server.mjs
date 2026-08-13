@@ -151,7 +151,8 @@ const upstream = createServer(async (request, response) => {
         response,
         200,
         body,
-        request.headers['content-type'] || 'application/octet-stream'
+        request.headers['content-type'] || 'application/octet-stream',
+        { 'Set-Cookie': ['steve-first=1', 'steve-second=2'] }
       );
     } catch (error) {
       if (error.code === 'BODY_TOO_LARGE') {

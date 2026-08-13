@@ -1,5 +1,5 @@
 .PHONY: test test-rust test-js test-wasm test-production \
-	test-production-fast test-e2e test-e2e-nitro \
+	test-production-fast test-e2e test-swift test-e2e-nitro \
 	test-e2e-nitro-browser test-e2e-nitro-rust \
 	verify-dev verify-release verify
 
@@ -22,6 +22,9 @@ test-production-fast:
 
 test-e2e:
 	./scripts/test-e2e.sh
+
+test-swift:
+	./scripts/test-e2e.sh swift
 
 test-e2e-nitro:
 	./scripts/test-e2e-nitro.sh

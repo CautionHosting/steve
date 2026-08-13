@@ -1,5 +1,7 @@
 //! Native client for STEVE's attestation-bound E2P v2 transport.
 
+#[cfg(any(test, feature = "eval-attestation"))]
+mod eval_attestation;
 mod protocol;
 
 use std::{
@@ -39,6 +41,9 @@ use tokio::{
 use x_wing::{Ciphertext, Decapsulate, DecapsulationKey, Kem, KeyExport, XWingKem};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 use zeroize::{Zeroize, Zeroizing};
+
+#[cfg(any(test, feature = "eval-attestation"))]
+use eval_attestation::EvalAttestationVerifier;
 
 pub use bootproof_sdk::format::nitro::NitroPcrs as ExpectedPcrs;
 
@@ -540,6 +545,16 @@ impl ClientBuilder {
 
     pub fn request_timeout(mut self, duration: Duration) -> Self {
         self.request_timeout = duration;
+        self
+    }
+
+    /// Trust the repository's signed synthetic attestation fixture.
+    ///
+    /// This is available only with the non-default `eval-attestation` feature and must never be
+    /// used for production verification.
+    #[cfg(feature = "eval-attestation")]
+    pub fn use_synthetic_attestation_for_testing(mut self) -> Self {
+        self.attestation_verifier = Arc::new(EvalAttestationVerifier);
         self
     }
 

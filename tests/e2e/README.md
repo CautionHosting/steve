@@ -20,6 +20,19 @@ STEVE_KEY_EXCHANGE=XWING-DRAFT10 make test-e2e
 STEVE_E2E_BROWSER=firefox make test-e2e
 ```
 
+On macOS, run the separate generated Swift/UniFFI smoke gate with:
+
+```bash
+make test-swift
+```
+
+It requires Command Line Tools and Docker, but not full Xcode, signing, an
+Apple developer account, or an iOS project. The static library and generated
+`SteveSDK`/`SteveSDKFFI` files stay under `target/`. The gate covers pinned
+X25519 and Swift-owned TOFU with XWING-DRAFT10, including rotation, concurrent
+requests, binary bodies, repeated headers, callback failure, and wrong-suite
+rejection. Signed synthetic evidence does not prove Nitro hardware.
+
 Manual UI:
 
 ```bash
