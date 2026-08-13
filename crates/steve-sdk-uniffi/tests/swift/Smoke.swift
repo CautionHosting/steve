@@ -18,6 +18,10 @@ func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
     }
 }
 
+func report(_ message: String) {
+    print("  PASS \(message)")
+}
+
 func bytes(_ value: String) -> Data {
     Data(value.utf8)
 }
@@ -102,6 +106,7 @@ func runPinnedX25519() async throws {
     )
     let first = try await client.verifyAttestation()
     try requireAttestation(first, trust: .pinned)
+    report("X25519 session established and pinned attestation verified")
 
     let body = Data([0x00, 0xff, 0x53, 0x54, 0x45, 0x56, 0x45])
     let response = try await client.send(request: request(
@@ -125,15 +130,19 @@ func runPinnedX25519() async throws {
         response.headers.filter { $0.name.lowercased() == "set-cookie" }.count == 2,
         "repeated response headers were not preserved"
     )
+    report("protected binary echo preserved header and body semantics")
 
     async let slow = client.send(request: request(method: "GET", path: "/delay?ms=80"))
     async let fast = client.send(request: request(method: "GET", path: "/delay?ms=10"))
     let (slowResponse, fastResponse) = try await (slow, fast)
     try require(slowResponse.body == bytes("delayed:80"), "slow concurrent response differed")
     try require(fastResponse.body == bytes("delayed:10"), "fast concurrent response differed")
+    report("concurrent protected requests completed on one client")
 
     let rotated = try await client.rotateSession()
     try requireAttestation(rotated, trust: .pinned, previousSession: first.sessionId)
+    report("session rotation produced a new pinned session")
+    print("PASS Swift UniFFI smoke: X25519 pinned")
 }
 
 func runTofuXwing() async throws {
@@ -153,6 +162,7 @@ func runTofuXwing() async throws {
             "wrong-suite session returned an unexpected protocol error"
         )
     }
+    report("wrong-suite X25519 session was rejected without fallback")
 
     let failing = try createTofuForSyntheticTesting(
         config: config(.xwingDraft10),
@@ -164,6 +174,7 @@ func runTofuXwing() async throws {
     } catch SteveError.PcrTrustStore(let message) {
         try require(message.contains("swift trust failure sentinel"), "callback error message was lost")
     }
+    report("Swift TOFU callback failure failed closed with its message")
 
     let store = MemoryTrustStore()
     let client = try createTofuForSyntheticTesting(
@@ -172,6 +183,7 @@ func runTofuXwing() async throws {
     )
     let first = try await client.verifyAttestation()
     try requireAttestation(first, trust: .tofuEnrolled)
+    report("XWING-DRAFT10 session established and Swift TOFU enrolled")
     let rotated = try await client.rotateSession()
     try requireAttestation(rotated, trust: .tofuMatched, previousSession: first.sessionId)
 
@@ -183,6 +195,7 @@ func runTofuXwing() async throws {
         snapshot.profiles.allSatisfy { $0.pcrs.map(\.index) == [0, 1, 2] },
         "TOFU callback must receive PCR0/1/2 only"
     )
+    report("rotation matched PCR0/1/2 using a stable 32-byte trust key")
 
     let body = Data([0x00, 0x01, 0xfe, 0xff])
     let response = try await client.send(request: request(
@@ -193,6 +206,8 @@ func runTofuXwing() async throws {
     ))
     try require(response.status == 200, "X-Wing protected echo returned a non-200 status")
     try require(response.body == body, "X-Wing protected echo changed the binary body")
+    report("X-Wing protected binary echo preserved the response")
+    print("PASS Swift UniFFI smoke: XWING-DRAFT10 TOFU")
 }
 
 @main

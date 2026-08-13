@@ -58,6 +58,7 @@ build_swift_smoke() {
   fi
   compiler_deployment_target=${swift_target##*macosx}
   deployment_target=${MACOSX_DEPLOYMENT_TARGET:-$compiler_deployment_target}
+  echo "Building Swift UniFFI library, bindings, and smoke executable"
   MACOSX_DEPLOYMENT_TARGET=$deployment_target \
     cargo build --release --locked --manifest-path "$ROOT_DIR/Cargo.toml" \
       -p steve-sdk-uniffi --features synthetic-testing,bindgen
@@ -96,11 +97,18 @@ build_swift_smoke() {
     "$ROOT_DIR/crates/steve-sdk-uniffi/tests/swift/Smoke.swift" \
     "$ROOT_DIR/target/release/libsteve_sdk_uniffi.a" \
     -o "$SWIFT_SMOKE_BINARY"
+  echo "Built Swift smoke executable"
 }
 
 prepare() {
   build_assets
   compose build
+}
+
+prepare_swift() {
+  echo "Building signed synthetic STEVE and upstream fixture images"
+  echo "  Docker progress is hidden; a cold build may take a few minutes"
+  compose build --quiet
 }
 
 wait_for_services() {
@@ -129,10 +137,11 @@ start_suite() {
   SERVICES_RUNNING=1
   compose up --detach --no-build --force-recreate
   wait_for_services
+  echo "  READY signed synthetic STEVE: $STEVE_KEY_EXCHANGE"
 }
 
 stop() {
-  compose down --volumes --remove-orphans
+  compose down --timeout 1 --volumes --remove-orphans
   SERVICES_RUNNING=0
 }
 
@@ -207,7 +216,7 @@ run_plaintext_compatibility() {
 
 run_swift() {
   build_swift_smoke
-  prepare
+  prepare_swift
 
   echo "Running Swift UniFFI smoke: X25519 pinned"
   start_suite X25519 false
@@ -218,6 +227,8 @@ run_swift() {
   start_suite XWING-DRAFT10 false
   "$SWIFT_SMOKE_BINARY" tofu-xwing
   stop
+
+  echo "PASS Swift UniFFI smoke: both suites"
 }
 
 case "$ACTION" in

@@ -31,7 +31,9 @@ Apple developer account, or an iOS project. The static library and generated
 `SteveSDK`/`SteveSDKFFI` files stay under `target/`. The gate covers pinned
 X25519 and Swift-owned TOFU with XWING-DRAFT10, including rotation, concurrent
 requests, binary bodies, repeated headers, callback failure, and wrong-suite
-rejection. Signed synthetic evidence does not prove Nitro hardware.
+rejection. Successful runs report each exercised boundary. The runner skips
+browser/WASM asset generation and uses a one-second shutdown timeout for its
+disposable containers. Signed synthetic evidence does not prove Nitro hardware.
 
 Manual UI:
 
