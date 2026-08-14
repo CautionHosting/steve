@@ -35,10 +35,12 @@ iOS application or XCFramework is intentionally outside v1.
 first `verifyAttestation`, `rotateSession`, or `send` call lazily establishes a
 session. An omitted suite selects X25519. Omitted rotation, establishment, and
 request timeouts retain the Rust SDK defaults: 25 minutes, 10 seconds, and 30
-seconds respectively.
+seconds respectively. Zero values are literal: a zero rotation interval rotates
+before every operation, while zero timeouts expire immediately.
 
 HTTP methods and paths are passed to the native SDK. Header values and bodies
-cross the FFI as `Data`; response header entries preserve repeated names.
+cross the FFI as `Data`; response header entries preserve repeated names and
+normalize names to lowercase. Compare header names case-insensitively.
 Duplicate request names retain the SDK's last-value-wins behavior. Invalid
 methods, names, values, paths, and non-UTF-8 request header values fail through
 typed `SteveError` cases. Application HTTP 4xx/5xx values remain responses.
@@ -55,14 +57,19 @@ authoritative.
 
 The Swift trust store callback is synchronous, may run on a blocking worker
 thread, and must be thread-safe. It must not call or wait on methods of the same
-`SteveClient`. `loadOrInsert` must atomically:
+`SteveClient`. The client retains the store for its lifetime; any back-reference
+from the store to the client must be weak. `loadOrInsert` must atomically:
 
 - durably insert the observed PCR0/1/2 and return `inserted`; or
 - return `existing(profile:)` without replacing the stored value.
 
+Once running, the callback cannot be cancelled. A session-establishment timeout
+does not roll back caller-owned storage: insertion may still complete, and a
+retry can return `tofuMatched` without a prior successful `tofuEnrolled` result.
+
 The 32-byte key is bound to the normalized origin, application context, and
 selected suite. Callback failures fail closed, and their messages are retained
-inside `SteveError.pcrTrustStore`. Complete signed PCR maps remain available in
+inside `SteveError.PcrTrustStore`. Complete signed PCR maps remain available in
 `AttestationInfo`; the callback intentionally receives only PCR0/1/2.
 
 ## Security and validation
