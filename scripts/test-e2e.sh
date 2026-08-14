@@ -9,7 +9,9 @@ REQUESTED_KEY_EXCHANGE=${STEVE_KEY_EXCHANGE:-}
 STEVE_KEY_EXCHANGE=${REQUESTED_KEY_EXCHANGE:-X25519}
 STEVE_ALLOW_PLAINTEXT_FALLBACK=${STEVE_ALLOW_PLAINTEXT_FALLBACK:-false}
 SERVICES_RUNNING=0
-SWIFT_BUILD_DIR="$ROOT_DIR/target/steve-sdk-uniffi"
+SWIFT_BUILD_DIR="$ROOT_DIR/target/steve-sdk-uniffi-smoke"
+SWIFT_CARGO_TARGET_DIR="$SWIFT_BUILD_DIR/cargo"
+SWIFT_BINDGEN_TARGET_DIR="$ROOT_DIR/target/steve-sdk-uniffi-tools"
 SWIFT_BINDINGS_DIR="$SWIFT_BUILD_DIR/swift"
 SWIFT_SMOKE_BINARY="$SWIFT_BUILD_DIR/steve-sdk-swift-smoke"
 
@@ -23,7 +25,9 @@ validate_key_exchange() {
   esac
 }
 
-validate_key_exchange "$STEVE_KEY_EXCHANGE"
+if [ "$ACTION" != swift ]; then
+  validate_key_exchange "$STEVE_KEY_EXCHANGE"
+fi
 case "$STEVE_ALLOW_PLAINTEXT_FALLBACK" in
   true|false) ;;
   *)
@@ -61,14 +65,18 @@ build_swift_smoke() {
   echo "Building Swift UniFFI library, bindings, and smoke executable"
   MACOSX_DEPLOYMENT_TARGET=$deployment_target \
     cargo build --release --locked --manifest-path "$ROOT_DIR/Cargo.toml" \
-      -p steve-sdk-uniffi --features synthetic-testing,bindgen
+      --target-dir "$SWIFT_CARGO_TARGET_DIR" \
+      -p steve-sdk-uniffi --features synthetic-testing --lib
+  cargo build --release --locked --manifest-path "$ROOT_DIR/Cargo.toml" \
+    --target-dir "$SWIFT_BINDGEN_TARGET_DIR" \
+    -p steve-sdk-uniffi --features bindgen --bin uniffi-bindgen-swift
 
-  "$ROOT_DIR/target/release/uniffi-bindgen-swift" \
+  "$SWIFT_BINDGEN_TARGET_DIR/release/uniffi-bindgen-swift" \
     --metadata-no-deps \
     --module-name SteveSDKFFI \
     --modulemap-filename SteveSDKFFI.modulemap \
     --swift-sources --headers --modulemap \
-    "$ROOT_DIR/target/release/libsteve_sdk_uniffi.a" \
+    "$SWIFT_CARGO_TARGET_DIR/release/libsteve_sdk_uniffi.a" \
     "$SWIFT_BINDINGS_DIR"
 
   set --
@@ -95,7 +103,7 @@ build_swift_smoke() {
     -Xcc -fmodule-map-file="$SWIFT_BINDINGS_DIR/SteveSDKFFI.modulemap" \
     "$SWIFT_BINDINGS_DIR/SteveSDK.swift" \
     "$ROOT_DIR/crates/steve-sdk-uniffi/tests/swift/Smoke.swift" \
-    "$ROOT_DIR/target/release/libsteve_sdk_uniffi.a" \
+    "$SWIFT_CARGO_TARGET_DIR/release/libsteve_sdk_uniffi.a" \
     -o "$SWIFT_SMOKE_BINARY"
   echo "Built Swift smoke executable"
 }
@@ -141,7 +149,7 @@ start_suite() {
 }
 
 stop() {
-  compose down --timeout 1 --volumes --remove-orphans
+  compose down --timeout "${1:-10}" --volumes --remove-orphans
   SERVICES_RUNNING=0
 }
 
@@ -153,7 +161,11 @@ cleanup_test() {
     compose logs --no-color --tail 200 >&2 || true
   fi
   if [ "$SERVICES_RUNNING" -eq 1 ]; then
-    stop || true
+    if [ "$ACTION" = swift ]; then
+      stop 1 || true
+    else
+      stop || true
+    fi
   fi
   exit "$status"
 }
@@ -215,18 +227,21 @@ run_plaintext_compatibility() {
 }
 
 run_swift() {
+  if [ -n "$REQUESTED_KEY_EXCHANGE" ]; then
+    echo "make test-swift always runs X25519 and XWING-DRAFT10; ignoring STEVE_KEY_EXCHANGE"
+  fi
   build_swift_smoke
   prepare_swift
 
   echo "Running Swift UniFFI smoke: X25519 pinned"
   start_suite X25519 false
   "$SWIFT_SMOKE_BINARY" pinned-x25519
-  stop
+  stop 1
 
   echo "Running Swift UniFFI smoke: XWING-DRAFT10 TOFU"
   start_suite XWING-DRAFT10 false
   "$SWIFT_SMOKE_BINARY" tofu-xwing
-  stop
+  stop 1
 
   echo "PASS Swift UniFFI smoke: both suites"
 }

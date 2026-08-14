@@ -32,8 +32,10 @@ Apple developer account, or an iOS project. The static library and generated
 X25519 and Swift-owned TOFU with XWING-DRAFT10, including rotation, concurrent
 requests, binary bodies, repeated headers, callback failure, and wrong-suite
 rejection. Successful runs report each exercised boundary. The runner skips
-browser/WASM asset generation and uses a one-second shutdown timeout for its
-disposable containers. Signed synthetic evidence does not prove Nitro hardware.
+browser/WASM asset generation and uses a one-second shutdown timeout only for
+its disposable Swift-test containers. It always runs both suites; a configured
+`STEVE_KEY_EXCHANGE` is reported and ignored. Signed synthetic evidence does not
+prove Nitro hardware.
 
 Manual UI:
 

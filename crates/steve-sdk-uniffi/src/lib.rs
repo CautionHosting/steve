@@ -448,8 +448,6 @@ struct ForeignPcrTrustStore {
 
 #[derive(Debug, thiserror::Error)]
 enum TrustStoreAdapterError {
-    #[error("PCR trust store callback failed: {0}")]
-    Callback(String),
     #[error("PCR trust store task failed: {0}")]
     Task(String),
     #[error("PCR trust store returned duplicate PCR index {0}")]
@@ -483,9 +481,7 @@ async fn call_foreign_trust_store(
         .map_err(|error| -> PcrTrustStoreError {
             Box::new(TrustStoreAdapterError::Task(error.to_string()))
         })?
-        .map_err(|error| -> PcrTrustStoreError {
-            Box::new(TrustStoreAdapterError::Callback(error.to_string()))
-        })?;
+        .map_err(|error| -> PcrTrustStoreError { Box::new(error) })?;
     match record {
         PcrTrustRecord::Inserted => Ok(CorePcrTrustRecord::Inserted),
         PcrTrustRecord::Existing { profile } => {
@@ -555,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn config_preserves_defaults_and_supports_xwing() {
+    fn config_accepts_defaults_and_xwing() {
         let config = SteveClientConfig {
             base_url: "https://example.com".to_owned(),
             application_context: None,
@@ -705,12 +701,12 @@ mod tests {
                 .to_string()
                 .contains("duplicate PCR index 0")
         );
-        assert!(
+        assert_eq!(
             call_test_store(StoreResult::Failed)
                 .await
                 .unwrap_err()
-                .to_string()
-                .contains("callback sentinel")
+                .to_string(),
+            "PCR trust store callback failed: callback sentinel"
         );
     }
 

@@ -12,9 +12,10 @@ from the native static library:
 ```bash
 cargo build --release --locked -p steve-sdk-uniffi
 cargo build --release --locked -p steve-sdk-uniffi \
-  --features bindgen --bin uniffi-bindgen-swift
+  --features bindgen --bin uniffi-bindgen-swift \
+  --target-dir target/steve-sdk-uniffi-tools
 mkdir -p target/steve-sdk-uniffi/swift
-target/release/uniffi-bindgen-swift \
+target/steve-sdk-uniffi-tools/release/uniffi-bindgen-swift \
   --metadata-no-deps \
   --module-name SteveSDKFFI \
   --modulemap-filename SteveSDKFFI.modulemap \
@@ -53,7 +54,8 @@ authoritative.
 ## TOFU contract
 
 The Swift trust store callback is synchronous, may run on a blocking worker
-thread, and must be thread-safe. `loadOrInsert` must atomically:
+thread, and must be thread-safe. It must not call or wait on methods of the same
+`SteveClient`. `loadOrInsert` must atomically:
 
 - durably insert the observed PCR0/1/2 and return `inserted`; or
 - return `existing(profile:)` without replacing the stored value.
@@ -78,6 +80,8 @@ Xcode, signing, a paid Apple account, or an iOS project. The gate generates and
 compiles the bindings once, then exercises pinned X25519 and Swift-owned TOFU
 with XWING-DRAFT10 against signed synthetic evidence. It proves FFI and
 encrypted-protocol interoperability, not Nitro hardware or production PCRs.
+Its synthetic library, bindings, and executable stay isolated under
+`target/steve-sdk-uniffi-smoke`.
 
 There is no Keychain, Secure Enclave, platform KEM provider, or persistent
 session-key API in v1. Session key generation and use remain ephemeral inside

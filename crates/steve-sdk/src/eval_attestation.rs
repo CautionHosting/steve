@@ -8,7 +8,7 @@ use x509_parser::{certificate::X509Certificate, prelude::FromDer};
 
 use super::{AttestationVerifier, NitroPcrs};
 
-const EVAL_LEAF_CERT_PEM: &str = include_str!("../../../tests/e2e/fixtures/eval-leaf-cert.pem");
+const EVAL_LEAF_CERT_PEM: &str = include_str!("../fixtures/eval-leaf-cert.pem");
 
 #[derive(Debug)]
 pub(crate) struct EvalAttestationVerifier;

@@ -111,7 +111,7 @@ func runPinnedX25519() async throws {
     let body = Data([0x00, 0xff, 0x53, 0x54, 0x45, 0x56, 0x45])
     let response = try await client.send(request: request(
         method: "POST",
-        path: "/echo?client=swift-pinned",
+        path: "/echo?client=swift-pinned&repeat-headers=1",
         headers: [
             HttpHeader(name: "content-type", value: bytes("application/ignored")),
             HttpHeader(name: "Content-Type", value: bytes("application/octet-stream")),
