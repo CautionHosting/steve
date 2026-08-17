@@ -323,9 +323,10 @@ export STEVE_REMOTE_ORIGIN=https://secure.example
 export STEVE_KEY_EXCHANGE=XWING-DRAFT10
 caution verify --attestation-url "$STEVE_REMOTE_ORIGIN/attestation"
 
-STEVE_EXPECTED_PCR0="$PCR0_HEX" \
-STEVE_EXPECTED_PCR1="$PCR1_HEX" \
-STEVE_EXPECTED_PCR2="$PCR2_HEX" \
+export STEVE_TRUSTED_HASHES=/path/to/independently/verified/trusted_hashes.json
+export STEVE_EXPECTED_PCR0="$(jq -er .pcr0 "$STEVE_TRUSTED_HASHES")"
+export STEVE_EXPECTED_PCR1="$(jq -er .pcr1 "$STEVE_TRUSTED_HASHES")"
+export STEVE_EXPECTED_PCR2="$(jq -er .pcr2 "$STEVE_TRUSTED_HASHES")"
 make test-e2e-nitro
 ```
 

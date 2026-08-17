@@ -206,6 +206,16 @@ default path for unknown future codes; it must not parse `message`. Intercepted
 `fetch()` calls retain their HTTP error response behavior; use `client.send()`
 when structured failures are required.
 
+Stable registration and control codes are `SERVICE_WORKER_UNAVAILABLE`,
+`SERVICE_WORKER_REGISTRATION`, `SERVICE_WORKER_INSTALLATION`,
+`SERVICE_WORKER_ACTIVATION_TIMEOUT`, `SERVICE_WORKER_FAILED`, `MESSAGE_TIMEOUT`,
+and `INITIALIZATION_TIMEOUT`. Request and protocol codes are `INVALID_REQUEST`,
+`CONFIGURATION_UNAVAILABLE`, `TIMEOUT`, `ABORTED`, `TRANSPORT`, `HTTP_STATUS`,
+`ATTESTATION_INVALID`, and `CONFIRMATION_INVALID`. PCR codes are
+`PCR_POLICY_INVALID`, `PCR_POLICY_MISMATCH`, `ATTESTED_PCR_INVALID`,
+`PCR_TRUST_MISMATCH`, and `PCR_TRUST_STORAGE`. Other failures use a
+stage-derived `*_FAILED` code.
+
 `enclaveOrigin` is the absolute HTTP(S) origin where STEVE is exposed. It
 defaults to the service worker's origin. For a cross-origin deployment, allow
 the browser application's origin in `STEVE_CORS_ORIGINS` and address the

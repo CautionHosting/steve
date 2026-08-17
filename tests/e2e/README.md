@@ -14,9 +14,9 @@ make test-e2e
 both `X25519` and `XWING-DRAFT10`. Synthetic evidence does not prove Nitro.
 The browser gate covers pinned success and rejection, TOFU enrollment and
 rotation, worker-restart persistence, selected-PCR conflict, storage failure,
-and preservation of the previous accepted session after a failed explicit
-rotation and explicit protected `client.send()` routing. Rejections do not
-reach the application endpoint.
+preservation of the previous accepted session after a failed explicit rotation,
+and explicit protected `client.send()` routing. Rejections do not reach the
+application endpoint.
 
 Focused runs:
 
@@ -80,9 +80,10 @@ caution verify --attestation-url "$STEVE_REMOTE_ORIGIN/attestation"
 Run the full browser/WASM and Rust gate:
 
 ```bash
-STEVE_EXPECTED_PCR0="$PCR0_HEX" \
-STEVE_EXPECTED_PCR1="$PCR1_HEX" \
-STEVE_EXPECTED_PCR2="$PCR2_HEX" \
+export STEVE_TRUSTED_HASHES=/path/to/independently/verified/trusted_hashes.json
+export STEVE_EXPECTED_PCR0="$(jq -er .pcr0 "$STEVE_TRUSTED_HASHES")"
+export STEVE_EXPECTED_PCR1="$(jq -er .pcr1 "$STEVE_TRUSTED_HASHES")"
+export STEVE_EXPECTED_PCR2="$(jq -er .pcr2 "$STEVE_TRUSTED_HASHES")"
 make test-e2e-nitro
 ```
 
