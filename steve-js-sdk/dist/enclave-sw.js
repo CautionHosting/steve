@@ -1371,6 +1371,303 @@ async function createXWingClient(moduleLoader) {
   };
 }
 
+// src/pcr-policy.js
+var DATABASE_NAME = "steve-sdk-pcr-policy-v1";
+var DATABASE_VERSION = 1;
+var STORE_NAME = "state";
+var TRUST_KEY_DOMAIN = "STEVE-E2P-V2-BROWSER-PCR-TOFU\0";
+var PCR_HEX = /^[0-9a-f]{96}$/iu;
+var PCR_NAME = /^PCR(0|[1-9][0-9]{0,2})$/u;
+var ZERO_PCR = "0".repeat(96);
+function normalizePcrPolicy(policy) {
+  if (policy === null) return null;
+  requireRecord(policy, "pcrPolicy");
+  if (policy.mode === "pinned") {
+    requireOnlyKeys(policy, ["mode", "profiles"], "pinned PCR policy");
+    if (!Array.isArray(policy.profiles) || policy.profiles.length === 0) {
+      throw new Error("pinned PCR policy requires at least one profile");
+    }
+    return {
+      mode: "pinned",
+      profiles: policy.profiles.map((profile, index) => normalizeProfile(
+        profile,
+        `pinned PCR profile ${index}`
+      ))
+    };
+  }
+  if (policy.mode === "tofu") {
+    requireOnlyKeys(policy, ["mode", "additionalPcrIndices"], "TOFU PCR policy");
+    const supplied = policy.additionalPcrIndices ?? [];
+    if (!Array.isArray(supplied)) {
+      throw new Error("additionalPcrIndices must be an array");
+    }
+    const indices = /* @__PURE__ */ new Set();
+    for (const index of supplied) {
+      if (!Number.isInteger(index) || index < 0 || index > 255) {
+        throw new Error("additional PCR indices must be integers from 0 through 255");
+      }
+      if (index > 2) indices.add(index);
+    }
+    return {
+      mode: "tofu",
+      additionalPcrIndices: [...indices].sort((left, right) => left - right)
+    };
+  }
+  throw new Error("pcrPolicy.mode must be exactly pinned or tofu");
+}
+function pcrPoliciesEqual(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+function verifyPinnedPcrPolicy(policy, observed) {
+  if (policy?.mode !== "pinned") throw new Error("pinned PCR policy required");
+  requireRecord(observed, "attested PCRs");
+  if (policy.profiles.some((profile) => profileMatches(profile, observed))) {
+    return "pinned";
+  }
+  throw policyError(
+    "PCR_POLICY_MISMATCH",
+    "attested PCRs did not match one complete pinned profile"
+  );
+}
+function selectTofuPcrs(policy, observed) {
+  if (policy?.mode !== "tofu") throw new Error("TOFU PCR policy required");
+  requireRecord(observed, "attested PCRs");
+  const selected = {};
+  for (const index of [0, 1, 2, ...policy.additionalPcrIndices]) {
+    try {
+      selected[`PCR${index}`] = normalizePcrValue(
+        observed[`PCR${index}`],
+        `attested PCR${index}`
+      );
+    } catch (cause) {
+      throw policyError("ATTESTED_PCR_INVALID", cause.message);
+    }
+  }
+  return selected;
+}
+async function pcrTrustKey(scope, enclaveOrigin, suite) {
+  const normalizedScope = new URL(scope).href;
+  const encoded = new TextEncoder().encode(
+    `${TRUST_KEY_DOMAIN}${normalizedScope}\0${enclaveOrigin}\0${suite}`
+  );
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", encoded));
+  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+function exactPcrsMatch(existing, observed) {
+  let normalized;
+  try {
+    normalized = normalizeProfile(existing, "stored PCR trust record");
+  } catch {
+    return false;
+  }
+  return JSON.stringify(normalized) === JSON.stringify(observed);
+}
+async function enforceTofuPcrPolicy(policy, observed, context, storage) {
+  const selected = selectTofuPcrs(policy, observed);
+  const key = await pcrTrustKey(context.scope, context.enclaveOrigin, context.suite);
+  const record = await storage.loadOrInsert(key, selected);
+  if (record?.status === "inserted") return "tofu-enrolled";
+  if (record?.status === "existing" && exactPcrsMatch(record.pcrs, selected)) {
+    return "tofu-matched";
+  }
+  throw policyError(
+    "PCR_TRUST_MISMATCH",
+    "attested PCRs did not match the enrolled TOFU record"
+  );
+}
+function createBrowserPcrPolicyStorage(databaseFactory = globalThis.indexedDB) {
+  const openDatabase = () => openPcrDatabase(databaseFactory);
+  return {
+    async isPolicyRequired(scope) {
+      return Boolean(await readValue(openDatabase, markerKey(scope)));
+    },
+    async setPolicyRequired(scope, required) {
+      await writeValue(openDatabase, markerKey(scope), required ? true : void 0);
+    },
+    async loadOrInsert(key, observed) {
+      const database = await openDatabase();
+      try {
+        return await new Promise((resolve, reject) => {
+          let outcome;
+          let transaction;
+          try {
+            transaction = database.transaction(
+              STORE_NAME,
+              "readwrite",
+              { durability: "strict" }
+            );
+          } catch (error) {
+            reject(storageError(error));
+            return;
+          }
+          const request = transaction.objectStore(STORE_NAME).get(`trust:${key}`);
+          request.onsuccess = () => {
+            if (request.result === void 0) {
+              outcome = { status: "inserted" };
+              transaction.objectStore(STORE_NAME).add(observed, `trust:${key}`);
+            } else {
+              outcome = { status: "existing", pcrs: request.result };
+            }
+          };
+          transaction.oncomplete = () => resolve(outcome);
+          transaction.onerror = () => reject(storageError(transaction.error));
+          transaction.onabort = () => reject(storageError(transaction.error));
+        });
+      } finally {
+        database.close();
+      }
+    }
+  };
+}
+function normalizeProfile(profile, label) {
+  requireRecord(profile, label);
+  const entries = [];
+  for (const [name, value] of Object.entries(profile)) {
+    const match = PCR_NAME.exec(name);
+    const index = match ? Number(match[1]) : -1;
+    if (!match || index > 255) {
+      throw new Error(`${label} contains an invalid PCR name: ${name}`);
+    }
+    entries.push([index, normalizePcrValue(value, `${label} PCR${index}`)]);
+  }
+  for (const required of [0, 1, 2]) {
+    if (!entries.some(([index]) => index === required)) {
+      throw new Error(`${label} must contain PCR0, PCR1, and PCR2`);
+    }
+  }
+  entries.sort(([left], [right]) => left - right);
+  return Object.fromEntries(entries.map(([index, value]) => [`PCR${index}`, value]));
+}
+function profileMatches(profile, observed) {
+  return Object.entries(profile).every(([name, expected]) => {
+    const value = observed[name];
+    return typeof value === "string" && PCR_HEX.test(value) && value.toLowerCase() !== ZERO_PCR && value.toLowerCase() === expected;
+  });
+}
+function normalizePcrValue(value, label) {
+  if (typeof value !== "string" || !PCR_HEX.test(value)) {
+    throw new Error(`${label} must contain exactly 96 hexadecimal characters`);
+  }
+  const normalized = value.toLowerCase();
+  if (normalized === ZERO_PCR) throw new Error(`${label} must be nonzero`);
+  return normalized;
+}
+function requireRecord(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+}
+function requireOnlyKeys(value, allowed, label) {
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) throw new Error(`${label} contains unsupported key: ${key}`);
+  }
+}
+function markerKey(scope) {
+  return `policy-required:${new URL(scope).href}`;
+}
+function openPcrDatabase(databaseFactory) {
+  if (!databaseFactory) return Promise.reject(storageError());
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let request;
+    try {
+      request = databaseFactory.open(DATABASE_NAME, DATABASE_VERSION);
+    } catch (error) {
+      reject(storageError(error));
+      return;
+    }
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(STORE_NAME)) {
+        request.result.createObjectStore(STORE_NAME);
+      }
+    };
+    request.onsuccess = () => {
+      if (settled) {
+        request.result.close();
+      } else {
+        settled = true;
+        resolve(request.result);
+      }
+    };
+    request.onerror = () => {
+      if (!settled) {
+        settled = true;
+        reject(storageError(request.error));
+      }
+    };
+    request.onblocked = () => {
+      if (!settled) {
+        settled = true;
+        reject(storageError());
+      }
+    };
+  });
+}
+async function readValue(openDatabase, key) {
+  const database = await openDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      let transaction;
+      try {
+        transaction = database.transaction(STORE_NAME, "readonly");
+      } catch (error) {
+        reject(storageError(error));
+        return;
+      }
+      const request = transaction.objectStore(STORE_NAME).get(key);
+      let value;
+      request.onsuccess = () => {
+        value = request.result;
+      };
+      request.onerror = () => reject(storageError(request.error));
+      transaction.oncomplete = () => resolve(value);
+      transaction.onerror = () => reject(storageError(transaction.error));
+      transaction.onabort = () => reject(storageError(transaction.error));
+    });
+  } finally {
+    database.close();
+  }
+}
+async function writeValue(openDatabase, key, value) {
+  const database = await openDatabase();
+  try {
+    await new Promise((resolve, reject) => {
+      let transaction;
+      try {
+        transaction = database.transaction(
+          STORE_NAME,
+          "readwrite",
+          { durability: "strict" }
+        );
+      } catch (error) {
+        reject(storageError(error));
+        return;
+      }
+      const store = transaction.objectStore(STORE_NAME);
+      if (value === void 0) store.delete(key);
+      else store.put(value, key);
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(storageError(transaction.error));
+      transaction.onabort = () => reject(storageError(transaction.error));
+    });
+  } finally {
+    database.close();
+  }
+}
+function storageError(cause) {
+  const error = new Error("PCR policy storage failed");
+  error.code = "PCR_TRUST_STORAGE";
+  error.stage = "pcr-trust";
+  error.cause = cause;
+  return error;
+}
+function policyError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  error.stage = "pcr-policy";
+  return error;
+}
+
 // src/enclave-sw.js
 var DEFAULT_BOOTSTRAP_PATHS = [
   "/enclave-sw.js",
@@ -1405,11 +1702,16 @@ function defaultConfig() {
     excludePrefixes: ["/attestation", "/e2p/"],
     emitEncryptedPayloads: false,
     requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
-    expectedKeyExchange: DEFAULT_KEY_EXCHANGE
+    expectedKeyExchange: DEFAULT_KEY_EXCHANGE,
+    pcrPolicy: null
   };
 }
 var config = defaultConfig();
 var configRestoreError = null;
+var configurationReady = false;
+var configurationTail = Promise.resolve();
+var configGeneration = 0;
+var pcrStorage = false ? self.__STEVE_PCR_STORAGE_TEST__ : createBrowserPcrPolicyStorage();
 var configReady = initializeConfig();
 var state = freshState();
 self.addEventListener("install", () => self.skipWaiting());
@@ -1429,34 +1731,125 @@ async function handleMessage(event) {
         break;
       case "initialize":
         await ensureSession("explicit-initialize");
-        port?.postMessage({ type: "initialized", success: true });
+        port?.postMessage({ type: "initialized", success: true, status: statusMessage() });
         break;
+      case "rotate-session":
       case "rotate-key":
         await rotateSession();
-        port?.postMessage({ type: "key-rotated", success: true });
+        port?.postMessage({ type: "session-rotated", success: true, status: statusMessage() });
         break;
       case "reset":
         resetState();
-        port?.postMessage({ type: "reset", success: true });
+        port?.postMessage({ type: "reset", success: true, status: statusMessage() });
         break;
       case "configure": {
         await configureAndPersist(event.data.config || {});
-        port?.postMessage({ type: "configured", success: true, config });
+        port?.postMessage({
+          type: "configured",
+          success: true,
+          config,
+          status: statusMessage()
+        });
+        break;
+      }
+      case "protected-send": {
+        const result = await protectedSend(event.data.request);
+        port?.postMessage({ type: "protected-response", success: true, ...result });
+        break;
+      }
+      case "get-pcr-policy":
+        await configurationTail;
+        requireConfiguration();
+        port?.postMessage({
+          type: "pcr-policy",
+          success: true,
+          policy: clonePcrPolicy()
+        });
+        break;
+      case "replace-pcr-policy": {
+        await configureAndPersist({ pcrPolicy: event.data.policy });
+        port?.postMessage({
+          type: "pcr-policy-replaced",
+          success: true,
+          policy: clonePcrPolicy(),
+          status: statusMessage()
+        });
         break;
       }
       default:
         throw new Error("unknown service-worker command");
     }
   } catch (error) {
-    port?.postMessage({ type, success: false, error: publicError(error) });
+    port?.postMessage({
+      type,
+      success: false,
+      error: errorDetails(error, commandStage(type))
+    });
+  }
+}
+async function protectedSend(input) {
+  requireConfiguration();
+  const requestConfig = config;
+  const requestGeneration = configGeneration;
+  const request = deserializeProtectedRequest(input, requestConfig);
+  const result = await handleProtectedRequest(
+    request,
+    requestConfig,
+    requestGeneration,
+    true
+  );
+  return {
+    status: result.response.status,
+    headers: [...result.response.headers.entries()],
+    body: new Uint8Array(await result.response.arrayBuffer()),
+    sessionId: result.sessionId,
+    exchange: result.exchange
+  };
+}
+function deserializeProtectedRequest(input, activeConfig) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw sdkError("INVALID_REQUEST", "request", "protected request must be an object");
+  }
+  const path = input.path;
+  if (typeof path !== "string" || !path.startsWith("/") || path.startsWith("//")) {
+    throw sdkError("INVALID_REQUEST", "request", "protected request path must be relative");
+  }
+  const url = new URL(path, `${activeConfig.enclaveOrigin}/`);
+  if (url.origin !== activeConfig.enclaveOrigin || url.hash) {
+    throw sdkError("INVALID_REQUEST", "request", "protected request path must be relative");
+  }
+  if (!Array.isArray(input.headers) || input.headers.some((header) => !Array.isArray(header) || header.length !== 2 || typeof header[0] !== "string" || typeof header[1] !== "string")) {
+    throw sdkError("INVALID_REQUEST", "request", "protected request headers are invalid");
+  }
+  const method = typeof input.method === "string" ? input.method.toUpperCase() : "GET";
+  const body = input.body instanceof Uint8Array ? input.body : input.body instanceof ArrayBuffer ? new Uint8Array(input.body) : null;
+  try {
+    return new Request(url, {
+      method,
+      headers: input.headers,
+      body: body?.length ? body : void 0,
+      credentials: "omit",
+      redirect: "error"
+    });
+  } catch (cause) {
+    throw sdkError("INVALID_REQUEST", "request", "protected request is invalid", cause);
   }
 }
 async function routeRequest(request) {
   await configReady;
-  if (!shouldProtectRequest(request)) return fetch(request);
-  return handleProtectedRequest(request);
+  await configurationTail;
+  if (!configurationReady || configRestoreError) {
+    if (fixedBootstrapDisposition(request, new URL(request.url)) === true) {
+      return fetch(request);
+    }
+    return configurationFailureResponse();
+  }
+  const requestConfig = config;
+  const requestGeneration = configGeneration;
+  if (!shouldProtectRequest(request, requestConfig)) return fetch(request);
+  return handleProtectedRequest(request, requestConfig, requestGeneration);
 }
-async function handleProtectedRequest(request) {
+async function handleProtectedRequest(request, requestConfig = config, requestGeneration = configGeneration, returnDetails = false) {
   let session;
   let sequence;
   try {
@@ -1469,9 +1862,12 @@ async function handleProtectedRequest(request) {
       body: requestBody.length === 0 ? null : requestBody
     });
     session = await currentSession();
+    if (requestGeneration !== configGeneration || session.configGeneration !== requestGeneration) {
+      throw new Error("configuration changed before protected request");
+    }
     sequence = await session.sequences.allocate();
     const protectedResponse = await withDeadline(
-      config.requestTimeoutMs,
+      requestConfig.requestTimeoutMs,
       request.signal,
       async (signal) => {
         throwIfAborted(signal);
@@ -1485,15 +1881,21 @@ async function handleProtectedRequest(request) {
         );
         throwIfAborted(signal);
         const envelope = encodeEnvelope(session.id, sequence, ciphertext);
-        if (config.emitEncryptedPayloads) {
+        if (requestConfig.emitEncryptedPayloads) {
           await notifyClients(
             "encrypted-request",
             encryptedPayloadTrace(session, sequence, envelope)
           );
         }
-        const response = await protocolFetch(REQUEST_ENDPOINT, envelope, signal);
+        const response = await protocolFetch(
+          REQUEST_ENDPOINT,
+          envelope,
+          signal,
+          session.enclaveOrigin
+        );
+        const outerStatus = response.status;
         if (!response.ok) {
-          throw new ProtocolHttpError(response.status, "v2 request");
+          throw new ProtocolHttpError(outerStatus, "request", "v2 request");
         }
         const responseBytes = await readBoundedResponse(
           response,
@@ -1519,19 +1921,39 @@ async function handleProtectedRequest(request) {
         return {
           response: new Response(body, { status: decoded.status, headers: decoded.headers }),
           sequenceValue: responseEnvelope.sequenceValue,
-          responseEnvelope: responseBytes
+          responseEnvelope: responseBytes,
+          exchange: {
+            protocolName: PROTOCOL_ID,
+            protection: RECORD_PROTECTION,
+            sessionId: encodeDiagnosticBytes(session.id),
+            sequence: sequence.toString(),
+            keyExchange: session.keyExchange,
+            pcrTrust: session.attestation.pcrTrust,
+            outerStatus,
+            requestPlaintextBytes: plaintext.length,
+            requestCiphertextBytes: ciphertext.length,
+            requestEnvelopeBytes: envelope.length,
+            responseEnvelopeBytes: responseBytes.length,
+            responseCiphertextBytes: responseEnvelope.ciphertext.length,
+            responsePlaintextBytes: responsePlaintext.length
+          }
         };
       },
-      "v2 request timed out"
+      "v2 request timed out",
+      "request"
     );
     session.sequences.accept(sequence, protectedResponse.sequenceValue);
-    if (config.emitEncryptedPayloads) {
+    if (requestConfig.emitEncryptedPayloads) {
       await notifyClients(
         "encrypted-response",
         encryptedPayloadTrace(session, sequence, protectedResponse.responseEnvelope)
       );
     }
-    return protectedResponse.response;
+    return returnDetails ? {
+      response: protectedResponse.response,
+      sessionId: encodeDiagnosticBytes(session.id),
+      exchange: protectedResponse.exchange
+    } : protectedResponse.response;
   } catch (error) {
     if (session && sequence !== void 0 && isRequestLocalFailure(error)) {
       session.sequences.retire(sequence);
@@ -1543,10 +1965,11 @@ async function handleProtectedRequest(request) {
     }
     const requestUrl = new URL(request.url);
     notifyClients("error", {
-      message: publicError(error),
-      url: requestUrl.origin + requestUrl.pathname,
-      stage: session ? "request" : "initialization"
+      ...errorDetails(error, session ? "request" : "initialization"),
+      operation: session ? "request" : "initialization",
+      url: requestUrl.origin + requestUrl.pathname
     });
+    if (returnDetails) throw error;
     return new Response(JSON.stringify({ error: "secure channel failed" }), {
       status: error instanceof ProtocolTimeoutError ? 504 : 502,
       headers: { "Content-Type": "application/json", "Cache-Control": "no-store" }
@@ -1562,6 +1985,7 @@ async function currentSession() {
 }
 var establishSessionFn = establishSession;
 async function ensureSession(trigger = "protected-request") {
+  requireConfiguration();
   if (state.session) return state.session;
   if (!state.sessionPromise) {
     const s = state;
@@ -1597,6 +2021,7 @@ async function ensureSession(trigger = "protected-request") {
   return state.sessionPromise;
 }
 async function rotateSession() {
+  requireConfiguration();
   if (state.rotationPromise) return state.rotationPromise;
   const s = state;
   s.stage = "creating-session";
@@ -1631,11 +2056,14 @@ async function establishSession(_trigger, targetState) {
     SESSION_ESTABLISH_TIMEOUT_MS,
     null,
     (signal) => establishSessionWithinDeadline(signal, targetState),
-    "session establishment timed out"
+    "session establishment timed out",
+    "initialization"
   );
 }
 async function establishSessionWithinDeadline(signal, targetState) {
-  const keyExchange = config.expectedKeyExchange;
+  const sessionConfig = config;
+  const sessionGeneration = configGeneration;
+  const keyExchange = sessionConfig.expectedKeyExchange;
   updateStage(targetState, "creating-session");
   const clientNonce = crypto.getRandomValues(new Uint8Array(32));
   const clientKeyExchange = await createClientKeyExchange(
@@ -1655,9 +2083,12 @@ async function establishSessionWithinDeadline(signal, targetState) {
         clientKeyMaterial,
         contextHash
       ),
-      signal
+      signal,
+      sessionConfig.enclaveOrigin
     );
-    if (!response.ok) throw new ProtocolHttpError(response.status, "session creation");
+    if (!response.ok) {
+      throw new ProtocolHttpError(response.status, "initialization", "session creation");
+    }
     const sessionResponse = decodeSessionResponse(
       await readBoundedResponse(response, MAX_SESSION_RESPONSE_BYTES),
       keyExchange
@@ -1679,18 +2110,30 @@ async function establishSessionWithinDeadline(signal, targetState) {
     const material = await deriveMaterial(sharedSecret, transcriptHash);
     throwIfAborted(signal);
     updateStage(targetState, "verifying-attestation");
-    const attestation = await verifyAttestation(
-      sessionResponse.attestation_document,
-      { nonce: clientNonce }
-    );
-    throwIfAborted(signal);
-    validateAttestationResult(
-      attestation,
-      keyExchange,
-      sessionResponse.session_id,
-      transcriptHash,
-      material.binder
-    );
+    let attestation;
+    try {
+      attestation = await verifyAttestation(
+        sessionResponse.attestation_document,
+        { nonce: clientNonce }
+      );
+      throwIfAborted(signal);
+      validateAttestationResult(
+        attestation,
+        keyExchange,
+        sessionResponse.session_id,
+        transcriptHash,
+        material.binder
+      );
+    } catch (cause) {
+      if (cause?.code === "ABORTED") throw cause;
+      throw sdkError(
+        "ATTESTATION_INVALID",
+        "attestation",
+        publicError(cause),
+        cause
+      );
+    }
+    const pinnedTrust = sessionConfig.pcrPolicy?.mode === "pinned" ? verifyPinnedPcrPolicy(sessionConfig.pcrPolicy, attestation.pcrs) : null;
     updateStage(targetState, "confirming-session");
     const confirmationCiphertext = await seal(
       material,
@@ -1704,17 +2147,26 @@ async function establishSessionWithinDeadline(signal, targetState) {
     const confirmationResponse = await protocolFetch(
       CONFIRM_ENDPOINT,
       encodeEnvelope(sessionResponse.session_id, 0n, confirmationCiphertext),
-      signal
+      signal,
+      sessionConfig.enclaveOrigin
     );
     if (!confirmationResponse.ok) {
-      throw new ProtocolHttpError(confirmationResponse.status, "session confirmation");
+      throw new ProtocolHttpError(
+        confirmationResponse.status,
+        "confirmation",
+        "session confirmation"
+      );
     }
     const confirmationEnvelope = decodeEnvelope(
       await readBoundedResponse(confirmationResponse, MAX_CONFIRMATION_RESPONSE_BYTES)
     );
     throwIfAborted(signal);
     if (confirmationEnvelope.sequenceValue !== 0n || !equalBytes(confirmationEnvelope.session_id, sessionResponse.session_id)) {
-      throw new Error("unexpected confirmation response");
+      throw sdkError(
+        "CONFIRMATION_INVALID",
+        "confirmation",
+        "unexpected confirmation response"
+      );
     }
     const confirmedHash = await open(
       material,
@@ -1725,13 +2177,29 @@ async function establishSessionWithinDeadline(signal, targetState) {
       confirmationEnvelope.ciphertext
     );
     throwIfAborted(signal);
-    if (!equalBytes(confirmedHash, transcriptHash)) throw new Error("session confirmation mismatch");
+    if (!equalBytes(confirmedHash, transcriptHash)) {
+      throw sdkError(
+        "CONFIRMATION_INVALID",
+        "confirmation",
+        "session confirmation mismatch"
+      );
+    }
+    const pcrTrust = await finalizePcrTrust(
+      sessionConfig,
+      sessionGeneration,
+      targetState,
+      attestation.pcrs,
+      pinnedTrust,
+      signal
+    );
     const session = {
       id: sessionResponse.session_id,
       keyExchange,
       material,
       sequences: new SequenceTracker(),
       createdAt: Date.now(),
+      enclaveOrigin: sessionConfig.enclaveOrigin,
+      configGeneration: sessionGeneration,
       transcriptHash,
       confirmation: "verified",
       attestation: {
@@ -1740,13 +2208,14 @@ async function establishSessionWithinDeadline(signal, targetState) {
         trustAnchor: ATTESTATION_PROFILE.trustAnchor,
         synthetic: ATTESTATION_PROFILE.synthetic,
         pcrs: attestation.pcrs,
+        pcrTrust,
         moduleId: attestation.moduleId,
         checks: {
           certificateChain: "verified",
           nonceBinding: "verified",
           sessionBinding: "verified",
           keyConfirmation: "verified",
-          expectedPcrPolicy: "not-checked"
+          expectedPcrPolicy: pcrTrust === "not-checked" ? "not-checked" : "verified"
         }
       }
     };
@@ -1755,9 +2224,35 @@ async function establishSessionWithinDeadline(signal, targetState) {
     clientKeyExchange.destroy();
   }
 }
-async function protocolFetch(path, body, signal) {
+async function finalizePcrTrust(sessionConfig, sessionGeneration, targetState, observedPcrs, pinnedTrust, signal) {
+  return serializeConfiguration(async () => {
+    throwIfAborted(signal);
+    if (config !== sessionConfig || configGeneration !== sessionGeneration || state !== targetState) {
+      throw new Error("configuration changed during session establishment");
+    }
+    if (!sessionConfig.pcrPolicy) return "not-checked";
+    if (pinnedTrust) return pinnedTrust;
+    const status = await enforceTofuPcrPolicy(
+      sessionConfig.pcrPolicy,
+      observedPcrs,
+      {
+        scope: serviceWorkerScope(),
+        enclaveOrigin: sessionConfig.enclaveOrigin,
+        suite: sessionConfig.expectedKeyExchange
+      },
+      pcrStorage
+    );
+    throwIfAborted(signal);
+    return status;
+  });
+}
+function clonePcrPolicy() {
+  return config.pcrPolicy === null ? null : JSON.parse(JSON.stringify(config.pcrPolicy));
+}
+async function protocolFetch(path, body, signal, enclaveOrigin = config.enclaveOrigin) {
+  const stage = path === REQUEST_ENDPOINT ? "request" : path === CONFIRM_ENDPOINT ? "confirmation" : "initialization";
   try {
-    return await fetch(resolveProtocolUrl(path), {
+    return await fetch(resolveProtocolUrl(path, enclaveOrigin), {
       method: "POST",
       headers: { "Content-Type": "application/cbor" },
       body,
@@ -1766,9 +2261,24 @@ async function protocolFetch(path, body, signal) {
       signal
     });
   } catch (error) {
-    if (signal?.aborted) throw new ProtocolAbortError();
-    throw new ProtocolTransportError(error);
+    if (signal?.aborted) throw new ProtocolAbortError(void 0, stage);
+    throw new ProtocolTransportError(error, stage);
   }
+}
+function requireConfiguration() {
+  if (!configurationReady || configRestoreError) {
+    throw sdkError(
+      "CONFIGURATION_UNAVAILABLE",
+      "configuration",
+      configRestoreError || "service worker configuration unavailable"
+    );
+  }
+}
+function configurationFailureResponse() {
+  return new Response(JSON.stringify({ error: "secure channel unavailable" }), {
+    status: 503,
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" }
+  });
 }
 async function readBoundedResponse(response, limit) {
   const declaredLength = response.headers.get("content-length");
@@ -1806,38 +2316,47 @@ async function readBoundedResponse(response, limit) {
   return body;
 }
 var ProtocolTimeoutError = class extends Error {
-  constructor(message = "v2 operation timed out") {
+  constructor(message = "v2 operation timed out", stage = "request") {
     super(message);
     this.name = "ProtocolTimeoutError";
+    this.code = "TIMEOUT";
+    this.stage = stage;
   }
 };
 var ProtocolAbortError = class extends Error {
-  constructor(message = "v2 request aborted") {
+  constructor(message = "v2 request aborted", stage = "request") {
     super(message);
     this.name = "ProtocolAbortError";
+    this.code = "ABORTED";
+    this.stage = stage;
   }
 };
 var ProtocolTransportError = class extends Error {
-  constructor(cause) {
+  constructor(cause, stage = "transport") {
     super("v2 transport failed");
     this.name = "ProtocolTransportError";
+    this.code = "TRANSPORT";
+    this.stage = stage;
     this.cause = cause;
   }
 };
 var ProtocolHttpError = class extends Error {
-  constructor(status, stage) {
-    super(`${stage} rejected (${status})`);
+  constructor(status, stage, operation = stage) {
+    super(`${operation} rejected (${status})`);
     this.name = "ProtocolHttpError";
+    this.code = "HTTP_STATUS";
+    this.stage = stage;
     this.status = status;
+    this.httpStatus = status;
   }
 };
-async function withDeadline(timeoutMs, externalSignal, operation, timeoutMessage) {
+async function withDeadline(timeoutMs, externalSignal, operation, timeoutMessage, stage = "request") {
   const controller = new AbortController();
   let timedOut = false;
   let forwardAbort;
   const abortPromise = new Promise((_, reject) => {
     controller.signal.addEventListener("abort", () => {
-      reject(timedOut ? new ProtocolTimeoutError(timeoutMessage) : new ProtocolAbortError());
+      reject(timedOut ? new ProtocolTimeoutError(timeoutMessage, stage) : new ProtocolAbortError(void 0, stage));
     }, { once: true });
   });
   if (externalSignal) {
@@ -1875,8 +2394,8 @@ function isRequestLocalFailure(error) {
   if (SESSION_FATAL_HTTP_STATUSES.has(error.status)) return false;
   return REQUEST_LOCAL_HTTP_STATUSES.has(error.status) || error.status >= 500 && error.status <= 599;
 }
-function resolveProtocolUrl(path) {
-  return new URL(path, `${config.enclaveOrigin}/`).href;
+function resolveProtocolUrl(path, enclaveOrigin = config.enclaveOrigin) {
+  return new URL(path, `${enclaveOrigin}/`).href;
 }
 function validateApplicationResponse(response) {
   if (!response || !Number.isInteger(response.status) || response.status < 200 || response.status > 599) {
@@ -1889,23 +2408,31 @@ function validateApplicationResponse(response) {
     throw new Error("invalid protected application body");
   }
 }
-function shouldProtectRequest(request) {
+function shouldProtectRequest(request, activeConfig = config) {
   const url = new URL(request.url);
-  if (url.origin !== config.enclaveOrigin) return false;
-  return !isPassthrough(request, url);
+  if (url.origin !== activeConfig.enclaveOrigin) return false;
+  return !isPassthrough(request, url, activeConfig);
 }
-function isPassthrough(request, url) {
+function isPassthrough(request, url, activeConfig = config) {
+  const fixedBootstrap = fixedBootstrapDisposition(request, url);
+  if (fixedBootstrap !== null) return fixedBootstrap;
+  const localOrigin = url.origin === self.location.origin;
+  const configuredPassthrough = activeConfig.passthroughPaths.includes(url.pathname);
+  const localBootstrap = localOrigin && configuredPassthrough;
+  return localBootstrap && SAFE_BOOTSTRAP_METHODS.has(request.method) || activeConfig.excludePrefixes.some((prefix) => url.pathname.startsWith(prefix));
+}
+function fixedBootstrapDisposition(request, url) {
   const localOrigin = url.origin === self.location.origin;
   const registrationScope = new URL(self.registration.scope);
   const bootstrapNavigation = localOrigin && (url.pathname === "/" || url.pathname === registrationScope.pathname) && request.method === "GET" && request.mode === "navigate" && request.destination === "document";
   if (bootstrapNavigation) return true;
+  const bootstrapNavigationTarget = localOrigin && (url.pathname === "/" || url.pathname === registrationScope.pathname) && request.mode === "navigate" && request.destination === "document";
+  if (bootstrapNavigationTarget) return false;
   const builtInBootstrap = localOrigin && (DEFAULT_BOOTSTRAP_PATHS.includes(url.pathname) || SCOPED_BOOTSTRAP_PATHS.some(
     (path) => new URL(path, registrationScope).pathname === url.pathname
   ));
   if (builtInBootstrap) return SAFE_BOOTSTRAP_METHODS.has(request.method);
-  const configuredPassthrough = config.passthroughPaths.includes(url.pathname);
-  const localBootstrap = localOrigin && configuredPassthrough;
-  return localBootstrap && SAFE_BOOTSTRAP_METHODS.has(request.method) || config.excludePrefixes.some((prefix) => url.pathname.startsWith(prefix));
+  return null;
 }
 function configure(update) {
   const allowed = [
@@ -1914,7 +2441,8 @@ function configure(update) {
     "excludePrefixes",
     "emitEncryptedPayloads",
     "requestTimeoutMs",
-    "expectedKeyExchange"
+    "expectedKeyExchange",
+    "pcrPolicy"
   ];
   for (const key of Object.keys(update)) {
     if (!allowed.includes(key)) throw new Error(`unsupported configuration key: ${key}`);
@@ -1925,7 +2453,15 @@ function configure(update) {
   if ("expectedKeyExchange" in update) {
     requireKeyExchange(update.expectedKeyExchange);
   }
-  const next = { ...config, ...update };
+  let nextPolicy = config.pcrPolicy;
+  if ("pcrPolicy" in update) {
+    try {
+      nextPolicy = normalizePcrPolicy(update.pcrPolicy);
+    } catch (cause) {
+      throw sdkError("PCR_POLICY_INVALID", "configuration", publicError(cause), cause);
+    }
+  }
+  const next = { ...config, ...update, pcrPolicy: nextPolicy };
   if ("enclaveOrigin" in update) {
     next.enclaveOrigin = normalizeEnclaveOrigin(update.enclaveOrigin);
   }
@@ -1937,10 +2473,15 @@ function configure(update) {
   ];
   const enclaveChanged = next.enclaveOrigin !== config.enclaveOrigin;
   const keyExchangeChanged = next.expectedKeyExchange !== config.expectedKeyExchange;
-  if (enclaveChanged || keyExchangeChanged) resetState();
+  const pcrPolicyChanged = !pcrPoliciesEqual(next.pcrPolicy, config.pcrPolicy);
+  if (enclaveChanged || keyExchangeChanged || pcrPolicyChanged) {
+    configGeneration += 1;
+    resetState();
+  }
   config = next;
 }
 async function initializeConfig() {
+  configurationReady = false;
   try {
     await restoreConfig();
     configRestoreError = null;
@@ -1949,15 +2490,49 @@ async function initializeConfig() {
   }
 }
 async function configureAndPersist(update) {
+  return serializeConfiguration(() => configureAndPersistNow(update));
+}
+async function configureAndPersistNow(update) {
   const previous = config;
-  configure(update);
+  let policyRequired;
   try {
-    await persistConfig();
-    configRestoreError = null;
+    policyRequired = await pcrStorage.isPolicyRequired(serviceWorkerScope());
   } catch (error) {
-    config = previous;
+    blockConfiguration(previous, error);
     throw error;
   }
+  if (policyRequired && !previous.pcrPolicy && !("pcrPolicy" in update)) {
+    const error = new Error("persisted PCR policy configuration is missing");
+    blockConfiguration(previous, error);
+    throw error;
+  }
+  configure(update);
+  try {
+    if (!policyRequired && config.pcrPolicy) {
+      await pcrStorage.setPolicyRequired(serviceWorkerScope(), true);
+    }
+    await persistConfig();
+    if (policyRequired && !config.pcrPolicy) {
+      await pcrStorage.setPolicyRequired(serviceWorkerScope(), false);
+    }
+    configurationReady = true;
+    configRestoreError = null;
+  } catch (error) {
+    blockConfiguration(previous, error);
+    throw error;
+  }
+}
+function blockConfiguration(previous, error) {
+  config = previous;
+  configurationReady = false;
+  configRestoreError = publicError(error);
+  resetState(configRestoreError);
+}
+function serializeConfiguration(operation) {
+  const result = configurationTail.then(operation);
+  configurationTail = result.catch(() => {
+  });
+  return result;
 }
 function configCacheKey() {
   if (typeof self.registration?.scope !== "string") {
@@ -1966,13 +2541,25 @@ function configCacheKey() {
   return new URL(CONFIG_CACHE_PATH, self.registration.scope).href;
 }
 async function restoreConfig() {
-  if (!self.caches) return;
+  const policyRequired = await pcrStorage.isPolicyRequired(serviceWorkerScope());
+  if (!self.caches) throw new Error("configuration storage unavailable");
   const cache = await self.caches.open(CONFIG_CACHE_NAME);
   const response = await cache.match(configCacheKey());
-  if (response) configure(await response.json());
+  if (!response) {
+    if (policyRequired) throw new Error("persisted PCR policy configuration is missing");
+    return;
+  }
+  configure(await response.json());
+  if (policyRequired && !config.pcrPolicy) {
+    throw new Error("persisted PCR policy configuration is missing");
+  }
+  if (config.pcrPolicy && !policyRequired) {
+    await pcrStorage.setPolicyRequired(serviceWorkerScope(), true);
+  }
+  configurationReady = true;
 }
 async function persistConfig() {
-  if (!self.caches) return;
+  if (!self.caches) throw new Error("configuration storage unavailable");
   const cache = await self.caches.open(CONFIG_CACHE_NAME);
   await cache.put(
     configCacheKey(),
@@ -1980,6 +2567,12 @@ async function persistConfig() {
       headers: { "Content-Type": "application/json" }
     })
   );
+}
+function serviceWorkerScope() {
+  if (typeof self.registration?.scope !== "string") {
+    throw new Error("service worker scope unavailable");
+  }
+  return new URL(self.registration.scope).href;
 }
 function normalizeEnclaveOrigin(value) {
   if (typeof value !== "string" || value.length === 0) {
@@ -2018,7 +2611,7 @@ function statusMessage() {
     state: lifecycleState(),
     stage: state.stage,
     initialized: Boolean(session),
-    error: state.error,
+    error: state.error || configRestoreError,
     protocol: {
       id: PROTOCOL_ID,
       version: VERSION,
@@ -2056,7 +2649,7 @@ function lifecycleState() {
   if (state.rotationPromise) return "rotating";
   if (state.session) return "ready";
   if (state.sessionPromise) return "establishing";
-  if (state.error) return "error";
+  if (state.error || configRestoreError) return "error";
   return "idle";
 }
 function hasValidSession(session) {
@@ -2079,6 +2672,42 @@ function resetState(error = null) {
 }
 function publicError(error) {
   return error instanceof Error ? error.message : "secure channel error";
+}
+function sdkError(code, stage, message, cause, httpStatus) {
+  const error = new Error(message);
+  error.code = code;
+  error.stage = stage;
+  if (cause !== void 0) error.cause = cause;
+  if (httpStatus !== void 0) error.httpStatus = httpStatus;
+  return error;
+}
+function errorDetails(error, fallbackStage = "internal") {
+  const stage = typeof error?.stage === "string" ? error.stage : fallbackStage;
+  const details = {
+    code: typeof error?.code === "string" ? error.code : `${stage.replaceAll("-", "_").toUpperCase()}_FAILED`,
+    stage,
+    message: publicError(error)
+  };
+  const httpStatus = error?.httpStatus ?? error?.status;
+  if (Number.isInteger(httpStatus)) details.httpStatus = httpStatus;
+  return details;
+}
+function commandStage(type) {
+  switch (type) {
+    case "configure":
+    case "get-pcr-policy":
+    case "replace-pcr-policy":
+      return "configuration";
+    case "rotate-key":
+    case "rotate-session":
+      return "rotation";
+    case "protected-send":
+      return "request";
+    case "initialize":
+      return "initialization";
+    default:
+      return "service-worker";
+  }
 }
 async function notifyClients(type, data) {
   const allClients = await self.clients.matchAll({ type: "window" });

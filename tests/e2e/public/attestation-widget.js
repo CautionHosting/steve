@@ -4,6 +4,7 @@ const KEY_EXCHANGE_META = 'meta[name="steve-key-exchange"]';
 const PROFILE_META = 'meta[name="steve-profile"]';
 const DEFAULT_ORIGIN_META = 'meta[name="steve-default-origin"]';
 const REQUEST_TIMEOUT_META = 'meta[name="steve-request-timeout-ms"]';
+const EXPECTED_PCR_META = index => `meta[name="steve-expected-pcr${index}"]`;
 const RECOVERY_PARAM = 'steve-sw-recovery';
 const MAX_EVENTS = 100;
 const FIXTURE_CONTRACT = 'steve-test-fixture/v1';
@@ -33,9 +34,11 @@ const elements = Object.fromEntries(
     'attestation-profile',
     'trust-anchor',
     'module-id',
+    'pcr-trust',
     'verification-checks',
     'pcr-details',
     'pcr-values',
+    'pcr-policy-note',
     'target-origin',
     'target-kind',
     'boundary-note',
@@ -96,6 +99,14 @@ function normalizeKeyExchange(value) {
   return value;
 }
 
+function requiredPcr(index) {
+  const value = requiredMeta(EXPECTED_PCR_META(index), `expected PCR${index}`);
+  if (!/^[0-9a-f]{96}$/iu.test(value) || value.toLowerCase() === '0'.repeat(96)) {
+    throw new Error(`expected PCR${index} must be a nonzero 96-character hexadecimal value`);
+  }
+  return value.toLowerCase();
+}
+
 const profile = requiredMeta(PROFILE_META, 'STEVE evidence profile');
 if (!['local', 'nitro'].includes(profile)) {
   throw new Error('STEVE evidence profile must be exactly local or nitro');
@@ -104,6 +115,11 @@ const requestTimeoutMs = Number(requiredMeta(REQUEST_TIMEOUT_META, 'request time
 if (!Number.isInteger(requestTimeoutMs)) {
   throw new Error('request timeout must be an integer');
 }
+const expectedPcrs = {
+  PCR0: requiredPcr(0),
+  PCR1: requiredPcr(1),
+  PCR2: requiredPcr(2)
+};
 const query = new URL(location.href).searchParams;
 let enclaveOrigin = normalizeOrigin(
   query.get('origin') || requiredMeta(DEFAULT_ORIGIN_META, 'default STEVE origin')
@@ -272,7 +288,14 @@ function renderStatus(status) {
   setText('attestation-profile', attestation?.profile || verifier.id || '—');
   setText('trust-anchor', attestation?.trustAnchor || verifier.trustAnchor || '—');
   setText('module-id', attestation?.moduleId || '—');
+  setText('pcr-trust', attestation?.pcrTrust || '—');
   setText('target-origin', enclaveOrigin);
+  setText('pcr-policy-note', {
+    pinned: 'Matched one complete independently supplied PCR profile.',
+    'tofu-enrolled': 'Enrolled the exact selected PCR set after key confirmation.',
+    'tofu-matched': 'Matched the exact selected PCR set enrolled previously.',
+    'not-checked': 'Reported only; no PCR policy was supplied.'
+  }[attestation?.pcrTrust] || 'Waiting for PCR policy verification.');
 
   const warning = elements['trust-warning'];
   if (verifier.synthetic || attestation?.synthetic) {
@@ -480,6 +503,7 @@ const ready = (async () => {
         emitEncryptedPayloads: true,
         requestTimeoutMs,
         expectedKeyExchange: keyExchange,
+        pcrPolicy: { mode: 'pinned', profiles: [expectedPcrs] },
         passthroughPaths: [
           `${profileBase}attestation-widget.js`,
           `${profileBase}register.js`,
@@ -526,7 +550,7 @@ async function status() {
 
 async function rotate() {
   const client = await ready;
-  await client.rotateKey();
+  await client.rotateSession();
   return refreshStatus();
 }
 
@@ -569,6 +593,12 @@ async function applyTarget(origin, suite) {
     `${profile === 'nitro' ? 'Nitro' : 'local'} profile configured for ${keyExchange} at ${enclaveOrigin}`,
     'success'
   );
+  return refreshStatus();
+}
+
+async function configurePcrPolicy(pcrPolicy) {
+  const client = await ready;
+  await client.configure({ pcrPolicy });
   return refreshStatus();
 }
 
@@ -734,6 +764,7 @@ window.steveDemo = {
   rotate,
   reset,
   applyTarget,
+  configurePcrPolicy,
   fixture,
   echo,
   largeEcho,

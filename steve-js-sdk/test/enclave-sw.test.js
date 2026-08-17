@@ -18,7 +18,11 @@ import {
 // at module top-level. Stub the minimal SW globals it needs before import so
 // those calls are no-ops instead of throwing in Node.
 const cachedResponses = new Map();
+const policyMarkers = new Set();
+const pcrTrustRecords = new Map();
 let cacheOpenError = null;
+let cachePutGate = null;
+let pcrStorageError = null;
 let captureClientMessages = false;
 const clientMessages = [];
 globalThis.self = {
@@ -38,26 +42,54 @@ globalThis.self = {
           return cachedResponses.get(key)?.clone();
         },
         async put(key, response) {
+          if (cachePutGate) {
+            cachePutGate.enter();
+            await cachePutGate.release;
+          }
           cachedResponses.set(key, response.clone());
         }
       };
     }
   }
 };
+globalThis.self.__STEVE_PCR_STORAGE_TEST__ = {
+  async isPolicyRequired(scope) {
+    if (pcrStorageError) throw pcrStorageError;
+    return policyMarkers.has(scope);
+  },
+  async setPolicyRequired(scope, required) {
+    if (pcrStorageError) throw pcrStorageError;
+    if (required) policyMarkers.add(scope);
+    else policyMarkers.delete(scope);
+  },
+  async loadOrInsert(key, observed) {
+    if (pcrStorageError) throw pcrStorageError;
+    if (pcrTrustRecords.has(key)) {
+      return { status: 'existing', pcrs: pcrTrustRecords.get(key) };
+    }
+    pcrTrustRecords.set(key, structuredClone(observed));
+    return { status: 'inserted' };
+  }
+};
 globalThis.__STEVE_ENABLE_TEST_HOOKS__ = true;
 
 await import('../src/enclave-sw.js');
-const { configure, hasValidSession, resetState, ensureSession, getState, getConfig,
+const { handleMessage, configure, hasValidSession, resetState, ensureSession, getState, getConfig,
   protocolFetch, readBoundedResponse, resolveProtocolUrl, shouldProtectRequest, resetConfig,
-  handleProtectedRequest, withDeadline, ProtocolHttpError, ProtocolTimeoutError,
+  handleProtectedRequest, protectedSend, withDeadline, ProtocolHttpError, ProtocolTimeoutError,
   ProtocolTransportError,
   isRequestLocalFailure,
   configureAndPersist, configCacheKey, getConfigRestoreError, initializeConfig,
   persistConfig, restoreConfig, lifecycleState, statusMessage, rotateSession,
+  finalizePcrTrust,
+  errorDetails, isConfigurationReady, getConfigGeneration,
   setEstablishSession, resetEstablishSession } = globalThis.self.__ENCLAVE_SW_TEST__;
 
 const ROTATION_INTERVAL_MS = 25 * 60 * 1000;
 const originalFetch = globalThis.fetch;
+
+await initializeConfig();
+await configureAndPersist({});
 
 function isProtected(url, init) {
   return shouldProtectRequest(new Request(url, init));
@@ -70,9 +102,14 @@ test.afterEach(async () => {
   resetConfig();
   resetEstablishSession();
   cacheOpenError = null;
+  cachePutGate = null;
+  pcrStorageError = null;
+  policyMarkers.clear();
+  pcrTrustRecords.clear();
   globalThis.self.registration.scope = 'https://example.test/';
   cachedResponses.clear();
   await initializeConfig();
+  await configureAndPersist({});
   globalThis.fetch = originalFetch;
 });
 
@@ -329,6 +366,130 @@ test('expectedKeyExchange defaults to X25519 and only accepts exact suites', () 
   }
 });
 
+test('PCR policy configuration is strict, normalized, retained when omitted, and explicitly clearable', () => {
+  const upper = 'AB'.repeat(48);
+  configure({
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR2: upper, PCR0: upper, PCR1: upper }]
+    }
+  });
+  assert.deepEqual(getConfig().pcrPolicy, {
+    mode: 'pinned',
+    profiles: [{ PCR0: upper.toLowerCase(), PCR1: upper.toLowerCase(), PCR2: upper.toLowerCase() }]
+  });
+
+  configure({ requestTimeoutMs: 1234 });
+  assert.equal(getConfig().pcrPolicy.mode, 'pinned');
+  configure({ pcrPolicy: null });
+  assert.equal(getConfig().pcrPolicy, null);
+  assert.throws(
+    () => configure({ pcrPolicy: { mode: 'pinned', profiles: [] } }),
+    /at least one profile/u
+  );
+});
+
+test('persisted PCR policy cannot silently downgrade when its cached configuration is lost', async () => {
+  const value = '12'.repeat(48);
+  await configureAndPersist({
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: value, PCR1: value, PCR2: value }]
+    }
+  });
+  assert.equal(policyMarkers.has('https://example.test/'), true);
+
+  cachedResponses.clear();
+  resetConfig();
+  await initializeConfig();
+
+  assert.equal(isConfigurationReady(), false);
+  assert.match(getConfigRestoreError(), /persisted PCR policy configuration is missing/u);
+  await assert.rejects(
+    configureAndPersist({}),
+    /persisted PCR policy configuration is missing/u
+  );
+  assert.equal(policyMarkers.has('https://example.test/'), true);
+
+  await configureAndPersist({ pcrPolicy: null });
+  assert.equal(isConfigurationReady(), true);
+  assert.equal(policyMarkers.has('https://example.test/'), false);
+});
+
+test('only explicit pcrPolicy null clears the durable policy marker', async () => {
+  const value = '12'.repeat(48);
+  await configureAndPersist({
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: value, PCR1: value, PCR2: value }]
+    }
+  });
+  await configureAndPersist({ requestTimeoutMs: 1234 });
+  assert.equal(policyMarkers.has('https://example.test/'), true);
+  assert.equal(getConfig().pcrPolicy.mode, 'pinned');
+
+  await configureAndPersist({ pcrPolicy: null });
+  assert.equal(policyMarkers.has('https://example.test/'), false);
+  assert.equal(getConfig().pcrPolicy, null);
+});
+
+test('get-pcr-policy waits for policy replacement persistence', async () => {
+  const original = '12'.repeat(48);
+  const replacement = '13'.repeat(48);
+  await configureAndPersist({
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: original, PCR1: original, PCR2: original }]
+    }
+  });
+
+  let releasePut;
+  let markPutEntered;
+  const putEntered = new Promise(resolve => { markPutEntered = resolve; });
+  cachePutGate = {
+    enter: markPutEntered,
+    release: new Promise(resolve => { releasePut = resolve; })
+  };
+  const replacing = configureAndPersist({
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: replacement, PCR1: replacement, PCR2: replacement }]
+    }
+  });
+  await putEntered;
+
+  let response;
+  const reading = handleMessage({
+    data: { type: 'get-pcr-policy' },
+    ports: [{ postMessage: value => { response = value; } }]
+  });
+  await Promise.resolve();
+  assert.equal(response, undefined);
+
+  releasePut();
+  await replacing;
+  await reading;
+  assert.equal(response.success, true);
+  assert.equal(response.policy.profiles[0].PCR0, replacement);
+});
+
+test('PCR policy storage failure blocks configuration and secure sessions', async () => {
+  pcrStorageError = new Error('PCR policy storage failed');
+  const value = '12'.repeat(48);
+
+  await assert.rejects(
+    configureAndPersist({
+      pcrPolicy: {
+        mode: 'pinned',
+        profiles: [{ PCR0: value, PCR1: value, PCR2: value }]
+      }
+    }),
+    /PCR policy storage failed/u
+  );
+  assert.equal(isConfigurationReady(), false);
+  await assert.rejects(ensureSession(), /PCR policy storage failed/u);
+});
+
 test('protocol requests use the configured enclave origin without credentials or cache bypass', async () => {
   configure({ enclaveOrigin: 'https://secure.example' });
   let captured;
@@ -404,6 +565,96 @@ test('changing enclaveOrigin discards a session established for the old enclave'
   assert.equal(getState().session, null);
 });
 
+test('changing PCR policy discards a session established under the old policy', async () => {
+  setEstablishSession(async () => ({ id: 'session-a', createdAt: Date.now() }));
+  await ensureSession();
+  const value = '12'.repeat(48);
+
+  configure({
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: value, PCR1: value, PCR2: value }]
+    }
+  });
+
+  assert.equal(getState().session, null);
+});
+
+test('TOFU finalization reports enrollment then match over the exact configured set', async () => {
+  configure({ pcrPolicy: { mode: 'tofu', additionalPcrIndices: [3] } });
+  const snapshot = getConfig();
+  const generation = getConfigGeneration();
+  const targetState = getState();
+  const observedPcrs = {
+    PCR0: '10'.repeat(48),
+    PCR1: '11'.repeat(48),
+    PCR2: '12'.repeat(48),
+    PCR3: '13'.repeat(48)
+  };
+  const signal = new AbortController().signal;
+
+  assert.equal(
+    await finalizePcrTrust(
+      snapshot,
+      generation,
+      targetState,
+      observedPcrs,
+      null,
+      signal
+    ),
+    'tofu-enrolled'
+  );
+  assert.equal(
+    await finalizePcrTrust(
+      snapshot,
+      generation,
+      targetState,
+      observedPcrs,
+      null,
+      signal
+    ),
+    'tofu-matched'
+  );
+});
+
+test('a configuration update queued before PCR finalization prevents stale enrollment', async () => {
+  configure({ pcrPolicy: { mode: 'tofu' } });
+  const snapshot = getConfig();
+  const generation = getConfigGeneration();
+  const targetState = getState();
+  const configuration = configureAndPersist({ requestTimeoutMs: 1234 });
+  const finalization = finalizePcrTrust(
+    snapshot,
+    generation,
+    targetState,
+    {
+      PCR0: '10'.repeat(48),
+      PCR1: '11'.repeat(48),
+      PCR2: '12'.repeat(48)
+    },
+    null,
+    new AbortController().signal
+  );
+
+  await configuration;
+  await assert.rejects(finalization, /configuration changed during session establishment/u);
+  assert.equal(pcrTrustRecords.size, 0);
+});
+
+test('structured worker errors have stable code, stage, and optional HTTP status', () => {
+  assert.deepEqual(errorDetails(new ProtocolHttpError(429, 'request', 'v2 request')), {
+    code: 'HTTP_STATUS',
+    stage: 'request',
+    message: 'v2 request rejected (429)',
+    httpStatus: 429
+  });
+  assert.deepEqual(errorDetails(new Error('bad rotation'), 'rotation'), {
+    code: 'ROTATION_FAILED',
+    stage: 'rotation',
+    message: 'bad rotation'
+  });
+});
+
 test('hasValidSession: false for null/undefined session', () => {
   assert.equal(hasValidSession(null), false);
   assert.equal(hasValidSession(undefined), false);
@@ -469,6 +720,7 @@ function diagnosticSession(fill, createdAt = Date.now()) {
       trustAnchor: 'AWS Nitro root CA',
       synthetic: false,
       pcrs: { PCR0: 'reported-pcr' },
+      pcrTrust: 'not-checked',
       moduleId: 'test-module',
       checks: {
         certificateChain: 'verified',
@@ -529,6 +781,7 @@ test('status tracks eager establishment and exposes only safe session diagnostic
   assert.equal(status.session.establishedAt, session.createdAt);
   assert.equal(status.session.rotatesAt, session.createdAt + ROTATION_INTERVAL_MS);
   assert.equal(status.attestation.checks.expectedPcrPolicy, 'not-checked');
+  assert.equal(status.attestation.pcrTrust, 'not-checked');
   assert.equal(status.lastKeyRotation, session.createdAt);
   assert.equal(serialized.includes('derived-key-material-must-not-appear'), false);
   assert.equal(serialized.includes('secretMarker'), false);
@@ -565,6 +818,19 @@ test('status distinguishes lazy establishment and session rotation triggers', as
   assert.equal(statusMessage().session.trigger, 'rotation');
 });
 
+test('failed explicit rotation preserves the previously accepted session', async () => {
+  const original = diagnosticSession(5);
+  setEstablishSession(async () => original);
+  await ensureSession();
+  setEstablishSession(async () => {
+    throw new Error('PCR policy rejected rotation');
+  });
+
+  await assert.rejects(rotateSession(), /PCR policy rejected rotation/u);
+  assert.equal(getState().session, original);
+  assert.equal(statusMessage().state, 'ready');
+});
+
 async function installFakeSession() {
   const session = {
     id: new Uint8Array(16).fill(7),
@@ -574,7 +840,15 @@ async function installFakeSession() {
     ),
     sequences: new SequenceTracker(),
     createdAt: Date.now(),
-    attestation: { verified: true, pcrs: {}, moduleId: 'test-module' }
+    enclaveOrigin: getConfig().enclaveOrigin,
+    configGeneration: getConfigGeneration(),
+    keyExchange: X25519_KEY_EXCHANGE,
+    attestation: {
+      verified: true,
+      pcrs: {},
+      pcrTrust: 'not-checked',
+      moduleId: 'test-module'
+    }
   };
   setEstablishSession(async () => session);
   await ensureSession();
@@ -621,6 +895,69 @@ test('protected responses preserve repeated headers', async () => {
 
   assert.equal(response.status, 200);
   assert.equal(response.headers.get('x-repeat'), 'one, two');
+});
+
+test('protectedSend returns non-secret metadata for the accepted exchange', async () => {
+  const session = await installFakeSession();
+  let requestEnvelope;
+  let responseEnvelope;
+  globalThis.fetch = async (url, options) => {
+    requestEnvelope = new Uint8Array(options.body);
+    const response = await validProtocolResponse(options, session, 201);
+    responseEnvelope = new Uint8Array(await response.clone().arrayBuffer());
+    return response;
+  };
+
+  const result = await protectedSend({
+    path: '/items?q=1',
+    method: 'POST',
+    headers: [['content-type', 'text/plain']],
+    body: new TextEncoder().encode('payload')
+  });
+
+  assert.equal(result.status, 201);
+  assert.equal(result.sessionId.length, 22);
+  const requestCiphertext = decodeEnvelope(requestEnvelope).ciphertext;
+  const responseCiphertext = decodeEnvelope(responseEnvelope).ciphertext;
+  assert.deepEqual(result.exchange, {
+    protocolName: 'STEVE-E2P-V2',
+    protection: 'AES-256-GCM',
+    sessionId: result.sessionId,
+    sequence: '1',
+    keyExchange: 'X25519',
+    pcrTrust: 'not-checked',
+    outerStatus: 200,
+    requestPlaintextBytes: requestCiphertext.length - 16,
+    requestCiphertextBytes: requestCiphertext.length,
+    requestEnvelopeBytes: requestEnvelope.length,
+    responseEnvelopeBytes: responseEnvelope.length,
+    responseCiphertextBytes: responseCiphertext.length,
+    responsePlaintextBytes: responseCiphertext.length - 16
+  });
+  assert.doesNotMatch(JSON.stringify(result.exchange), /payload/u);
+});
+
+test('protectedSend reports each sequence and authenticated application error', async () => {
+  const session = await installFakeSession();
+  globalThis.fetch = (url, options) => validProtocolResponse(options, session, 404);
+
+  const first = await protectedSend({ path: '/missing', headers: [], body: new Uint8Array() });
+  const second = await protectedSend({ path: '/missing', headers: [], body: new Uint8Array() });
+
+  assert.equal(first.status, 404);
+  assert.equal(first.exchange.sequence, '1');
+  assert.equal(second.exchange.sequence, '2');
+  assert.equal(first.exchange.sessionId, second.exchange.sessionId);
+});
+
+test('protectedSend rejects invalid paths without exchange metadata', async () => {
+  await installFakeSession();
+  await assert.rejects(
+    protectedSend({ path: 'https://other.test/items', headers: [], body: new Uint8Array() }),
+    error => error.code === 'INVALID_REQUEST'
+      && error.stage === 'request'
+      && !Object.hasOwn(error, 'exchange')
+  );
 });
 
 test('protected responses reject malformed header pairs', async () => {
@@ -680,13 +1017,12 @@ test('a transient request failure does not poison a concurrent sibling', async (
     return response;
   };
 
-  const [failed, succeeded] = await Promise.all([
+  const responses = await Promise.all([
     handleProtectedRequest(new Request('https://example.test/first')),
     handleProtectedRequest(new Request('https://example.test/second'))
   ]);
 
-  assert.equal(failed.status, 502);
-  assert.equal(succeeded.status, 200);
+  assert.deepEqual(responses.map(response => response.status).sort(), [200, 502]);
   assert.equal(getState().session, session);
   assert.equal(await session.sequences.allocate(), 3n);
 });
@@ -818,10 +1154,29 @@ test('an invalid protected response resets the secure session', async () => {
   assert.equal(getState().session, null);
   const errorMessage = clientMessages.find(message => message.type === 'enclave:error');
   assert.equal(errorMessage.url, 'https://example.test/invalid-response');
+  assert.equal(errorMessage.operation, 'request');
   assert.throws(
     () => session.sequences.accept(1n, 1n),
     /unsupported envelope version/u
   );
+});
+
+test('session establishment errors identify the initialization operation', async () => {
+  captureClientMessages = true;
+  const mismatch = new Error('attested PCRs did not match');
+  mismatch.code = 'PCR_POLICY_MISMATCH';
+  mismatch.stage = 'pcr-policy';
+  setEstablishSession(async () => { throw mismatch; });
+
+  const response = await handleProtectedRequest(
+    new Request('https://example.test/initialization-failure')
+  );
+
+  assert.equal(response.status, 502);
+  const errorMessage = clientMessages.find(message => message.type === 'enclave:error');
+  assert.equal(errorMessage.operation, 'initialization');
+  assert.equal(errorMessage.code, 'PCR_POLICY_MISMATCH');
+  assert.equal(errorMessage.stage, 'pcr-policy');
 });
 
 test('an oversized protected response resets the secure session', async () => {

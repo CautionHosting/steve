@@ -7,6 +7,9 @@
     <meta name="steve-key-exchange" content="__STEVE_KEY_EXCHANGE__">
     <meta name="steve-default-origin" content="__STEVE_DEFAULT_ORIGIN__">
     <meta name="steve-request-timeout-ms" content="__STEVE_REQUEST_TIMEOUT_MS__">
+    <meta name="steve-expected-pcr0" content="__STEVE_EXPECTED_PCR0__">
+    <meta name="steve-expected-pcr1" content="__STEVE_EXPECTED_PCR1__">
+    <meta name="steve-expected-pcr2" content="__STEVE_EXPECTED_PCR2__">
     <link rel="icon" href="data:,">
     <title>STEVE E2E</title>
     <style>
@@ -394,11 +397,12 @@
               <dt>Profile</dt><dd id="attestation-profile">—</dd>
               <dt>Trust anchor</dt><dd id="trust-anchor">—</dd>
               <dt>Module</dt><dd id="module-id">—</dd>
+              <dt>PCR trust</dt><dd id="pcr-trust">—</dd>
             </dl>
             <details id="pcr-details" hidden>
               <summary>Reported PCR values</summary>
               <dl id="pcr-values" class="pcr-list"></dl>
-              <p class="policy-note">Reported only; not compared with an approved PCR policy.</p>
+              <p id="pcr-policy-note" class="policy-note">Waiting for PCR policy verification.</p>
             </details>
           </article>
 

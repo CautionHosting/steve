@@ -13,7 +13,8 @@ See the [normative STEVE v2 protocol specification](docs/steve-v2-protocol.md).
 > provide trusted first-load bootstrap or expected-PCR delivery. STEVE rejects
 > plaintext application routing by default. Native clients require an explicit
 > PCR policy: reviewed pinned profiles or caller-persisted trust on first use
-> (TOFU). The browser SDK does not yet enforce expected PCRs.
+> (TOFU). The browser SDK supports the same policies, but leaves PCR policy
+> optional for backward compatibility.
 
 ## Architecture
 
@@ -109,10 +110,15 @@ routes; they do not enable general plaintext application forwarding.
 
 Current limitations:
 
-- Expected PCR values are not enforced by the browser client.
+- Browser PCR policy is optional; omitting it reports `not-checked` and does
+  not authenticate the expected deployment.
 - Deployments must keep the application upstream private; fail-closed STEVE routing does not protect a separately exposed app port.
-- The first-load service-worker bootstrap is not independently trusted.
-- A host can route a client to another legitimate enclave using the same pinned suite unless expected deployment identity is supplied independently.
+- Same-origin page, worker, configuration, and expected-PCR delivery are not
+  independently trusted on first load.
+- Browser TOFU provides continuity after first use, not first-use workload
+  identity. Losing the TOFU record or clearing all same-origin site data reopens
+  enrollment; losing only the persisted policy configuration fails closed while
+  its policy-required marker remains.
 - Browser WASM must not be described as inherently constant-time; its supported-browser side-channel posture requires independent review.
 
 ## Usage
@@ -122,7 +128,14 @@ Current limitations:
 ```javascript
 import { registerEnclaveServiceWorker } from 'steve-js-sdk';
 
-const client = await registerEnclaveServiceWorker();
+const client = await registerEnclaveServiceWorker({
+  config: {
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: pcr0Hex, PCR1: pcr1Hex, PCR2: pcr2Hex }]
+    }
+  }
+});
 await client.initialize(); // Optional eager establishment
 
 // Same-origin fetch() calls are now transparently E2E encrypted
@@ -137,6 +150,10 @@ const client = await registerEnclaveServiceWorker({
   config: {
     enclaveOrigin: 'https://secure.example',
     expectedKeyExchange: 'XWING-DRAFT10',
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: pcr0Hex, PCR1: pcr1Hex, PCR2: pcr2Hex }]
+    },
     requestTimeoutMs: 30000
   }
 });
@@ -144,6 +161,22 @@ await client.initialize(); // Optional eager establishment
 
 const response = await fetch('https://secure.example/api/secret');
 ```
+
+Omitting `pcrPolicy` retains the compatibility behavior: PCRs are reported as
+`not-checked` and do not authenticate the expected deployment.
+
+For an explicit protected call, `client.send('/api/secret')` routes an
+origin-relative path through E2P without SDK retries and returns the `Response`,
+protecting session ID, and non-secret exchange metadata. The metadata covers
+protocol, suite, PCR trust result, sequence, outer status, and serialized
+plaintext/ciphertext/envelope byte counts; it excludes raw records, application
+data, and cryptographic secrets. STEVE does not follow upstream redirects;
+the call returns their `3xx` response, while a redirect of the outer protocol
+request fails. Client methods expose structured `SteveError` fields (`code`,
+`stage`, `message`, and optional `httpStatus`). The worker serializes PCR policy
+configuration replacement and resets the session; the next session enforces the
+new policy, and existing TOFU records are not migrated. See
+[the browser SDK API](steve-js-sdk/README.md#client-api).
 
 `expectedKeyExchange` defaults to `X25519`; X-Wing deployments must set
 `XWING-DRAFT10` explicitly. Initialization, CSP, response, or
@@ -158,8 +191,10 @@ session is lost, the next protected request establishes a fresh session.
 `client.getStatus()` reports the worker lifecycle and safe session diagnostics:
 the protocol and key-establishment suite, KDF and record protection, base64url
 session ID and transcript hash, establishment trigger and rotation time, and
-attestation checks. PCRs are reported evidence only; v2 does not yet compare
-them with an independently supplied expected-PCR policy. Status never includes
+attestation checks. When `pcrPolicy` is omitted, PCRs are reported but not
+checked. With a pinned or TOFU policy, the worker
+enforces the policy before application traffic. `attestation.pcrTrust` reports
+`not-checked`, `pinned`, `tofu-enrolled`, or `tofu-matched`. Status never includes
 private keys, shared secrets, derived traffic keys, binders, nonces, or
 application plaintext.
 
@@ -182,8 +217,8 @@ failures do not reset an otherwise valid secure session. The SDK does not
 automatically retry timed-out requests because the upstream operation may
 already have executed.
 
-The browser SDK requires module service workers, ES2020, WebCrypto, and
-WebAssembly. X25519 mode also requires WebCrypto X25519; X-Wing requires a CSP
+The browser SDK requires module service workers, ES2020, WebCrypto, Cache
+Storage, and IndexedDB. X25519 mode also requires WebCrypto X25519; X-Wing requires a CSP
 that permits the fixed same-origin WASM asset. Unsupported capabilities fail
 closed without a classic-worker or cryptographic fallback. See
 `steve-js-sdk/README.md` for the tested-browser policy.
@@ -291,13 +326,14 @@ export STEVE_REMOTE_ORIGIN=https://secure.example
 export STEVE_KEY_EXCHANGE=XWING-DRAFT10
 caution verify --attestation-url "$STEVE_REMOTE_ORIGIN/attestation"
 
-STEVE_EXPECTED_PCR0="$PCR0_HEX" \
-STEVE_EXPECTED_PCR1="$PCR1_HEX" \
-STEVE_EXPECTED_PCR2="$PCR2_HEX" \
+export STEVE_TRUSTED_HASHES=/path/to/independently/verified/trusted_hashes.json
+export STEVE_EXPECTED_PCR0="$(jq -er .pcr0 "$STEVE_TRUSTED_HASHES")"
+export STEVE_EXPECTED_PCR1="$(jq -er .pcr1 "$STEVE_TRUSTED_HASHES")"
+export STEVE_EXPECTED_PCR2="$(jq -er .pcr2 "$STEVE_TRUSTED_HASHES")"
 make test-e2e-nitro
 ```
 
-The browser gate compares verified evidence with the expected PCRs; the Rust SDK
-enforces them during connection. Do not source expected PCRs from the unverified
-remote response. See [tests/e2e/README.md](tests/e2e/README.md) for CI,
+The browser and Rust gates enforce the expected PCRs during connection and
+reject a mutated profile before application traffic. Do not source expected
+PCRs from the unverified remote response. See [tests/e2e/README.md](tests/e2e/README.md) for CI,
 fixture-deployment, focused-test, and trust-boundary details.
