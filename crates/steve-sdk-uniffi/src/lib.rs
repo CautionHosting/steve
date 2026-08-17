@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     future::Future,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -433,17 +433,26 @@ fn response_from_core(response: steve_sdk::Response) -> HttpResponse {
 }
 
 fn runtime() -> Result<&'static Runtime, SteveError> {
-    static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
-    match RUNTIME.get_or_init(|| {
-        RuntimeBuilder::new_multi_thread()
-            .enable_all()
-            .thread_name("steve-sdk-uniffi")
-            .build()
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(runtime) => Ok(runtime),
-        Err(message) => Err(SteveError::Runtime(message.clone())),
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    static RUNTIME_INIT: Mutex<()> = Mutex::new(());
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime);
     }
+
+    let _initialization = match RUNTIME_INIT.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime);
+    }
+
+    let runtime = RuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .thread_name("steve-sdk-uniffi")
+        .build()
+        .map_err(|error| SteveError::Runtime(error.to_string()))?;
+    Ok(RUNTIME.get_or_init(|| runtime))
 }
 
 async fn run_on_runtime<F, T>(future: F) -> Result<T, SteveError>

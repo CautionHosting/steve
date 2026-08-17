@@ -53,9 +53,10 @@ helpers are not part of the FFI; Swift uses the byte-oriented request and
 response DTOs.
 
 The facade owns one lazy, process-global, multi-thread Tokio runtime. A client
-may be used concurrently. Swift task cancellation does not prove that a remote
-request stopped; configured deadlines and the SDK's no-retry behavior remain
-authoritative.
+may be used concurrently. Only successful runtime initialization is cached, so
+a later call retries after an initialization failure. Swift task cancellation
+does not prove that a remote request stopped; configured deadlines and the
+SDK's no-retry behavior remain authoritative.
 
 ## TOFU contract
 
