@@ -460,22 +460,31 @@ protocol.
 - Every profile requires nonzero, 48-byte PCR0, PCR1, and PCR2 values. Pinned
   policy accepts only one whole profile; values from different profiles cannot
   be mixed. Attested PCRs not configured in that profile are ignored.
-- TOFU stores verified PCR0, PCR1, and PCR2 under an opaque key derived as:
+- TOFU selects PCR0, PCR1, and PCR2 by default. Callers may add PCR indices with
+  `PcrPolicy::trust_on_first_use_with_additional_pcrs`; the effective selection
+  is the sorted, deduplicated union of PCR0/1/2 and those indices. Every selected
+  PCR must be present, nonzero, and 48 bytes before storage is called.
+- TOFU stores exactly the selected verified PCRs under an opaque key derived as:
 
   ```text
   SHA-256("STEVE-E2P-V2-PCR-TOFU\0" || context_hash
           || UTF8(pinned_suite))
   ```
 
-  The embedding application supplies durable storage with atomic
-  load-or-insert semantics. Enrollment occurs only after Nitro evidence,
-  nonce, suite, transcript, binder, and session confirmation succeed. An
-  existing different value or storage failure aborts before application
-  traffic. The SDK never replaces the record.
+  The key does not include the selected PCR indices. The embedding application
+  supplies durable storage with atomic load-or-insert semantics. Enrollment
+  occurs only after Nitro evidence, nonce, suite, transcript, binder, and
+  session confirmation succeed. An existing record must contain exactly the
+  selected indices and values; a missing, extra, or changed entry or storage
+  failure aborts before application traffic. Changing the selection requires
+  explicit record migration or a distinct application context. The SDK never
+  replaces the record.
 - Attestation results report `Pinned`, `TofuEnrolled`, or `TofuMatched`. TOFU
   establishes continuity after first use, not independently pinned workload
-  identity on first use. A PCR-changing upgrade requires either a preapproved
-  pinned profile or explicit out-of-band replacement of the TOFU record.
+  identity on first use. Results retain the complete signed PCR map, including
+  PCRs outside the TOFU selection. A PCR-changing upgrade requires either a
+  preapproved pinned profile or explicit out-of-band replacement of the TOFU
+  record.
 - There is no unpinned policy, automatic policy downgrade, or plaintext
   fallback in the native SDK.
 - The SDK caps session, confirmation, and application protocol responses at
@@ -489,7 +498,8 @@ protocol.
 not change E2P v2. Repeated `--pcrs FILE` values select a pinned allowlist
 (`--trusted-hashes-file` is an alias). With no trust flag, the CLI pins
 `.caution/trusted_hashes.json`. The mutually exclusive `--tofu-store FILE`
-selects TOFU backed by a versioned, atomic local file.
+selects PCR0/1/2 TOFU backed by a versioned, atomic local file; the CLI does not
+expose additional TOFU PCR selection.
 
 The CLI never auto-updates PCRs. Deleting or replacing its TOFU file reopens
 first-use enrollment, so that file is a caller-controlled trust boundary rather
