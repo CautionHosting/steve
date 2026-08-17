@@ -82,14 +82,14 @@ impl PcrTrustKey {
 pub enum PcrTrustRecord {
     /// The supplied PCRs were durably inserted.
     Inserted,
-    /// The key was already present with this value; it was not replaced.
+    /// The key was already present with this value; the client requires an exact match.
     Existing(ExpectedPcrs),
 }
 
 /// Durable storage used by trust-on-first-use PCR policy.
 #[async_trait]
 pub trait PcrTrustStore: Send + Sync {
-    /// Atomically insert `observed` when `key` is absent, or return the existing record.
+    /// Atomically insert the selected `observed` PCRs, or return the complete existing record.
     async fn load_or_insert(
         &self,
         key: PcrTrustKey,
@@ -106,7 +106,10 @@ pub struct PcrPolicy {
 #[derive(Clone)]
 enum PcrPolicyKind {
     Pinned(Vec<ExpectedPcrs>),
-    TrustOnFirstUse(Arc<dyn PcrTrustStore>),
+    TrustOnFirstUse {
+        store: Arc<dyn PcrTrustStore>,
+        pcr_indices: BTreeSet<u8>,
+    },
 }
 
 impl PcrPolicy {
@@ -126,8 +129,21 @@ impl PcrPolicy {
 
     /// Enroll the first verified PCR0/1/2 profile in caller-owned durable storage.
     pub fn trust_on_first_use(store: Arc<dyn PcrTrustStore>) -> Self {
+        Self::trust_on_first_use_with_additional_pcrs(store, [])
+    }
+
+    /// Enroll the first verified PCR0/1/2 profile plus the selected PCRs.
+    ///
+    /// Duplicate indices, including PCR0/1/2, are ignored. Existing records must
+    /// contain exactly the selected indices and values.
+    pub fn trust_on_first_use_with_additional_pcrs(
+        store: Arc<dyn PcrTrustStore>,
+        additional_pcr_indices: impl IntoIterator<Item = u8>,
+    ) -> Self {
+        let mut pcr_indices = BTreeSet::from([0, 1, 2]);
+        pcr_indices.extend(additional_pcr_indices);
         Self {
-            kind: PcrPolicyKind::TrustOnFirstUse(store),
+            kind: PcrPolicyKind::TrustOnFirstUse { store, pcr_indices },
         }
     }
 }
@@ -139,7 +155,10 @@ impl Debug for PcrPolicy {
                 .debug_struct("PcrPolicy::Pinned")
                 .field("profiles", &profiles.len())
                 .finish(),
-            PcrPolicyKind::TrustOnFirstUse(_) => formatter.write_str("PcrPolicy::TrustOnFirstUse"),
+            PcrPolicyKind::TrustOnFirstUse { pcr_indices, .. } => formatter
+                .debug_struct("PcrPolicy::TrustOnFirstUse")
+                .field("pcr_indices", pcr_indices)
+                .finish(),
         }
     }
 }
@@ -149,9 +168,9 @@ impl Debug for PcrPolicy {
 pub enum PcrTrustStatus {
     /// The attested PCRs matched one complete approved profile.
     Pinned,
-    /// This session atomically enrolled its verified PCR0/1/2 values.
+    /// This session atomically enrolled its selected verified PCR values.
     TofuEnrolled,
-    /// This session matched PCR0/1/2 values enrolled previously.
+    /// This session matched the selected PCR values enrolled previously.
     TofuMatched,
 }
 
@@ -844,7 +863,7 @@ impl Client {
                 .attestation_verifier
                 .verify(document, &candidate_pcrs, now, client_nonce)?;
         let pcrs = extract_pcrs(&payload)?;
-        if extract_required_attested_pcrs(&pcrs)? != candidate_pcrs {
+        if extract_attested_pcrs(&pcrs, [0, 1, 2])? != candidate_pcrs {
             return Err(Error::MalformedAttestation(
                 "verified PCRs differ from the signed COSE payload",
             ));
@@ -878,10 +897,11 @@ impl Client {
         observed: &NitroPcrs,
         key_exchange: KeyExchangeSuite,
     ) -> Result<PcrTrustStatus> {
-        let PcrPolicyKind::TrustOnFirstUse(store) = &self.inner.pcr_policy.kind else {
+        let PcrPolicyKind::TrustOnFirstUse { store, pcr_indices } = &self.inner.pcr_policy.kind
+        else {
             unreachable!("pinned PCR policy was already handled")
         };
-        let observed = extract_required_attested_pcrs(observed)?;
+        let observed = extract_attested_pcrs(observed, pcr_indices.iter().copied())?;
         let record = store
             .load_or_insert(
                 pcr_trust_key(&self.inner.context_hash, key_exchange),
@@ -892,7 +912,7 @@ impl Client {
         match record {
             PcrTrustRecord::Inserted => Ok(PcrTrustStatus::TofuEnrolled),
             PcrTrustRecord::Existing(existing) => {
-                let existing = extract_required_expected_pcrs(&existing)?;
+                validate_expected_pcrs(&existing)?;
                 if existing == observed {
                     Ok(PcrTrustStatus::TofuMatched)
                 } else {
@@ -1236,12 +1256,15 @@ fn extract_unverified_required_pcrs(document: &[u8]) -> Result<NitroPcrs> {
         .ok_or(Error::MalformedAttestation("COSE payload"))?;
     let payload = serde_cbor::from_slice(payload)
         .map_err(|_| Error::MalformedAttestation("COSE payload CBOR"))?;
-    extract_required_attested_pcrs(&extract_pcrs(&payload)?)
+    extract_attested_pcrs(&extract_pcrs(&payload)?, [0, 1, 2])
 }
 
-fn extract_required_attested_pcrs(pcrs: &NitroPcrs) -> Result<NitroPcrs> {
-    let mut required = NitroPcrs::with_capacity(3);
-    for index in [0, 1, 2] {
+fn extract_attested_pcrs(
+    pcrs: &NitroPcrs,
+    indices: impl IntoIterator<Item = u8>,
+) -> Result<NitroPcrs> {
+    let mut selected = NitroPcrs::new();
+    for index in indices {
         let value = pcrs.get(&index).ok_or(Error::InvalidAttestedPcr {
             index,
             reason: "missing",
@@ -1258,17 +1281,9 @@ fn extract_required_attested_pcrs(pcrs: &NitroPcrs) -> Result<NitroPcrs> {
                 reason: "all-zero debug PCRs are not accepted",
             });
         }
-        required.insert(index, value.clone());
+        selected.insert(index, value.clone());
     }
-    Ok(required)
-}
-
-fn extract_required_expected_pcrs(pcrs: &NitroPcrs) -> Result<NitroPcrs> {
-    validate_expected_pcrs(pcrs)?;
-    Ok([0, 1, 2]
-        .into_iter()
-        .map(|index| (index, pcrs[&index].clone()))
-        .collect())
+    Ok(selected)
 }
 
 fn pcr_profile_matches(profile: &NitroPcrs, observed: &NitroPcrs) -> bool {

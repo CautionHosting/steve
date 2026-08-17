@@ -191,10 +191,11 @@ closed without a classic-worker or cryptographic fallback. See
 ### Native (Rust)
 
 The native SDK requires an explicit PCR policy. A pinned policy accepts one or
-more reviewed, complete PCR0/1/2 profiles. TOFU records the first fully verified
-profile in caller-owned durable storage and requires it on later sessions. PCRs
-are checked together with the Nitro certificate chain, fresh nonce, session
-transcript, selected suite, and derived-key binder.
+more reviewed profiles containing at least PCR0/1/2. TOFU records PCR0/1/2 by
+default and may include caller-selected additional PCRs. It requires the exact
+selected set on later sessions. PCRs are checked together with the Nitro
+certificate chain, fresh nonce, session transcript, selected suite, and
+derived-key binder.
 
 ```rust
 use steve_sdk::{Client, ExpectedPcrs};
