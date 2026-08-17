@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import {
   enforceTofuPcrPolicy,
@@ -10,6 +11,11 @@ import {
   verifyPinnedPcrPolicy
 } from '../src/pcr-policy.js';
 
+const conformance = JSON.parse(await readFile(
+  new URL('../../test-vectors/pcr-policy-v1.json', import.meta.url),
+  'utf8'
+));
+
 const pcr = byte => byte.toString(16).padStart(2, '0').repeat(48);
 const observed = {
   PCR0: pcr(0x10),
@@ -18,6 +24,27 @@ const observed = {
   PCR3: pcr(0x13),
   PCR8: pcr(0x18)
 };
+
+test('shared PCR policy vectors match browser normalization and policy semantics', () => {
+  for (const vector of conformance.pinned) {
+    const policy = normalizePcrPolicy({ mode: 'pinned', profiles: vector.profiles });
+    if (vector.accepted) {
+      assert.equal(verifyPinnedPcrPolicy(policy, conformance.observed), 'pinned', vector.name);
+    } else {
+      assert.throws(() => verifyPinnedPcrPolicy(policy, conformance.observed), undefined, vector.name);
+    }
+  }
+
+  const tofuPolicy = normalizePcrPolicy({
+    mode: 'tofu',
+    additionalPcrIndices: conformance.tofu.additionalPcrIndices
+  });
+  const selected = selectTofuPcrs(tofuPolicy, conformance.observed);
+  assert.deepEqual(selected, conformance.tofu.selected);
+  for (const record of conformance.tofu.records) {
+    assert.equal(exactPcrsMatch(record.pcrs, selected), record.matches, record.name);
+  }
+});
 
 test('pinned policies normalize complete profiles and additional PCRs', () => {
   const policy = normalizePcrPolicy({

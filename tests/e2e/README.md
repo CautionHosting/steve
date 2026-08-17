@@ -15,7 +15,8 @@ both `X25519` and `XWING-DRAFT10`. Synthetic evidence does not prove Nitro.
 The browser gate covers pinned success and rejection, TOFU enrollment and
 rotation, worker-restart persistence, selected-PCR conflict, storage failure,
 and preservation of the previous accepted session after a failed explicit
-rotation. Rejections do not reach the application endpoint.
+rotation and explicit protected `client.send()` routing. Rejections do not
+reach the application endpoint.
 
 Focused runs:
 

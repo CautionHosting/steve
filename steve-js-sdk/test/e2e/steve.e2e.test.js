@@ -196,6 +196,29 @@ test('protects a 100 KiB body and requests an identity response', async ({ page 
   });
 });
 
+test('client.send routes exactly one protected relative request and returns its session ID', async ({ page }) => {
+  await openDemo(page);
+  const before = isNitro ? null : await upstreamCount(page, 'POST', '/echo');
+  const result = await page.evaluate(async () => {
+    const client = await window.steveDemo.ready;
+    const { response, sessionId } = await client.send('/echo', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: 'explicit-protected-send'
+    });
+    return { status: response.status, body: await response.text(), sessionId };
+  });
+
+  expect(result).toEqual({
+    status: 200,
+    body: 'explicit-protected-send',
+    sessionId: (await currentStatus(page)).session.id
+  });
+  if (!isNitro) {
+    expect(await upstreamCount(page, 'POST', '/echo')).toBe(before + 1);
+  }
+});
+
 test('fails closed when the browser and server suites disagree', async ({ page }) => {
   await openDemo(page);
   const mismatched = keyExchange === 'X25519' ? 'XWING-DRAFT10' : 'X25519';
@@ -241,10 +264,20 @@ test('rejects a mutated pinned profile before application traffic', async ({ pag
       mode: 'pinned',
       profiles: [mutated]
     });
-    return window.steveDemo.echo('must-not-reach-upstream');
+    const client = await window.steveDemo.ready;
+    try {
+      await client.send('/echo', { method: 'POST', body: 'must-not-reach-upstream' });
+      return null;
+    } catch (error) {
+      return { code: error.code, stage: error.stage, message: error.message };
+    }
   }, expectedPcrs);
 
-  expect(rejected.status).toBe(502);
+  expect(rejected).toEqual({
+    code: 'PCR_POLICY_MISMATCH',
+    stage: 'pcr-policy',
+    message: 'attested PCRs did not match one complete pinned profile'
+  });
   expect(await upstreamCount(page, 'POST', '/echo')).toBe(before);
   expect((await currentStatus(page)).session).toBeNull();
 });

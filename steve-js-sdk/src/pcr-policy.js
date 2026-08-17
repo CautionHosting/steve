@@ -56,7 +56,10 @@ export function verifyPinnedPcrPolicy(policy, observed) {
   if (policy.profiles.some(profile => profileMatches(profile, observed))) {
     return 'pinned';
   }
-  throw new Error('attested PCRs did not match one complete pinned profile');
+  throw policyError(
+    'PCR_POLICY_MISMATCH',
+    'attested PCRs did not match one complete pinned profile'
+  );
 }
 
 export function selectTofuPcrs(policy, observed) {
@@ -64,10 +67,14 @@ export function selectTofuPcrs(policy, observed) {
   requireRecord(observed, 'attested PCRs');
   const selected = {};
   for (const index of [0, 1, 2, ...policy.additionalPcrIndices]) {
-    selected[`PCR${index}`] = normalizePcrValue(
-      observed[`PCR${index}`],
-      `attested PCR${index}`
-    );
+    try {
+      selected[`PCR${index}`] = normalizePcrValue(
+        observed[`PCR${index}`],
+        `attested PCR${index}`
+      );
+    } catch (cause) {
+      throw policyError('ATTESTED_PCR_INVALID', cause.message);
+    }
   }
   return selected;
 }
@@ -99,7 +106,10 @@ export async function enforceTofuPcrPolicy(policy, observed, context, storage) {
   if (record?.status === 'existing' && exactPcrsMatch(record.pcrs, selected)) {
     return 'tofu-matched';
   }
-  throw new Error('attested PCRs did not match the enrolled TOFU record');
+  throw policyError(
+    'PCR_TRUST_MISMATCH',
+    'attested PCRs did not match the enrolled TOFU record'
+  );
 }
 
 export function createBrowserPcrPolicyStorage(databaseFactory = globalThis.indexedDB) {
@@ -290,6 +300,15 @@ async function writeValue(openDatabase, key, value) {
 
 function storageError(cause) {
   const error = new Error('PCR policy storage failed');
+  error.code = 'PCR_TRUST_STORAGE';
+  error.stage = 'pcr-trust';
   error.cause = cause;
+  return error;
+}
+
+function policyError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  error.stage = 'pcr-policy';
   return error;
 }

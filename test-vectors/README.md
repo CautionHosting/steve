@@ -9,6 +9,8 @@
 - `e2p-v2-xwing.json` covers the same protocol surface for `XWING-DRAFT10`,
   using the first draft-10 KAT's decapsulation seed, encapsulation seed, public
   key, ciphertext, and shared secret.
+- `pcr-policy-v1.json` covers PCR hex normalization, complete-profile matching,
+  additional PCR selection, and exact TOFU-record comparison.
 
 Rust and browser tests consume these shared files directly and fail on drift.
 The published `x-wing` 0.1.0 package metadata still says draft-06; the KAT test

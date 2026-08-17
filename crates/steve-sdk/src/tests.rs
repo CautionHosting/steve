@@ -1552,6 +1552,36 @@ struct XWingKat {
     ct: String,
 }
 
+#[derive(Deserialize)]
+struct PcrPolicyVectors {
+    version: u8,
+    observed: HashMap<String, String>,
+    pinned: Vec<PinnedPolicyVector>,
+    tofu: TofuPolicyVectors,
+}
+
+#[derive(Deserialize)]
+struct PinnedPolicyVector {
+    name: String,
+    profiles: Vec<HashMap<String, String>>,
+    accepted: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TofuPolicyVectors {
+    additional_pcr_indices: Vec<u8>,
+    selected: HashMap<String, String>,
+    records: Vec<TofuRecordVector>,
+}
+
+#[derive(Deserialize)]
+struct TofuRecordVector {
+    name: String,
+    pcrs: HashMap<String, String>,
+    matches: bool,
+}
+
 struct KatRng {
     bytes: Vec<u8>,
     offset: usize,
@@ -1592,6 +1622,50 @@ impl TryRng for KatRng {
 impl TryCryptoRng for KatRng {}
 
 #[test]
+fn shared_pcr_policy_vectors_match_native_semantics() {
+    let vectors: PcrPolicyVectors = serde_json::from_slice(include_bytes!(
+        "../../../test-vectors/pcr-policy-v1.json"
+    ))
+    .unwrap();
+    assert_eq!(vectors.version, 1);
+    let observed = vector_pcrs(vectors.observed);
+
+    for vector in vectors.pinned {
+        let profiles = vector
+            .profiles
+            .into_iter()
+            .map(vector_pcrs)
+            .collect::<Vec<_>>();
+        for profile in &profiles {
+            validate_expected_pcrs(profile).unwrap();
+        }
+        assert_eq!(
+            profiles
+                .iter()
+                .any(|profile| pcr_profile_matches(profile, &observed)),
+            vector.accepted,
+            "{}",
+            vector.name
+        );
+    }
+
+    let indices = BTreeSet::from([0, 1, 2])
+        .into_iter()
+        .chain(vectors.tofu.additional_pcr_indices)
+        .collect::<BTreeSet<_>>();
+    let selected = extract_attested_pcrs(&observed, indices).unwrap();
+    assert_eq!(selected, vector_pcrs(vectors.tofu.selected));
+    for record in vectors.tofu.records {
+        assert_eq!(
+            vector_pcrs(record.pcrs) == selected,
+            record.matches,
+            "{}",
+            record.name
+        );
+    }
+}
+
+#[test]
 fn rustcrypto_matches_all_draft10_kats_and_snapshot_digest() {
     let snapshot = include_bytes!("../../../test-vectors/xwing-draft10.json");
     assert_eq!(
@@ -1623,6 +1697,16 @@ fn rustcrypto_matches_all_draft10_kats_and_snapshot_digest() {
             hex_bytes(&vector.ss)
         );
     }
+}
+
+fn vector_pcrs(values: HashMap<String, String>) -> NitroPcrs {
+    values
+        .into_iter()
+        .map(|(name, value)| {
+            let index = name.strip_prefix("PCR").unwrap().parse::<u8>().unwrap();
+            (index, hex_bytes(&value))
+        })
+        .collect()
 }
 
 fn hex_bytes(value: &str) -> Vec<u8> {

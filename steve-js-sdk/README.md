@@ -14,7 +14,14 @@ JavaScript service worker for client side facilitation of steve.
 ```javascript
 import { registerEnclaveServiceWorker } from '/register.js'
 
-const client = await registerEnclaveServiceWorker()
+const client = await registerEnclaveServiceWorker({
+  config: {
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: pcr0Hex, PCR1: pcr1Hex, PCR2: pcr2Hex }]
+    }
+  }
+})
 await client.initialize() // Optional eager establishment
 ```
 
@@ -25,13 +32,21 @@ explicitly; it never falls back to X25519:
 
 ```javascript
 const client = await registerEnclaveServiceWorker({
-  config: { expectedKeyExchange: 'XWING-DRAFT10' }
+  config: {
+    expectedKeyExchange: 'XWING-DRAFT10',
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: pcr0Hex, PCR1: pcr1Hex, PCR2: pcr2Hex }]
+    }
+  }
 })
 ```
 
 The configured suite is exact and client-pinned; the session response and
 attestation binding must both match it. The worker does not negotiate a suite
-or make a metadata preflight request.
+or make a metadata preflight request. Omitting `pcrPolicy` retains compatibility
+mode: PCRs are reported as `not-checked` and do not authenticate the expected
+deployment.
 
 ## Browser support
 
@@ -118,11 +133,17 @@ TOFU records PCR0/1/2 and optional additional indices:
 const tofu = { mode: 'tofu', additionalPcrIndices: [3, 8] }
 ```
 
-The worker enrolls exactly the sorted selected set after attestation, session
-binding, and key confirmation succeed. Later sessions must match the complete
-stored record. The record is namespaced by worker scope, enclave origin, and
-suite, but not by selected indices; changing the selected set therefore
-conflicts until the application explicitly migrates browser storage.
+Additional indices must be integers from 0 through 255. PCR0/1/2 and duplicate
+indices are harmless and canonicalize to the sorted union with mandatory
+PCR0/1/2. The worker enrolls exactly that selected set after attestation,
+session binding, and key confirmation succeed. Later sessions must match the
+complete stored record. The record is namespaced by worker scope, enclave
+origin, and suite, but not by selected indices; changing the selected set
+therefore conflicts until the application explicitly migrates browser storage.
+The SDK exposes no TOFU-record migration API: `replacePcrPolicy()`, clearing the
+configured policy, and `reset()` do not modify an enrolled record. Re-enrollment
+therefore requires an explicit origin-controlled storage migration or clearing
+all site data for the origin.
 
 Configuration calls are partial updates. Omitting `pcrPolicy` retains a stored
 policy; only `pcrPolicy: null` clears it. Clearing policy or calling `reset()`
@@ -134,10 +155,56 @@ session and rotation rechecks policy before the new session is published.
 
 Pinned profiles authenticate a deployment only if the expected PCR values
 arrive through an independently authenticated channel. Automatic browser TOFU
-provides continuity, not first-use identity. Clearing or evicting same-origin
-browser storage reopens enrollment. An attacker able to replace the
-same-origin page, worker, or configuration remains outside this feature's
-trust guarantee.
+provides continuity, not first-use identity. Losing the TOFU record or clearing
+all same-origin site data reopens enrollment. Losing only the persisted policy
+configuration fails closed while its policy-required marker remains. An
+attacker able to replace the same-origin page, worker, or configuration remains
+outside this feature's trust guarantee.
+
+## Client API
+
+Use `client.send()` when a call must enter the worker's protected E2P path
+without relying on fetch interception:
+
+```javascript
+const { response, sessionId } = await client.send('/api/secret', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ operation: 'read' })
+})
+```
+
+The path must be origin-relative: it begins with one `/` and contains no origin,
+authority, or fragment. The only request options are `method`, `headers`, and
+`body`; the call supplies no implicit browser credentials or cookies. STEVE does
+not follow an upstream redirect and returns its `3xx` response. A redirect of
+the outer protocol request fails, and the SDK never retries. The result contains
+a normal `Response` and the base64url ID of the session that protected the
+request. This API guarantees routing through the active worker, subject to the
+same same-origin bootstrap trust boundary described above.
+
+`initialize()`, `rotateSession()`, and `reset()` return the resulting status.
+`rotateKey()` remains an alias for compatibility. `getStatus()` reads status
+without changing session state.
+
+Policy changes remain authoritative in the worker:
+
+```javascript
+const current = await client.getPcrPolicy()
+const { policy, status } = await client.replacePcrPolicy(nextPolicy)
+```
+
+`replacePcrPolicy()` validates and persists a pinned or TOFU policy, or `null`
+to clear it, then resets the active session before returning. It does not
+attest against the new policy; the next `initialize()` or protected request does
+that. It also does not replace or delete an existing TOFU record.
+
+Client methods reject with `SteveError`, which has machine-readable `code` and
+`stage` fields, a diagnostic `message`, and `httpStatus` for an outer protocol
+HTTP rejection. Code may branch on documented `code` values but must retain a
+default path for unknown future codes; it must not parse `message`. Intercepted
+`fetch()` calls retain their HTTP error response behavior; use `client.send()`
+when structured failures are required.
 
 `enclaveOrigin` is the absolute HTTP(S) origin where STEVE is exposed. It
 defaults to the service worker's origin. For a cross-origin deployment, allow

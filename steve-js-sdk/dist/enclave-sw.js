@@ -1424,17 +1424,24 @@ function verifyPinnedPcrPolicy(policy, observed) {
   if (policy.profiles.some((profile) => profileMatches(profile, observed))) {
     return "pinned";
   }
-  throw new Error("attested PCRs did not match one complete pinned profile");
+  throw policyError(
+    "PCR_POLICY_MISMATCH",
+    "attested PCRs did not match one complete pinned profile"
+  );
 }
 function selectTofuPcrs(policy, observed) {
   if (policy?.mode !== "tofu") throw new Error("TOFU PCR policy required");
   requireRecord(observed, "attested PCRs");
   const selected = {};
   for (const index of [0, 1, 2, ...policy.additionalPcrIndices]) {
-    selected[`PCR${index}`] = normalizePcrValue(
-      observed[`PCR${index}`],
-      `attested PCR${index}`
-    );
+    try {
+      selected[`PCR${index}`] = normalizePcrValue(
+        observed[`PCR${index}`],
+        `attested PCR${index}`
+      );
+    } catch (cause) {
+      throw policyError("ATTESTED_PCR_INVALID", cause.message);
+    }
   }
   return selected;
 }
@@ -1463,7 +1470,10 @@ async function enforceTofuPcrPolicy(policy, observed, context, storage) {
   if (record?.status === "existing" && exactPcrsMatch(record.pcrs, selected)) {
     return "tofu-matched";
   }
-  throw new Error("attested PCRs did not match the enrolled TOFU record");
+  throw policyError(
+    "PCR_TRUST_MISMATCH",
+    "attested PCRs did not match the enrolled TOFU record"
+  );
 }
 function createBrowserPcrPolicyStorage(databaseFactory = globalThis.indexedDB) {
   const openDatabase = () => openPcrDatabase(databaseFactory);
@@ -1640,7 +1650,15 @@ async function writeValue(openDatabase, key, value) {
 }
 function storageError(cause) {
   const error = new Error("PCR policy storage failed");
+  error.code = "PCR_TRUST_STORAGE";
+  error.stage = "pcr-trust";
   error.cause = cause;
+  return error;
+}
+function policyError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  error.stage = "pcr-policy";
   return error;
 }
 
@@ -1707,26 +1725,106 @@ async function handleMessage(event) {
         break;
       case "initialize":
         await ensureSession("explicit-initialize");
-        port?.postMessage({ type: "initialized", success: true });
+        port?.postMessage({ type: "initialized", success: true, status: statusMessage() });
         break;
+      case "rotate-session":
       case "rotate-key":
         await rotateSession();
-        port?.postMessage({ type: "key-rotated", success: true });
+        port?.postMessage({ type: "session-rotated", success: true, status: statusMessage() });
         break;
       case "reset":
         resetState();
-        port?.postMessage({ type: "reset", success: true });
+        port?.postMessage({ type: "reset", success: true, status: statusMessage() });
         break;
       case "configure": {
         await configureAndPersist(event.data.config || {});
-        port?.postMessage({ type: "configured", success: true, config });
+        port?.postMessage({
+          type: "configured",
+          success: true,
+          config,
+          status: statusMessage()
+        });
+        break;
+      }
+      case "protected-send": {
+        const result = await protectedSend(event.data.request);
+        port?.postMessage({ type: "protected-response", success: true, ...result });
+        break;
+      }
+      case "get-pcr-policy":
+        requireConfiguration();
+        port?.postMessage({
+          type: "pcr-policy",
+          success: true,
+          policy: clonePcrPolicy()
+        });
+        break;
+      case "replace-pcr-policy": {
+        await configureAndPersist({ pcrPolicy: event.data.policy });
+        port?.postMessage({
+          type: "pcr-policy-replaced",
+          success: true,
+          policy: clonePcrPolicy(),
+          status: statusMessage()
+        });
         break;
       }
       default:
         throw new Error("unknown service-worker command");
     }
   } catch (error) {
-    port?.postMessage({ type, success: false, error: publicError(error) });
+    port?.postMessage({
+      type,
+      success: false,
+      error: errorDetails(error, commandStage(type))
+    });
+  }
+}
+async function protectedSend(input) {
+  requireConfiguration();
+  const requestConfig = config;
+  const requestGeneration = configGeneration;
+  const request = deserializeProtectedRequest(input, requestConfig);
+  const result = await handleProtectedRequest(
+    request,
+    requestConfig,
+    requestGeneration,
+    true
+  );
+  return {
+    status: result.response.status,
+    headers: [...result.response.headers.entries()],
+    body: new Uint8Array(await result.response.arrayBuffer()),
+    sessionId: result.sessionId
+  };
+}
+function deserializeProtectedRequest(input, activeConfig) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw sdkError("INVALID_REQUEST", "request", "protected request must be an object");
+  }
+  const path = input.path;
+  if (typeof path !== "string" || !path.startsWith("/") || path.startsWith("//")) {
+    throw sdkError("INVALID_REQUEST", "request", "protected request path must be relative");
+  }
+  const url = new URL(path, `${activeConfig.enclaveOrigin}/`);
+  if (url.origin !== activeConfig.enclaveOrigin || url.hash) {
+    throw sdkError("INVALID_REQUEST", "request", "protected request path must be relative");
+  }
+  if (!Array.isArray(input.headers) || input.headers.some((header) => !Array.isArray(header) || header.length !== 2 || typeof header[0] !== "string" || typeof header[1] !== "string")) {
+    throw sdkError("INVALID_REQUEST", "request", "protected request headers are invalid");
+  }
+  const method = typeof input.method === "string" ? input.method.toUpperCase() : "GET";
+  const body = input.body instanceof Uint8Array ? input.body : input.body instanceof ArrayBuffer ? new Uint8Array(input.body) : null;
+  try {
+    return new Request(url, {
+      method,
+      headers: input.headers,
+      body: body?.length ? body : void 0,
+      credentials: "omit",
+      redirect: "error"
+    });
+  } catch (cause) {
+    throw sdkError("INVALID_REQUEST", "request", "protected request is invalid", cause);
   }
 }
 async function routeRequest(request) {
@@ -1743,7 +1841,7 @@ async function routeRequest(request) {
   if (!shouldProtectRequest(request, requestConfig)) return fetch(request);
   return handleProtectedRequest(request, requestConfig, requestGeneration);
 }
-async function handleProtectedRequest(request, requestConfig = config, requestGeneration = configGeneration) {
+async function handleProtectedRequest(request, requestConfig = config, requestGeneration = configGeneration, returnDetails = false) {
   let session;
   let sequence;
   try {
@@ -1788,7 +1886,7 @@ async function handleProtectedRequest(request, requestConfig = config, requestGe
           session.enclaveOrigin
         );
         if (!response.ok) {
-          throw new ProtocolHttpError(response.status, "v2 request");
+          throw new ProtocolHttpError(response.status, "request", "v2 request");
         }
         const responseBytes = await readBoundedResponse(
           response,
@@ -1817,7 +1915,8 @@ async function handleProtectedRequest(request, requestConfig = config, requestGe
           responseEnvelope: responseBytes
         };
       },
-      "v2 request timed out"
+      "v2 request timed out",
+      "request"
     );
     session.sequences.accept(sequence, protectedResponse.sequenceValue);
     if (requestConfig.emitEncryptedPayloads) {
@@ -1826,7 +1925,10 @@ async function handleProtectedRequest(request, requestConfig = config, requestGe
         encryptedPayloadTrace(session, sequence, protectedResponse.responseEnvelope)
       );
     }
-    return protectedResponse.response;
+    return returnDetails ? {
+      response: protectedResponse.response,
+      sessionId: encodeDiagnosticBytes(session.id)
+    } : protectedResponse.response;
   } catch (error) {
     if (session && sequence !== void 0 && isRequestLocalFailure(error)) {
       session.sequences.retire(sequence);
@@ -1838,10 +1940,10 @@ async function handleProtectedRequest(request, requestConfig = config, requestGe
     }
     const requestUrl = new URL(request.url);
     notifyClients("error", {
-      message: publicError(error),
-      url: requestUrl.origin + requestUrl.pathname,
-      stage: session ? "request" : "initialization"
+      ...errorDetails(error, session ? "request" : "initialization"),
+      url: requestUrl.origin + requestUrl.pathname
     });
+    if (returnDetails) throw error;
     return new Response(JSON.stringify({ error: "secure channel failed" }), {
       status: error instanceof ProtocolTimeoutError ? 504 : 502,
       headers: { "Content-Type": "application/json", "Cache-Control": "no-store" }
@@ -1928,7 +2030,8 @@ async function establishSession(_trigger, targetState) {
     SESSION_ESTABLISH_TIMEOUT_MS,
     null,
     (signal) => establishSessionWithinDeadline(signal, targetState),
-    "session establishment timed out"
+    "session establishment timed out",
+    "initialization"
   );
 }
 async function establishSessionWithinDeadline(signal, targetState) {
@@ -1957,7 +2060,9 @@ async function establishSessionWithinDeadline(signal, targetState) {
       signal,
       sessionConfig.enclaveOrigin
     );
-    if (!response.ok) throw new ProtocolHttpError(response.status, "session creation");
+    if (!response.ok) {
+      throw new ProtocolHttpError(response.status, "initialization", "session creation");
+    }
     const sessionResponse = decodeSessionResponse(
       await readBoundedResponse(response, MAX_SESSION_RESPONSE_BYTES),
       keyExchange
@@ -1979,18 +2084,29 @@ async function establishSessionWithinDeadline(signal, targetState) {
     const material = await deriveMaterial(sharedSecret, transcriptHash);
     throwIfAborted(signal);
     updateStage(targetState, "verifying-attestation");
-    const attestation = await verifyAttestation(
-      sessionResponse.attestation_document,
-      { nonce: clientNonce }
-    );
-    throwIfAborted(signal);
-    validateAttestationResult(
-      attestation,
-      keyExchange,
-      sessionResponse.session_id,
-      transcriptHash,
-      material.binder
-    );
+    let attestation;
+    try {
+      attestation = await verifyAttestation(
+        sessionResponse.attestation_document,
+        { nonce: clientNonce }
+      );
+      throwIfAborted(signal);
+      validateAttestationResult(
+        attestation,
+        keyExchange,
+        sessionResponse.session_id,
+        transcriptHash,
+        material.binder
+      );
+    } catch (cause) {
+      if (cause?.code === "ABORTED") throw cause;
+      throw sdkError(
+        "ATTESTATION_INVALID",
+        "attestation",
+        publicError(cause),
+        cause
+      );
+    }
     const pinnedTrust = sessionConfig.pcrPolicy?.mode === "pinned" ? verifyPinnedPcrPolicy(sessionConfig.pcrPolicy, attestation.pcrs) : null;
     updateStage(targetState, "confirming-session");
     const confirmationCiphertext = await seal(
@@ -2009,14 +2125,22 @@ async function establishSessionWithinDeadline(signal, targetState) {
       sessionConfig.enclaveOrigin
     );
     if (!confirmationResponse.ok) {
-      throw new ProtocolHttpError(confirmationResponse.status, "session confirmation");
+      throw new ProtocolHttpError(
+        confirmationResponse.status,
+        "confirmation",
+        "session confirmation"
+      );
     }
     const confirmationEnvelope = decodeEnvelope(
       await readBoundedResponse(confirmationResponse, MAX_CONFIRMATION_RESPONSE_BYTES)
     );
     throwIfAborted(signal);
     if (confirmationEnvelope.sequenceValue !== 0n || !equalBytes(confirmationEnvelope.session_id, sessionResponse.session_id)) {
-      throw new Error("unexpected confirmation response");
+      throw sdkError(
+        "CONFIRMATION_INVALID",
+        "confirmation",
+        "unexpected confirmation response"
+      );
     }
     const confirmedHash = await open(
       material,
@@ -2027,7 +2151,13 @@ async function establishSessionWithinDeadline(signal, targetState) {
       confirmationEnvelope.ciphertext
     );
     throwIfAborted(signal);
-    if (!equalBytes(confirmedHash, transcriptHash)) throw new Error("session confirmation mismatch");
+    if (!equalBytes(confirmedHash, transcriptHash)) {
+      throw sdkError(
+        "CONFIRMATION_INVALID",
+        "confirmation",
+        "session confirmation mismatch"
+      );
+    }
     const pcrTrust = await finalizePcrTrust(
       sessionConfig,
       sessionGeneration,
@@ -2090,7 +2220,11 @@ async function finalizePcrTrust(sessionConfig, sessionGeneration, targetState, o
     return status;
   });
 }
+function clonePcrPolicy() {
+  return config.pcrPolicy === null ? null : JSON.parse(JSON.stringify(config.pcrPolicy));
+}
 async function protocolFetch(path, body, signal, enclaveOrigin = config.enclaveOrigin) {
+  const stage = path === REQUEST_ENDPOINT ? "request" : path === CONFIRM_ENDPOINT ? "confirmation" : "initialization";
   try {
     return await fetch(resolveProtocolUrl(path, enclaveOrigin), {
       method: "POST",
@@ -2101,13 +2235,17 @@ async function protocolFetch(path, body, signal, enclaveOrigin = config.enclaveO
       signal
     });
   } catch (error) {
-    if (signal?.aborted) throw new ProtocolAbortError();
-    throw new ProtocolTransportError(error);
+    if (signal?.aborted) throw new ProtocolAbortError(void 0, stage);
+    throw new ProtocolTransportError(error, stage);
   }
 }
 function requireConfiguration() {
   if (!configurationReady || configRestoreError) {
-    throw new Error(configRestoreError || "service worker configuration unavailable");
+    throw sdkError(
+      "CONFIGURATION_UNAVAILABLE",
+      "configuration",
+      configRestoreError || "service worker configuration unavailable"
+    );
   }
 }
 function configurationFailureResponse() {
@@ -2152,38 +2290,47 @@ async function readBoundedResponse(response, limit) {
   return body;
 }
 var ProtocolTimeoutError = class extends Error {
-  constructor(message = "v2 operation timed out") {
+  constructor(message = "v2 operation timed out", stage = "request") {
     super(message);
     this.name = "ProtocolTimeoutError";
+    this.code = "TIMEOUT";
+    this.stage = stage;
   }
 };
 var ProtocolAbortError = class extends Error {
-  constructor(message = "v2 request aborted") {
+  constructor(message = "v2 request aborted", stage = "request") {
     super(message);
     this.name = "ProtocolAbortError";
+    this.code = "ABORTED";
+    this.stage = stage;
   }
 };
 var ProtocolTransportError = class extends Error {
-  constructor(cause) {
+  constructor(cause, stage = "transport") {
     super("v2 transport failed");
     this.name = "ProtocolTransportError";
+    this.code = "TRANSPORT";
+    this.stage = stage;
     this.cause = cause;
   }
 };
 var ProtocolHttpError = class extends Error {
-  constructor(status, stage) {
-    super(`${stage} rejected (${status})`);
+  constructor(status, stage, operation = stage) {
+    super(`${operation} rejected (${status})`);
     this.name = "ProtocolHttpError";
+    this.code = "HTTP_STATUS";
+    this.stage = stage;
     this.status = status;
+    this.httpStatus = status;
   }
 };
-async function withDeadline(timeoutMs, externalSignal, operation, timeoutMessage) {
+async function withDeadline(timeoutMs, externalSignal, operation, timeoutMessage, stage = "request") {
   const controller = new AbortController();
   let timedOut = false;
   let forwardAbort;
   const abortPromise = new Promise((_, reject) => {
     controller.signal.addEventListener("abort", () => {
-      reject(timedOut ? new ProtocolTimeoutError(timeoutMessage) : new ProtocolAbortError());
+      reject(timedOut ? new ProtocolTimeoutError(timeoutMessage, stage) : new ProtocolAbortError(void 0, stage));
     }, { once: true });
   });
   if (externalSignal) {
@@ -2280,7 +2427,14 @@ function configure(update) {
   if ("expectedKeyExchange" in update) {
     requireKeyExchange(update.expectedKeyExchange);
   }
-  const nextPolicy = "pcrPolicy" in update ? normalizePcrPolicy(update.pcrPolicy) : config.pcrPolicy;
+  let nextPolicy = config.pcrPolicy;
+  if ("pcrPolicy" in update) {
+    try {
+      nextPolicy = normalizePcrPolicy(update.pcrPolicy);
+    } catch (cause) {
+      throw sdkError("PCR_POLICY_INVALID", "configuration", publicError(cause), cause);
+    }
+  }
   const next = { ...config, ...update, pcrPolicy: nextPolicy };
   if ("enclaveOrigin" in update) {
     next.enclaveOrigin = normalizeEnclaveOrigin(update.enclaveOrigin);
@@ -2492,6 +2646,42 @@ function resetState(error = null) {
 }
 function publicError(error) {
   return error instanceof Error ? error.message : "secure channel error";
+}
+function sdkError(code, stage, message, cause, httpStatus) {
+  const error = new Error(message);
+  error.code = code;
+  error.stage = stage;
+  if (cause !== void 0) error.cause = cause;
+  if (httpStatus !== void 0) error.httpStatus = httpStatus;
+  return error;
+}
+function errorDetails(error, fallbackStage = "internal") {
+  const stage = typeof error?.stage === "string" ? error.stage : fallbackStage;
+  const details = {
+    code: typeof error?.code === "string" ? error.code : `${stage.replaceAll("-", "_").toUpperCase()}_FAILED`,
+    stage,
+    message: publicError(error)
+  };
+  const httpStatus = error?.httpStatus ?? error?.status;
+  if (Number.isInteger(httpStatus)) details.httpStatus = httpStatus;
+  return details;
+}
+function commandStage(type) {
+  switch (type) {
+    case "configure":
+    case "get-pcr-policy":
+    case "replace-pcr-policy":
+      return "configuration";
+    case "rotate-key":
+    case "rotate-session":
+      return "rotation";
+    case "protected-send":
+      return "request";
+    case "initialize":
+      return "initialization";
+    default:
+      return "service-worker";
+  }
 }
 async function notifyClients(type, data) {
   const allClients = await self.clients.matchAll({ type: "window" });

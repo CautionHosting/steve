@@ -116,7 +116,9 @@ Current limitations:
 - Same-origin page, worker, configuration, and expected-PCR delivery are not
   independently trusted on first load.
 - Browser TOFU provides continuity after first use, not first-use workload
-  identity. Clearing or evicting same-origin browser storage reopens enrollment.
+  identity. Losing the TOFU record or clearing all same-origin site data reopens
+  enrollment; losing only the persisted policy configuration fails closed while
+  its policy-required marker remains.
 - Browser WASM must not be described as inherently constant-time; its supported-browser side-channel posture requires independent review.
 
 ## Usage
@@ -126,7 +128,14 @@ Current limitations:
 ```javascript
 import { registerEnclaveServiceWorker } from 'steve-js-sdk';
 
-const client = await registerEnclaveServiceWorker();
+const client = await registerEnclaveServiceWorker({
+  config: {
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: pcr0Hex, PCR1: pcr1Hex, PCR2: pcr2Hex }]
+    }
+  }
+});
 await client.initialize(); // Optional eager establishment
 
 // Same-origin fetch() calls are now transparently E2E encrypted
@@ -152,6 +161,19 @@ await client.initialize(); // Optional eager establishment
 
 const response = await fetch('https://secure.example/api/secret');
 ```
+
+Omitting `pcrPolicy` retains the compatibility behavior: PCRs are reported as
+`not-checked` and do not authenticate the expected deployment.
+
+For an explicit protected call, `client.send('/api/secret')` routes an
+origin-relative path through E2P without SDK retries and returns both the
+`Response` and protecting session ID. STEVE does not follow upstream redirects;
+the call returns their `3xx` response, while a redirect of the outer protocol
+request fails. Client methods expose structured `SteveError` fields (`code`,
+`stage`, `message`, and optional `httpStatus`). The worker serializes PCR policy
+configuration replacement and resets the session; the next session enforces the
+new policy, and existing TOFU records are not migrated. See
+[the browser SDK API](steve-js-sdk/README.md#client-api).
 
 `expectedKeyExchange` defaults to `X25519`; X-Wing deployments must set
 `XWING-DRAFT10` explicitly. Initialization, CSP, response, or

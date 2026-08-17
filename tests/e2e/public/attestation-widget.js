@@ -550,7 +550,7 @@ async function status() {
 
 async function rotate() {
   const client = await ready;
-  await client.rotateKey();
+  await client.rotateSession();
   return refreshStatus();
 }
 

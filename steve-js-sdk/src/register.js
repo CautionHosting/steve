@@ -1,19 +1,54 @@
 const CONTROLLER_TIMEOUT_MS = 5000;
+const PROTECTED_SEND_TIMEOUT_MS = 5 * 60 * 1000 + 5000;
+
+export class SteveError extends Error {
+  constructor(details = {}) {
+    const normalized = typeof details === 'string'
+      ? { message: details }
+      : details;
+    super(normalized.message || 'STEVE operation failed');
+    this.name = 'SteveError';
+    this.code = normalized.code || 'SERVICE_WORKER_FAILED';
+    this.stage = normalized.stage || 'service-worker';
+    if (Number.isInteger(normalized.httpStatus)) {
+      this.httpStatus = normalized.httpStatus;
+    }
+  }
+}
 
 export async function registerEnclaveServiceWorker(options = {}) {
   if (!('serviceWorker' in navigator)) {
-    throw new Error('Service workers not supported');
+    throw new SteveError({
+      code: 'SERVICE_WORKER_UNAVAILABLE',
+      stage: 'registration',
+      message: 'Service workers not supported'
+    });
   }
 
   const swPath = options.swPath || '/enclave-sw.js';
   const scope = options.scope || '/';
 
-  const registration = await navigator.serviceWorker.register(swPath, {
-    scope,
-    type: 'module'
-  });
+  let registration;
+  try {
+    registration = await navigator.serviceWorker.register(swPath, {
+      scope,
+      type: 'module'
+    });
+  } catch (cause) {
+    throw new SteveError({
+      code: 'SERVICE_WORKER_REGISTRATION',
+      stage: 'registration',
+      message: cause instanceof Error ? cause.message : 'Service worker registration failed'
+    });
+  }
   const worker = registration.installing || registration.waiting || registration.active;
-  if (!worker) throw new Error('Service worker registration has no worker');
+  if (!worker) {
+    throw new SteveError({
+      code: 'SERVICE_WORKER_REGISTRATION',
+      stage: 'registration',
+      message: 'Service worker registration has no worker'
+    });
+  }
   await waitForActivation(worker);
   await waitForController(worker);
 
@@ -36,13 +71,19 @@ function waitForActivation(worker) {
       if (worker.state === 'activated') {
         finish(resolve);
       } else if (worker.state === 'redundant') {
-        finish(() => reject(new Error('Service worker installation failed')));
+        finish(() => reject(new SteveError({
+          code: 'SERVICE_WORKER_INSTALLATION',
+          stage: 'registration',
+          message: 'Service worker installation failed'
+        })));
       }
     };
     timer = setTimeout(
-      () => finish(() => reject(
-        new Error('Service worker activation timed out')
-      )),
+      () => finish(() => reject(new SteveError({
+        code: 'SERVICE_WORKER_ACTIVATION_TIMEOUT',
+        stage: 'registration',
+        message: 'Service worker activation timed out'
+      }))),
       CONTROLLER_TIMEOUT_MS
     );
     worker.addEventListener('statechange', onStateChange);
@@ -63,9 +104,11 @@ function waitForController(worker) {
       if (navigator.serviceWorker.controller === worker) finish(resolve);
     };
     timer = setTimeout(
-      () => finish(() => reject(
-        new Error('Service worker is active but does not control this page')
-      )),
+      () => finish(() => reject(new SteveError({
+        code: 'SERVICE_WORKER_UNAVAILABLE',
+        stage: 'registration',
+        message: 'Service worker is active but does not control this page'
+      }))),
       CONTROLLER_TIMEOUT_MS
     );
     navigator.serviceWorker.addEventListener('controllerchange', onControllerChange);
@@ -106,7 +149,11 @@ export class EnclaveClient {
   async sendMessage(type, data = {}, timeout = 10000) {
     const controller = navigator.serviceWorker.controller;
     if (!controller) {
-      throw new Error('Service worker does not control this page');
+      throw new SteveError({
+        code: 'SERVICE_WORKER_UNAVAILABLE',
+        stage: 'service-worker',
+        message: 'Service worker does not control this page'
+      });
     }
     return new Promise((resolve, reject) => {
       const channel = new MessageChannel();
@@ -122,14 +169,18 @@ export class EnclaveClient {
 
       channel.port1.onmessage = (event) => {
         if (event.data.success === false) {
-          settle(reject, new Error(event.data.error));
+          settle(reject, new SteveError(event.data.error));
         } else {
           settle(resolve, event.data);
         }
       };
 
       const timer = setTimeout(
-        () => settle(reject, new Error('Message timeout')),
+        () => settle(reject, new SteveError({
+          code: 'MESSAGE_TIMEOUT',
+          stage: 'service-worker',
+          message: 'Message timeout'
+        })),
         timeout
       );
 
@@ -145,19 +196,51 @@ export class EnclaveClient {
   }
 
   async initialize() {
-    return this.sendMessage('initialize', {}, 15000);
+    return (await this.sendMessage('initialize', {}, 15000)).status;
+  }
+
+  async rotateSession() {
+    return (await this.sendMessage('rotate-session', {}, 15000)).status;
   }
 
   async rotateKey() {
-    return this.sendMessage('rotate-key', {}, 15000);
+    return this.rotateSession();
   }
 
   async reset() {
-    return this.sendMessage('reset');
+    return (await this.sendMessage('reset')).status;
   }
 
   async configure(config) {
     return this.sendMessage('configure', { config });
+  }
+
+  async send(path, options = {}) {
+    const request = await serializeProtectedRequest(path, options);
+    const result = await this.sendMessage(
+      'protected-send',
+      { request },
+      PROTECTED_SEND_TIMEOUT_MS
+    );
+    const body = result.body instanceof Uint8Array && result.body.length > 0
+      ? result.body
+      : null;
+    return {
+      response: new Response(body, {
+        status: result.status,
+        headers: result.headers
+      }),
+      sessionId: result.sessionId
+    };
+  }
+
+  async getPcrPolicy() {
+    return (await this.sendMessage('get-pcr-policy')).policy;
+  }
+
+  async replacePcrPolicy(policy) {
+    const result = await this.sendMessage('replace-pcr-policy', { policy });
+    return { policy: result.policy, status: result.status };
   }
 
   async waitForInitialization(timeout = 30000) {
@@ -169,7 +252,11 @@ export class EnclaveClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         cleanup();
-        reject(new Error('Initialization timeout'));
+        reject(new SteveError({
+          code: 'INITIALIZATION_TIMEOUT',
+          stage: 'initialization',
+          message: 'Initialization timeout'
+        }));
       }, timeout);
 
       const onInitialized = (data) => {
@@ -180,7 +267,7 @@ export class EnclaveClient {
       const onError = (data) => {
         if (data.stage === 'initialization') {
           cleanup();
-          reject(new Error(data.message));
+          reject(new SteveError(data));
         }
       };
 
@@ -194,4 +281,61 @@ export class EnclaveClient {
       this.on('error', onError);
     });
   }
+}
+
+async function serializeProtectedRequest(path, options) {
+  if (typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//')) {
+    throw new SteveError({
+      code: 'INVALID_REQUEST',
+      stage: 'request',
+      message: 'protected request path must be relative'
+    });
+  }
+  const url = new URL(path, 'https://steve.invalid/');
+  if (url.origin !== 'https://steve.invalid' || url.hash) {
+    throw new SteveError({
+      code: 'INVALID_REQUEST',
+      stage: 'request',
+      message: 'protected request path must be relative'
+    });
+  }
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    throw new SteveError({
+      code: 'INVALID_REQUEST',
+      stage: 'request',
+      message: 'protected request options must be an object'
+    });
+  }
+  const allowed = new Set(['method', 'headers', 'body']);
+  for (const key of Object.keys(options)) {
+    if (!allowed.has(key)) {
+      throw new SteveError({
+        code: 'INVALID_REQUEST',
+        stage: 'request',
+        message: `unsupported protected request option: ${key}`
+      });
+    }
+  }
+  let request;
+  try {
+    request = new Request(url, {
+      method: options.method || 'GET',
+      headers: options.headers,
+      body: options.body,
+      credentials: 'omit',
+      redirect: 'error'
+    });
+  } catch (cause) {
+    throw new SteveError({
+      code: 'INVALID_REQUEST',
+      stage: 'request',
+      message: cause instanceof Error ? cause.message : 'protected request is invalid'
+    });
+  }
+  return {
+    path: url.pathname + url.search,
+    method: request.method,
+    headers: [...request.headers.entries()],
+    body: new Uint8Array(await request.arrayBuffer())
+  };
 }

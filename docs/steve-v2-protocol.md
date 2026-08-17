@@ -451,8 +451,18 @@ protocol.
   WASM before those components enforce the expected deployment policy.
 - A fresh worker allows only fixed bootstrap assets until configuration is
   restored or supplied. Configuration and policy-storage failures block other
-  intercepted traffic locally. Clearing or evicting same-origin browser
-  storage reopens TOFU enrollment.
+  intercepted traffic locally. Losing the TOFU record or clearing all
+  same-origin site data reopens enrollment. Losing only persisted policy
+  configuration fails closed while its policy-required marker remains.
+- The browser API can route an origin-relative request directly through the
+  protected worker path without implicit credentials. It does not follow an
+  upstream redirect and returns its `3xx` response; an outer protocol redirect
+  fails. It performs no automatic retry and returns the protecting session ID.
+  Lifecycle calls return status and failures expose machine-readable code and
+  stage fields, a diagnostic message, and an optional outer HTTP status.
+- Policy replacement is serialized and persisted by the worker, resets the
+  active session, and is enforced on the next session. It does not migrate or
+  delete an enrolled TOFU record.
 - STEVE forwards only the default root-scope page and fixed bootstrap assets
   over safe methods while plaintext application fallback is disabled. Custom
   service-worker scopes require equivalent narrow routing at ingress.

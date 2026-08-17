@@ -71,12 +71,13 @@ globalThis.__STEVE_ENABLE_TEST_HOOKS__ = true;
 await import('../src/enclave-sw.js');
 const { configure, hasValidSession, resetState, ensureSession, getState, getConfig,
   protocolFetch, readBoundedResponse, resolveProtocolUrl, shouldProtectRequest, resetConfig,
-  handleProtectedRequest, withDeadline, ProtocolHttpError, ProtocolTimeoutError,
+  handleProtectedRequest, protectedSend, withDeadline, ProtocolHttpError, ProtocolTimeoutError,
   ProtocolTransportError,
   isRequestLocalFailure,
   configureAndPersist, configCacheKey, getConfigRestoreError, initializeConfig,
   persistConfig, restoreConfig, lifecycleState, statusMessage, rotateSession,
-  finalizePcrTrust, isConfigurationReady, getConfigGeneration,
+  finalizePcrTrust,
+  errorDetails, isConfigurationReady, getConfigGeneration,
   setEstablishSession, resetEstablishSession } = globalThis.self.__ENCLAVE_SW_TEST__;
 
 const ROTATION_INTERVAL_MS = 25 * 60 * 1000;
@@ -594,6 +595,20 @@ test('a configuration update queued before PCR finalization prevents stale enrol
   assert.equal(pcrTrustRecords.size, 0);
 });
 
+test('structured worker errors have stable code, stage, and optional HTTP status', () => {
+  assert.deepEqual(errorDetails(new ProtocolHttpError(429, 'request', 'v2 request')), {
+    code: 'HTTP_STATUS',
+    stage: 'request',
+    message: 'v2 request rejected (429)',
+    httpStatus: 429
+  });
+  assert.deepEqual(errorDetails(new Error('bad rotation'), 'rotation'), {
+    code: 'ROTATION_FAILED',
+    stage: 'rotation',
+    message: 'bad rotation'
+  });
+});
+
 test('hasValidSession: false for null/undefined session', () => {
   assert.equal(hasValidSession(null), false);
   assert.equal(hasValidSession(undefined), false);
@@ -830,6 +845,25 @@ test('protected responses preserve repeated headers', async () => {
   assert.equal(response.headers.get('x-repeat'), 'one, two');
 });
 
+test('protectedSend returns the accepted session ID and rejects non-relative paths', async () => {
+  const session = await installFakeSession();
+  globalThis.fetch = (url, options) => validProtocolResponse(options, session, 201);
+
+  const result = await protectedSend({
+    path: '/items?q=1',
+    method: 'POST',
+    headers: [['content-type', 'text/plain']],
+    body: new TextEncoder().encode('payload')
+  });
+
+  assert.equal(result.status, 201);
+  assert.equal(result.sessionId.length, 22);
+  await assert.rejects(
+    protectedSend({ path: 'https://other.test/items', headers: [], body: new Uint8Array() }),
+    error => error.code === 'INVALID_REQUEST' && error.stage === 'request'
+  );
+});
+
 test('protected responses reject malformed header pairs', async () => {
   const session = await installFakeSession();
   globalThis.fetch = (url, options) => validProtocolResponse(
@@ -887,13 +921,12 @@ test('a transient request failure does not poison a concurrent sibling', async (
     return response;
   };
 
-  const [failed, succeeded] = await Promise.all([
+  const responses = await Promise.all([
     handleProtectedRequest(new Request('https://example.test/first')),
     handleProtectedRequest(new Request('https://example.test/second'))
   ]);
 
-  assert.equal(failed.status, 502);
-  assert.equal(succeeded.status, 200);
+  assert.deepEqual(responses.map(response => response.status).sort(), [200, 502]);
   assert.equal(getState().session, session);
   assert.equal(await session.sequences.allocate(), 3n);
 });
