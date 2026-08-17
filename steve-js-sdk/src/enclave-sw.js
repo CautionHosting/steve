@@ -5,6 +5,13 @@ import {
 import { ATTESTATION_PROFILE, verifyAttestation } from './attestation-verifier.js';
 import { createClientKeyExchange, loadVerifiedXWingModule } from './key-exchange.js';
 import {
+  createBrowserPcrPolicyStorage,
+  enforceTofuPcrPolicy,
+  normalizePcrPolicy,
+  pcrPoliciesEqual,
+  verifyPinnedPcrPolicy
+} from './pcr-policy.js';
+import {
   CONFIRM_ENDPOINT,
   DEFAULT_KEY_EXCHANGE,
   Direction,
@@ -66,12 +73,20 @@ function defaultConfig() {
     excludePrefixes: ['/attestation', '/e2p/'],
     emitEncryptedPayloads: false,
     requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
-    expectedKeyExchange: DEFAULT_KEY_EXCHANGE
+    expectedKeyExchange: DEFAULT_KEY_EXCHANGE,
+    pcrPolicy: null
   };
 }
 
 let config = defaultConfig();
 let configRestoreError = null;
+let configurationReady = false;
+let configurationTail = Promise.resolve();
+let configGeneration = 0;
+let pcrStorage = globalThis.__STEVE_ENABLE_TEST_HOOKS__ === true
+  && self.__STEVE_PCR_STORAGE_TEST__
+  ? self.__STEVE_PCR_STORAGE_TEST__
+  : createBrowserPcrPolicyStorage();
 let configReady = initializeConfig();
 
 let state = freshState();
@@ -119,11 +134,24 @@ async function handleMessage(event) {
 
 async function routeRequest(request) {
   await configReady;
-  if (!shouldProtectRequest(request)) return fetch(request);
-  return handleProtectedRequest(request);
+  await configurationTail;
+  if (!configurationReady || configRestoreError) {
+    if (fixedBootstrapDisposition(request, new URL(request.url)) === true) {
+      return fetch(request);
+    }
+    return configurationFailureResponse();
+  }
+  const requestConfig = config;
+  const requestGeneration = configGeneration;
+  if (!shouldProtectRequest(request, requestConfig)) return fetch(request);
+  return handleProtectedRequest(request, requestConfig, requestGeneration);
 }
 
-async function handleProtectedRequest(request) {
+async function handleProtectedRequest(
+  request,
+  requestConfig = config,
+  requestGeneration = configGeneration
+) {
   let session;
   let sequence;
   try {
@@ -137,9 +165,13 @@ async function handleProtectedRequest(request) {
     });
 
     session = await currentSession();
+    if (requestGeneration !== configGeneration
+        || session.configGeneration !== requestGeneration) {
+      throw new Error('configuration changed before protected request');
+    }
     sequence = await session.sequences.allocate();
     const protectedResponse = await withDeadline(
-      config.requestTimeoutMs,
+      requestConfig.requestTimeoutMs,
       request.signal,
       async signal => {
         throwIfAborted(signal);
@@ -154,14 +186,19 @@ async function handleProtectedRequest(request) {
         throwIfAborted(signal);
         const envelope = encodeEnvelope(session.id, sequence, ciphertext);
 
-        if (config.emitEncryptedPayloads) {
+        if (requestConfig.emitEncryptedPayloads) {
           await notifyClients(
             'encrypted-request',
             encryptedPayloadTrace(session, sequence, envelope)
           );
         }
 
-        const response = await protocolFetch(REQUEST_ENDPOINT, envelope, signal);
+        const response = await protocolFetch(
+          REQUEST_ENDPOINT,
+          envelope,
+          signal,
+          session.enclaveOrigin
+        );
         if (!response.ok) {
           throw new ProtocolHttpError(response.status, 'v2 request');
         }
@@ -203,7 +240,7 @@ async function handleProtectedRequest(request) {
     );
 
     session.sequences.accept(sequence, protectedResponse.sequenceValue);
-    if (config.emitEncryptedPayloads) {
+    if (requestConfig.emitEncryptedPayloads) {
       await notifyClients(
         'encrypted-response',
         encryptedPayloadTrace(session, sequence, protectedResponse.responseEnvelope)
@@ -247,6 +284,7 @@ async function currentSession() {
 let establishSessionFn = establishSession;
 
 async function ensureSession(trigger = 'protected-request') {
+  requireConfiguration();
   if (state.session) return state.session;
   if (!state.sessionPromise) {
     const s = state;
@@ -287,6 +325,7 @@ async function ensureSession(trigger = 'protected-request') {
 }
 
 async function rotateSession() {
+  requireConfiguration();
   if (state.rotationPromise) return state.rotationPromise;
   const s = state;
   s.stage = 'creating-session';
@@ -327,7 +366,9 @@ async function establishSession(_trigger, targetState) {
 }
 
 async function establishSessionWithinDeadline(signal, targetState) {
-  const keyExchange = config.expectedKeyExchange;
+  const sessionConfig = config;
+  const sessionGeneration = configGeneration;
+  const keyExchange = sessionConfig.expectedKeyExchange;
   updateStage(targetState, 'creating-session');
   const clientNonce = crypto.getRandomValues(new Uint8Array(32));
   const clientKeyExchange = await createClientKeyExchange(
@@ -347,7 +388,8 @@ async function establishSessionWithinDeadline(signal, targetState) {
         clientKeyMaterial,
         contextHash
       ),
-      signal
+      signal,
+      sessionConfig.enclaveOrigin
     );
     if (!response.ok) throw new ProtocolHttpError(response.status, 'session creation');
     const sessionResponse = decodeSessionResponse(
@@ -384,6 +426,9 @@ async function establishSessionWithinDeadline(signal, targetState) {
       transcriptHash,
       material.binder
     );
+    const pinnedTrust = sessionConfig.pcrPolicy?.mode === 'pinned'
+      ? verifyPinnedPcrPolicy(sessionConfig.pcrPolicy, attestation.pcrs)
+      : null;
 
     updateStage(targetState, 'confirming-session');
     const confirmationCiphertext = await seal(
@@ -398,7 +443,8 @@ async function establishSessionWithinDeadline(signal, targetState) {
     const confirmationResponse = await protocolFetch(
       CONFIRM_ENDPOINT,
       encodeEnvelope(sessionResponse.session_id, 0n, confirmationCiphertext),
-      signal
+      signal,
+      sessionConfig.enclaveOrigin
     );
     if (!confirmationResponse.ok) {
       throw new ProtocolHttpError(confirmationResponse.status, 'session confirmation');
@@ -422,12 +468,23 @@ async function establishSessionWithinDeadline(signal, targetState) {
     throwIfAborted(signal);
     if (!equalBytes(confirmedHash, transcriptHash)) throw new Error('session confirmation mismatch');
 
+    const pcrTrust = await finalizePcrTrust(
+      sessionConfig,
+      sessionGeneration,
+      targetState,
+      attestation.pcrs,
+      pinnedTrust,
+      signal
+    );
+
     const session = {
       id: sessionResponse.session_id,
       keyExchange,
       material,
       sequences: new SequenceTracker(),
       createdAt: Date.now(),
+      enclaveOrigin: sessionConfig.enclaveOrigin,
+      configGeneration: sessionGeneration,
       transcriptHash,
       confirmation: 'verified',
       attestation: {
@@ -436,13 +493,14 @@ async function establishSessionWithinDeadline(signal, targetState) {
         trustAnchor: ATTESTATION_PROFILE.trustAnchor,
         synthetic: ATTESTATION_PROFILE.synthetic,
         pcrs: attestation.pcrs,
+        pcrTrust,
         moduleId: attestation.moduleId,
         checks: {
           certificateChain: 'verified',
           nonceBinding: 'verified',
           sessionBinding: 'verified',
           keyConfirmation: 'verified',
-          expectedPcrPolicy: 'not-checked'
+          expectedPcrPolicy: pcrTrust === 'not-checked' ? 'not-checked' : 'verified'
         }
       }
     };
@@ -452,9 +510,42 @@ async function establishSessionWithinDeadline(signal, targetState) {
   }
 }
 
-async function protocolFetch(path, body, signal) {
+async function finalizePcrTrust(
+  sessionConfig,
+  sessionGeneration,
+  targetState,
+  observedPcrs,
+  pinnedTrust,
+  signal
+) {
+  return serializeConfiguration(async () => {
+    throwIfAborted(signal);
+    if (config !== sessionConfig
+        || configGeneration !== sessionGeneration
+        || state !== targetState) {
+      throw new Error('configuration changed during session establishment');
+    }
+    if (!sessionConfig.pcrPolicy) return 'not-checked';
+    if (pinnedTrust) return pinnedTrust;
+
+    const status = await enforceTofuPcrPolicy(
+      sessionConfig.pcrPolicy,
+      observedPcrs,
+      {
+        scope: serviceWorkerScope(),
+        enclaveOrigin: sessionConfig.enclaveOrigin,
+        suite: sessionConfig.expectedKeyExchange
+      },
+      pcrStorage
+    );
+    throwIfAborted(signal);
+    return status;
+  });
+}
+
+async function protocolFetch(path, body, signal, enclaveOrigin = config.enclaveOrigin) {
   try {
-    return await fetch(resolveProtocolUrl(path), {
+    return await fetch(resolveProtocolUrl(path, enclaveOrigin), {
       method: 'POST',
       headers: { 'Content-Type': 'application/cbor' },
       body,
@@ -466,6 +557,19 @@ async function protocolFetch(path, body, signal) {
     if (signal?.aborted) throw new ProtocolAbortError();
     throw new ProtocolTransportError(error);
   }
+}
+
+function requireConfiguration() {
+  if (!configurationReady || configRestoreError) {
+    throw new Error(configRestoreError || 'service worker configuration unavailable');
+  }
+}
+
+function configurationFailureResponse() {
+  return new Response(JSON.stringify({ error: 'secure channel unavailable' }), {
+    status: 503,
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
+  });
 }
 
 async function readBoundedResponse(response, limit) {
@@ -589,8 +693,8 @@ function isRequestLocalFailure(error) {
     || (error.status >= 500 && error.status <= 599);
 }
 
-function resolveProtocolUrl(path) {
-  return new URL(path, `${config.enclaveOrigin}/`).href;
+function resolveProtocolUrl(path, enclaveOrigin = config.enclaveOrigin) {
+  return new URL(path, `${enclaveOrigin}/`).href;
 }
 
 function validateApplicationResponse(response) {
@@ -609,13 +713,23 @@ function validateApplicationResponse(response) {
   }
 }
 
-function shouldProtectRequest(request) {
+function shouldProtectRequest(request, activeConfig = config) {
   const url = new URL(request.url);
-  if (url.origin !== config.enclaveOrigin) return false;
-  return !isPassthrough(request, url);
+  if (url.origin !== activeConfig.enclaveOrigin) return false;
+  return !isPassthrough(request, url, activeConfig);
 }
 
-function isPassthrough(request, url) {
+function isPassthrough(request, url, activeConfig = config) {
+  const fixedBootstrap = fixedBootstrapDisposition(request, url);
+  if (fixedBootstrap !== null) return fixedBootstrap;
+  const localOrigin = url.origin === self.location.origin;
+  const configuredPassthrough = activeConfig.passthroughPaths.includes(url.pathname);
+  const localBootstrap = localOrigin && configuredPassthrough;
+  return (localBootstrap && SAFE_BOOTSTRAP_METHODS.has(request.method))
+    || activeConfig.excludePrefixes.some(prefix => url.pathname.startsWith(prefix));
+}
+
+function fixedBootstrapDisposition(request, url) {
   const localOrigin = url.origin === self.location.origin;
   const registrationScope = new URL(self.registration.scope);
   const bootstrapNavigation = localOrigin
@@ -625,19 +739,21 @@ function isPassthrough(request, url) {
     && request.destination === 'document';
   if (bootstrapNavigation) return true;
 
+  const bootstrapNavigationTarget = localOrigin
+    && (url.pathname === '/' || url.pathname === registrationScope.pathname)
+    && request.mode === 'navigate'
+    && request.destination === 'document';
+  if (bootstrapNavigationTarget) return false;
+
   const builtInBootstrap = localOrigin
     && (
       DEFAULT_BOOTSTRAP_PATHS.includes(url.pathname)
       || SCOPED_BOOTSTRAP_PATHS.some(
         path => new URL(path, registrationScope).pathname === url.pathname
       )
-    );
+  );
   if (builtInBootstrap) return SAFE_BOOTSTRAP_METHODS.has(request.method);
-
-  const configuredPassthrough = config.passthroughPaths.includes(url.pathname);
-  const localBootstrap = localOrigin && configuredPassthrough;
-  return (localBootstrap && SAFE_BOOTSTRAP_METHODS.has(request.method))
-    || config.excludePrefixes.some(prefix => url.pathname.startsWith(prefix));
+  return null;
 }
 
 function configure(update) {
@@ -647,7 +763,8 @@ function configure(update) {
     'excludePrefixes',
     'emitEncryptedPayloads',
     'requestTimeoutMs',
-    'expectedKeyExchange'
+    'expectedKeyExchange',
+    'pcrPolicy'
   ];
   for (const key of Object.keys(update)) {
     if (!allowed.includes(key)) throw new Error(`unsupported configuration key: ${key}`);
@@ -658,8 +775,11 @@ function configure(update) {
   if ('expectedKeyExchange' in update) {
     requireKeyExchange(update.expectedKeyExchange);
   }
+  const nextPolicy = 'pcrPolicy' in update
+    ? normalizePcrPolicy(update.pcrPolicy)
+    : config.pcrPolicy;
 
-  const next = { ...config, ...update };
+  const next = { ...config, ...update, pcrPolicy: nextPolicy };
   if ('enclaveOrigin' in update) {
     next.enclaveOrigin = normalizeEnclaveOrigin(update.enclaveOrigin);
   }
@@ -671,11 +791,16 @@ function configure(update) {
   ];
   const enclaveChanged = next.enclaveOrigin !== config.enclaveOrigin;
   const keyExchangeChanged = next.expectedKeyExchange !== config.expectedKeyExchange;
-  if (enclaveChanged || keyExchangeChanged) resetState();
+  const pcrPolicyChanged = !pcrPoliciesEqual(next.pcrPolicy, config.pcrPolicy);
+  if (enclaveChanged || keyExchangeChanged || pcrPolicyChanged) {
+    configGeneration += 1;
+    resetState();
+  }
   config = next;
 }
 
 async function initializeConfig() {
+  configurationReady = false;
   try {
     await restoreConfig();
     configRestoreError = null;
@@ -685,15 +810,51 @@ async function initializeConfig() {
 }
 
 async function configureAndPersist(update) {
+  return serializeConfiguration(() => configureAndPersistNow(update));
+}
+
+async function configureAndPersistNow(update) {
   const previous = config;
-  configure(update);
+  let policyRequired;
   try {
-    await persistConfig();
-    configRestoreError = null;
+    policyRequired = await pcrStorage.isPolicyRequired(serviceWorkerScope());
   } catch (error) {
-    config = previous;
+    blockConfiguration(previous, error);
     throw error;
   }
+  if (policyRequired && !previous.pcrPolicy && !('pcrPolicy' in update)) {
+    const error = new Error('persisted PCR policy configuration is missing');
+    blockConfiguration(previous, error);
+    throw error;
+  }
+  configure(update);
+  try {
+    if (!policyRequired && config.pcrPolicy) {
+      await pcrStorage.setPolicyRequired(serviceWorkerScope(), true);
+    }
+    await persistConfig();
+    if (policyRequired && !config.pcrPolicy) {
+      await pcrStorage.setPolicyRequired(serviceWorkerScope(), false);
+    }
+    configurationReady = true;
+    configRestoreError = null;
+  } catch (error) {
+    blockConfiguration(previous, error);
+    throw error;
+  }
+}
+
+function blockConfiguration(previous, error) {
+  config = previous;
+  configurationReady = false;
+  configRestoreError = publicError(error);
+  resetState(configRestoreError);
+}
+
+function serializeConfiguration(operation) {
+  const result = configurationTail.then(operation);
+  configurationTail = result.catch(() => {});
+  return result;
 }
 
 function configCacheKey() {
@@ -704,14 +865,26 @@ function configCacheKey() {
 }
 
 async function restoreConfig() {
-  if (!self.caches) return;
+  const policyRequired = await pcrStorage.isPolicyRequired(serviceWorkerScope());
+  if (!self.caches) throw new Error('configuration storage unavailable');
   const cache = await self.caches.open(CONFIG_CACHE_NAME);
   const response = await cache.match(configCacheKey());
-  if (response) configure(await response.json());
+  if (!response) {
+    if (policyRequired) throw new Error('persisted PCR policy configuration is missing');
+    return;
+  }
+  configure(await response.json());
+  if (policyRequired && !config.pcrPolicy) {
+    throw new Error('persisted PCR policy configuration is missing');
+  }
+  if (config.pcrPolicy && !policyRequired) {
+    await pcrStorage.setPolicyRequired(serviceWorkerScope(), true);
+  }
+  configurationReady = true;
 }
 
 async function persistConfig() {
-  if (!self.caches) return;
+  if (!self.caches) throw new Error('configuration storage unavailable');
   const cache = await self.caches.open(CONFIG_CACHE_NAME);
   await cache.put(
     configCacheKey(),
@@ -719,6 +892,13 @@ async function persistConfig() {
       headers: { 'Content-Type': 'application/json' }
     })
   );
+}
+
+function serviceWorkerScope() {
+  if (typeof self.registration?.scope !== 'string') {
+    throw new Error('service worker scope unavailable');
+  }
+  return new URL(self.registration.scope).href;
 }
 
 function normalizeEnclaveOrigin(value) {
@@ -766,7 +946,7 @@ function statusMessage() {
     state: lifecycleState(),
     stage: state.stage,
     initialized: Boolean(session),
-    error: state.error,
+    error: state.error || configRestoreError,
     protocol: {
       id: PROTOCOL_ID,
       version: VERSION,
@@ -809,7 +989,7 @@ function lifecycleState() {
   if (state.rotationPromise) return 'rotating';
   if (state.session) return 'ready';
   if (state.sessionPromise) return 'establishing';
-  if (state.error) return 'error';
+  if (state.error || configRestoreError) return 'error';
   return 'idle';
 }
 
@@ -874,12 +1054,20 @@ globalThis.__STEVE_ENABLE_TEST_HOOKS__ === true && (self.__ENCLAVE_SW_TEST__ = {
   initializeConfig,
   persistConfig,
   restoreConfig,
+  finalizePcrTrust,
   resolveProtocolUrl,
   shouldProtectRequest,
   getConfigRestoreError: () => configRestoreError,
+  isConfigurationReady: () => configurationReady,
+  getConfigGeneration: () => configGeneration,
   getState: () => state,
   getConfig: () => config,
-  resetConfig: () => { config = defaultConfig(); },
+  resetConfig: () => {
+    config = defaultConfig();
+    configurationReady = false;
+    configRestoreError = null;
+  },
+  setPcrStorage: storage => { pcrStorage = storage; },
   setEstablishSession: fn => { establishSessionFn = fn; },
   resetEstablishSession: () => { establishSessionFn = establishSession; }
 });

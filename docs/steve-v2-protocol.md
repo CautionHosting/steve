@@ -421,10 +421,26 @@ protocol.
 - `context_hash = SHA-256(UTF8(self.location.origin))`.
 - The browser verifies the Nitro signature chain, nonce, session binding,
   suite, transcript hash, and binder.
-- It currently reports expected-PCR policy as `not-checked` and does not
-  compare PCR0, PCR1, or PCR2 with independently supplied expected values.
-  Therefore it verifies a Nitro-backed session binding but does not establish
-  that the enclave is the expected STEVE deployment.
+- PCR policy is optional for compatibility. When omitted, the browser reports
+  `not-checked` and does not authenticate the expected deployment. A pinned
+  policy requires nonzero PCR0/1/2 and may include additional PCRs in each
+  profile. It accepts one complete profile without combining profiles. TOFU
+  selects exactly PCR0/1/2 plus sorted, deduplicated additional indices.
+- Pinned matching follows signed-evidence and session-binding verification but
+  precedes key confirmation. TOFU load-or-insert follows confirmation. The
+  worker publishes a session only after the selected policy succeeds and
+  reapplies it on every rotation.
+- Browser TOFU uses an atomic, durable IndexedDB load-or-insert. The key is:
+
+  ```text
+  SHA-256("STEVE-E2P-V2-BROWSER-PCR-TOFU\0"
+          || UTF8(scope) || 0x00 || UTF8(enclave_origin)
+          || 0x00 || UTF8(pinned_suite))
+  ```
+
+  Selected indices are not in the key, so changing the set conflicts with the
+  existing exact record. `attestation.pcrTrust` reports `not-checked`,
+  `pinned`, `tofu-enrolled`, or `tofu-matched`.
 - It caps session, confirmation, and application protocol responses at 65,536
   bytes, 4,096 bytes, and 33,619,968 bytes respectively.
 - `XWING-DRAFT10` uses self-hosted RustCrypto WASM whose build digest is checked
@@ -433,6 +449,10 @@ protocol.
   STEVE rejects plaintext application requests by default, but a compromised
   first load or host can still replace the page, worker, configuration, or
   WASM before those components enforce the expected deployment policy.
+- A fresh worker allows only fixed bootstrap assets until configuration is
+  restored or supplied. Configuration and policy-storage failures block other
+  intercepted traffic locally. Clearing or evicting same-origin browser
+  storage reopens TOFU enrollment.
 - STEVE forwards only the default root-scope page and fixed bootstrap assets
   over safe methods while plaintext application fallback is disabled. Custom
   service-worker scopes require equivalent narrow routing at ingress.

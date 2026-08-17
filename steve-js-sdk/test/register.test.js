@@ -44,6 +44,21 @@ test('sendMessage fails immediately when the page is not controlled', async () =
   await assert.rejects(client.getStatus(), /does not control this page/u);
 });
 
+test('getStatus returns a lifecycle error instead of treating it as a command failure', async () => {
+  serviceWorker.controller = {
+    postMessage: (_message, ports) => {
+      ports[0].postMessage({ type: 'status', state: 'error', error: 'policy rejected' });
+    }
+  };
+  const client = new EnclaveClient({});
+
+  assert.deepEqual(await client.getStatus(), {
+    type: 'status',
+    state: 'error',
+    error: 'policy rejected'
+  });
+});
+
 test('registration configures the newly activated controller, not its predecessor', async () => {
   const oldController = {
     messages: [],
@@ -86,6 +101,27 @@ test('registration configures the newly activated controller, not its predecesso
     type: 'configure',
     config: { enclaveOrigin: 'https://enclave.example' }
   }]);
+});
+
+test('registration always completes explicit configuration, including the legacy empty config', async () => {
+  const controller = {
+    state: 'activated',
+    messages: [],
+    postMessage(message, ports) {
+      this.messages.push(message);
+      ports[0].postMessage({ type: message.type, success: true });
+    }
+  };
+  serviceWorker.controller = controller;
+  serviceWorker.register = async () => ({
+    active: controller,
+    installing: null,
+    waiting: null
+  });
+
+  await registerEnclaveServiceWorker();
+
+  assert.deepEqual(controller.messages, [{ type: 'configure', config: {} }]);
 });
 
 test('initialize clears its message timer after the worker replies', async () => {

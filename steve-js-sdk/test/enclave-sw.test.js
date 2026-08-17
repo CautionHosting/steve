@@ -18,7 +18,10 @@ import {
 // at module top-level. Stub the minimal SW globals it needs before import so
 // those calls are no-ops instead of throwing in Node.
 const cachedResponses = new Map();
+const policyMarkers = new Set();
+const pcrTrustRecords = new Map();
 let cacheOpenError = null;
+let pcrStorageError = null;
 let captureClientMessages = false;
 const clientMessages = [];
 globalThis.self = {
@@ -44,6 +47,25 @@ globalThis.self = {
     }
   }
 };
+globalThis.self.__STEVE_PCR_STORAGE_TEST__ = {
+  async isPolicyRequired(scope) {
+    if (pcrStorageError) throw pcrStorageError;
+    return policyMarkers.has(scope);
+  },
+  async setPolicyRequired(scope, required) {
+    if (pcrStorageError) throw pcrStorageError;
+    if (required) policyMarkers.add(scope);
+    else policyMarkers.delete(scope);
+  },
+  async loadOrInsert(key, observed) {
+    if (pcrStorageError) throw pcrStorageError;
+    if (pcrTrustRecords.has(key)) {
+      return { status: 'existing', pcrs: pcrTrustRecords.get(key) };
+    }
+    pcrTrustRecords.set(key, structuredClone(observed));
+    return { status: 'inserted' };
+  }
+};
 globalThis.__STEVE_ENABLE_TEST_HOOKS__ = true;
 
 await import('../src/enclave-sw.js');
@@ -54,10 +76,14 @@ const { configure, hasValidSession, resetState, ensureSession, getState, getConf
   isRequestLocalFailure,
   configureAndPersist, configCacheKey, getConfigRestoreError, initializeConfig,
   persistConfig, restoreConfig, lifecycleState, statusMessage, rotateSession,
+  finalizePcrTrust, isConfigurationReady, getConfigGeneration,
   setEstablishSession, resetEstablishSession } = globalThis.self.__ENCLAVE_SW_TEST__;
 
 const ROTATION_INTERVAL_MS = 25 * 60 * 1000;
 const originalFetch = globalThis.fetch;
+
+await initializeConfig();
+await configureAndPersist({});
 
 function isProtected(url, init) {
   return shouldProtectRequest(new Request(url, init));
@@ -70,9 +96,13 @@ test.afterEach(async () => {
   resetConfig();
   resetEstablishSession();
   cacheOpenError = null;
+  pcrStorageError = null;
+  policyMarkers.clear();
+  pcrTrustRecords.clear();
   globalThis.self.registration.scope = 'https://example.test/';
   cachedResponses.clear();
   await initializeConfig();
+  await configureAndPersist({});
   globalThis.fetch = originalFetch;
 });
 
@@ -329,6 +359,90 @@ test('expectedKeyExchange defaults to X25519 and only accepts exact suites', () 
   }
 });
 
+test('PCR policy configuration is strict, normalized, retained when omitted, and explicitly clearable', () => {
+  const upper = 'AB'.repeat(48);
+  configure({
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR2: upper, PCR0: upper, PCR1: upper }]
+    }
+  });
+  assert.deepEqual(getConfig().pcrPolicy, {
+    mode: 'pinned',
+    profiles: [{ PCR0: upper.toLowerCase(), PCR1: upper.toLowerCase(), PCR2: upper.toLowerCase() }]
+  });
+
+  configure({ requestTimeoutMs: 1234 });
+  assert.equal(getConfig().pcrPolicy.mode, 'pinned');
+  configure({ pcrPolicy: null });
+  assert.equal(getConfig().pcrPolicy, null);
+  assert.throws(
+    () => configure({ pcrPolicy: { mode: 'pinned', profiles: [] } }),
+    /at least one profile/u
+  );
+});
+
+test('persisted PCR policy cannot silently downgrade when its cached configuration is lost', async () => {
+  const value = '12'.repeat(48);
+  await configureAndPersist({
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: value, PCR1: value, PCR2: value }]
+    }
+  });
+  assert.equal(policyMarkers.has('https://example.test/'), true);
+
+  cachedResponses.clear();
+  resetConfig();
+  await initializeConfig();
+
+  assert.equal(isConfigurationReady(), false);
+  assert.match(getConfigRestoreError(), /persisted PCR policy configuration is missing/u);
+  await assert.rejects(
+    configureAndPersist({}),
+    /persisted PCR policy configuration is missing/u
+  );
+  assert.equal(policyMarkers.has('https://example.test/'), true);
+
+  await configureAndPersist({ pcrPolicy: null });
+  assert.equal(isConfigurationReady(), true);
+  assert.equal(policyMarkers.has('https://example.test/'), false);
+});
+
+test('only explicit pcrPolicy null clears the durable policy marker', async () => {
+  const value = '12'.repeat(48);
+  await configureAndPersist({
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: value, PCR1: value, PCR2: value }]
+    }
+  });
+  await configureAndPersist({ requestTimeoutMs: 1234 });
+  assert.equal(policyMarkers.has('https://example.test/'), true);
+  assert.equal(getConfig().pcrPolicy.mode, 'pinned');
+
+  await configureAndPersist({ pcrPolicy: null });
+  assert.equal(policyMarkers.has('https://example.test/'), false);
+  assert.equal(getConfig().pcrPolicy, null);
+});
+
+test('PCR policy storage failure blocks configuration and secure sessions', async () => {
+  pcrStorageError = new Error('PCR policy storage failed');
+  const value = '12'.repeat(48);
+
+  await assert.rejects(
+    configureAndPersist({
+      pcrPolicy: {
+        mode: 'pinned',
+        profiles: [{ PCR0: value, PCR1: value, PCR2: value }]
+      }
+    }),
+    /PCR policy storage failed/u
+  );
+  assert.equal(isConfigurationReady(), false);
+  await assert.rejects(ensureSession(), /PCR policy storage failed/u);
+});
+
 test('protocol requests use the configured enclave origin without credentials or cache bypass', async () => {
   configure({ enclaveOrigin: 'https://secure.example' });
   let captured;
@@ -404,6 +518,82 @@ test('changing enclaveOrigin discards a session established for the old enclave'
   assert.equal(getState().session, null);
 });
 
+test('changing PCR policy discards a session established under the old policy', async () => {
+  setEstablishSession(async () => ({ id: 'session-a', createdAt: Date.now() }));
+  await ensureSession();
+  const value = '12'.repeat(48);
+
+  configure({
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: value, PCR1: value, PCR2: value }]
+    }
+  });
+
+  assert.equal(getState().session, null);
+});
+
+test('TOFU finalization reports enrollment then match over the exact configured set', async () => {
+  configure({ pcrPolicy: { mode: 'tofu', additionalPcrIndices: [3] } });
+  const snapshot = getConfig();
+  const generation = getConfigGeneration();
+  const targetState = getState();
+  const observedPcrs = {
+    PCR0: '10'.repeat(48),
+    PCR1: '11'.repeat(48),
+    PCR2: '12'.repeat(48),
+    PCR3: '13'.repeat(48)
+  };
+  const signal = new AbortController().signal;
+
+  assert.equal(
+    await finalizePcrTrust(
+      snapshot,
+      generation,
+      targetState,
+      observedPcrs,
+      null,
+      signal
+    ),
+    'tofu-enrolled'
+  );
+  assert.equal(
+    await finalizePcrTrust(
+      snapshot,
+      generation,
+      targetState,
+      observedPcrs,
+      null,
+      signal
+    ),
+    'tofu-matched'
+  );
+});
+
+test('a configuration update queued before PCR finalization prevents stale enrollment', async () => {
+  configure({ pcrPolicy: { mode: 'tofu' } });
+  const snapshot = getConfig();
+  const generation = getConfigGeneration();
+  const targetState = getState();
+  const configuration = configureAndPersist({ requestTimeoutMs: 1234 });
+  const finalization = finalizePcrTrust(
+    snapshot,
+    generation,
+    targetState,
+    {
+      PCR0: '10'.repeat(48),
+      PCR1: '11'.repeat(48),
+      PCR2: '12'.repeat(48)
+    },
+    null,
+    new AbortController().signal
+  );
+
+  await configuration;
+  await assert.rejects(finalization, /configuration changed during session establishment/u);
+  assert.equal(pcrTrustRecords.size, 0);
+});
+
 test('hasValidSession: false for null/undefined session', () => {
   assert.equal(hasValidSession(null), false);
   assert.equal(hasValidSession(undefined), false);
@@ -469,6 +659,7 @@ function diagnosticSession(fill, createdAt = Date.now()) {
       trustAnchor: 'AWS Nitro root CA',
       synthetic: false,
       pcrs: { PCR0: 'reported-pcr' },
+      pcrTrust: 'not-checked',
       moduleId: 'test-module',
       checks: {
         certificateChain: 'verified',
@@ -529,6 +720,7 @@ test('status tracks eager establishment and exposes only safe session diagnostic
   assert.equal(status.session.establishedAt, session.createdAt);
   assert.equal(status.session.rotatesAt, session.createdAt + ROTATION_INTERVAL_MS);
   assert.equal(status.attestation.checks.expectedPcrPolicy, 'not-checked');
+  assert.equal(status.attestation.pcrTrust, 'not-checked');
   assert.equal(status.lastKeyRotation, session.createdAt);
   assert.equal(serialized.includes('derived-key-material-must-not-appear'), false);
   assert.equal(serialized.includes('secretMarker'), false);
@@ -565,6 +757,19 @@ test('status distinguishes lazy establishment and session rotation triggers', as
   assert.equal(statusMessage().session.trigger, 'rotation');
 });
 
+test('failed explicit rotation preserves the previously accepted session', async () => {
+  const original = diagnosticSession(5);
+  setEstablishSession(async () => original);
+  await ensureSession();
+  setEstablishSession(async () => {
+    throw new Error('PCR policy rejected rotation');
+  });
+
+  await assert.rejects(rotateSession(), /PCR policy rejected rotation/u);
+  assert.equal(getState().session, original);
+  assert.equal(statusMessage().state, 'ready');
+});
+
 async function installFakeSession() {
   const session = {
     id: new Uint8Array(16).fill(7),
@@ -574,6 +779,8 @@ async function installFakeSession() {
     ),
     sequences: new SequenceTracker(),
     createdAt: Date.now(),
+    enclaveOrigin: getConfig().enclaveOrigin,
+    configGeneration: getConfigGeneration(),
     attestation: { verified: true, pcrs: {}, moduleId: 'test-module' }
   };
   setEstablishSession(async () => session);

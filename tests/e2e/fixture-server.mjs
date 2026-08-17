@@ -34,7 +34,10 @@ for (const placeholder of [
   '__STEVE_PROFILE__',
   '__STEVE_KEY_EXCHANGE__',
   '__STEVE_DEFAULT_ORIGIN__',
-  '__STEVE_REQUEST_TIMEOUT_MS__'
+  '__STEVE_REQUEST_TIMEOUT_MS__',
+  '__STEVE_EXPECTED_PCR0__',
+  '__STEVE_EXPECTED_PCR1__',
+  '__STEVE_EXPECTED_PCR2__'
 ]) {
   if (!indexTemplate.includes(placeholder)) {
     throw new Error(`STEVE E2E index is missing ${placeholder}`);
@@ -43,11 +46,17 @@ for (const placeholder of [
 
 function renderIndex(profile, requestHostname) {
   const localOrigin = `http://${requestHostname}:49500`;
+  const expectedPcr = index => profile === 'local'
+    ? (0x10 + index).toString(16).padStart(2, '0').repeat(48)
+    : process.env[`STEVE_EXPECTED_PCR${index}`] || '';
   return indexTemplate
     .replaceAll('__STEVE_PROFILE__', profile)
     .replaceAll('__STEVE_KEY_EXCHANGE__', keyExchange)
     .replaceAll('__STEVE_DEFAULT_ORIGIN__', localOrigin)
-    .replaceAll('__STEVE_REQUEST_TIMEOUT_MS__', profile === 'local' ? '1000' : '10000');
+    .replaceAll('__STEVE_REQUEST_TIMEOUT_MS__', profile === 'local' ? '1000' : '10000')
+    .replaceAll('__STEVE_EXPECTED_PCR0__', expectedPcr(0))
+    .replaceAll('__STEVE_EXPECTED_PCR1__', expectedPcr(1))
+    .replaceAll('__STEVE_EXPECTED_PCR2__', expectedPcr(2));
 }
 
 function readBody(request, limit) {

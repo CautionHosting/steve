@@ -15,9 +15,7 @@ async function registerEnclaveServiceWorker(options = {}) {
   await waitForActivation(worker);
   await waitForController(worker);
   const client = new EnclaveClient(registration);
-  if (options.config) {
-    await client.configure(options.config);
-  }
+  await client.configure(options.config || {});
   return client;
 }
 function waitForActivation(worker) {
@@ -110,7 +108,7 @@ var EnclaveClient = class {
         callback(value);
       };
       channel.port1.onmessage = (event) => {
-        if (event.data.error) {
+        if (event.data.success === false) {
           settle(reject, new Error(event.data.error));
         } else {
           settle(resolve, event.data);

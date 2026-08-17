@@ -64,7 +64,11 @@ const expectedPcrs = isNitro
       PCR1: requiredPcr('STEVE_EXPECTED_PCR1'),
       PCR2: requiredPcr('STEVE_EXPECTED_PCR2')
     }
-  : null;
+  : {
+      PCR0: '10'.repeat(48),
+      PCR1: '11'.repeat(48),
+      PCR2: '12'.repeat(48)
+    };
 
 function demoPath(origin = targetOrigin, suite = keyExchange) {
   const params = new URLSearchParams({ origin, suite });
@@ -93,6 +97,14 @@ async function initialize(page) {
 
 async function currentStatus(page) {
   return page.evaluate(() => window.steveDemo.status());
+}
+
+async function upstreamCount(page, method, path) {
+  return page.evaluate(async ({ method, path }) => {
+    const params = new URLSearchParams({ method, path });
+    const response = await fetch(`/__steve_e2e_upstream_count?${params}`);
+    return Number(await response.text());
+  }, { method, path });
 }
 
 function expectAttestationProfile(status) {
@@ -152,8 +164,9 @@ test('establishes an attested session and uses the versioned fixture', async ({ 
     nonceBinding: 'verified',
     sessionBinding: 'verified',
     keyConfirmation: 'verified',
-    expectedPcrPolicy: 'not-checked'
+    expectedPcrPolicy: 'verified'
   });
+  expect(status.attestation.pcrTrust).toBe('pinned');
   expectAttestationProfile(status);
   expect(await page.evaluate(() => window.steveDemo.fixture())).toEqual(fixtureContract);
   expect(await page.evaluate(() => window.steveDemo.echo('browser-to-steve'))).toEqual({
@@ -200,6 +213,40 @@ test('fails closed when the browser and server suites disagree', async ({ page }
 
   expect(error).toMatch(/session creation rejected \(400\)/u);
   await expect(page.locator('#system-status')).toHaveAttribute('data-state', 'error');
+});
+
+test('preserves legacy not-checked behavior only when PCR policy is explicitly omitted', async ({ page }) => {
+  await openDemo(page);
+  await page.evaluate(() => window.steveDemo.configurePcrPolicy(null));
+
+  const status = await page.evaluate(() => window.steveDemo.initialize());
+
+  expect(status.attestation.pcrTrust).toBe('not-checked');
+  expect(status.attestation.checks.expectedPcrPolicy).toBe('not-checked');
+  expect(await page.evaluate(() => window.steveDemo.echo('legacy-no-policy'))).toEqual({
+    status: 200,
+    body: 'legacy-no-policy'
+  });
+});
+
+test('rejects a mutated pinned profile before application traffic', async ({ page }) => {
+  await openDemo(page);
+  const before = await upstreamCount(page, 'POST', '/echo');
+  const rejected = await page.evaluate(async profilePcrs => {
+    const mutated = {
+      ...profilePcrs,
+      PCR2: `${profilePcrs.PCR2.slice(0, -2)}${profilePcrs.PCR2.endsWith('00') ? '01' : '00'}`
+    };
+    await window.steveDemo.configurePcrPolicy({
+      mode: 'pinned',
+      profiles: [mutated]
+    });
+    return window.steveDemo.echo('must-not-reach-upstream');
+  }, expectedPcrs);
+
+  expect(rejected.status).toBe(502);
+  expect(await upstreamCount(page, 'POST', '/echo')).toBe(before);
+  expect((await currentStatus(page)).session).toBeNull();
 });
 
 test('establishes lazily on the first protected request', async ({ page }) => {
@@ -297,6 +344,49 @@ test('restores configuration and re-attests after a service-worker restart', asy
   expect(await page.evaluate(() => window.steveDemo.echo('after-worker-restart'))).toEqual({
     status: 200,
     body: 'after-worker-restart'
+  });
+});
+
+test('TOFU enrolls after confirmation, matches on rotation, and survives worker restart', async ({
+  page,
+  browserName
+}) => {
+  test.skip(browserName !== 'chromium', 'service-worker process control requires Chromium CDP');
+  await openDemo(page);
+  const policy = isNitro
+    ? { mode: 'tofu' }
+    : { mode: 'tofu', additionalPcrIndices: [3, 1, 3] };
+  await page.evaluate(
+    pcrPolicy => window.steveDemo.configurePcrPolicy(pcrPolicy),
+    policy
+  );
+
+  const enrolled = await page.evaluate(() => window.steveDemo.initialize());
+  expect(enrolled.attestation.pcrTrust).toBe('tofu-enrolled');
+  expect(enrolled.attestation.checks.expectedPcrPolicy).toBe('verified');
+  expect(await page.evaluate(() => window.steveDemo.echo('after-tofu-enrollment'))).toEqual({
+    status: 200,
+    body: 'after-tofu-enrollment'
+  });
+
+  const rotated = await page.evaluate(() => window.steveDemo.rotate());
+  expect(rotated.attestation.pcrTrust).toBe('tofu-matched');
+  expect(rotated.session.id).not.toBe(enrolled.session.id);
+  expect(await page.evaluate(() => window.steveDemo.echo('after-tofu-rotation'))).toEqual({
+    status: 200,
+    body: 'after-tofu-rotation'
+  });
+
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('ServiceWorker.enable');
+  await cdp.send('ServiceWorker.stopAllWorkers');
+
+  const restored = await page.evaluate(() => window.steveDemo.initialize());
+  expect(restored.attestation.pcrTrust).toBe('tofu-matched');
+  expect(restored.session.id).not.toBe(rotated.session.id);
+  expect(await page.evaluate(() => window.steveDemo.echo('after-tofu-restart'))).toEqual({
+    status: 200,
+    body: 'after-tofu-restart'
   });
 });
 
@@ -399,6 +489,96 @@ test.describe('local synthetic profile', () => {
       status: 200,
       body: 'after-config-loss'
     });
+  });
+
+  test('TOFU selection changes conflict and dispatch no application traffic', async ({ page }) => {
+    await openDemo(page);
+    await page.evaluate(() => window.steveDemo.configurePcrPolicy({ mode: 'tofu' }));
+    const enrolled = await page.evaluate(() => window.steveDemo.initialize());
+    expect(enrolled.attestation.pcrTrust).toBe('tofu-enrolled');
+    const before = await upstreamCount(page, 'POST', '/echo');
+
+    await page.evaluate(() => window.steveDemo.configurePcrPolicy({
+      mode: 'tofu',
+      additionalPcrIndices: [3]
+    }));
+    const rejected = await page.evaluate(() => window.steveDemo.echo('selection-conflict'));
+
+    expect(rejected.status).toBe(502);
+    expect(await upstreamCount(page, 'POST', '/echo')).toBe(before);
+    expect((await currentStatus(page)).session).toBeNull();
+  });
+
+  test('failed TOFU rotation preserves the prior accepted session', async ({ page }) => {
+    await openDemo(page);
+    await page.evaluate(() => window.steveDemo.configurePcrPolicy({ mode: 'tofu' }));
+    const enrolled = await page.evaluate(() => window.steveDemo.initialize());
+
+    await page.evaluate(async () => {
+      const database = await new Promise((resolve, reject) => {
+        const request = indexedDB.open('steve-sdk-pcr-policy-v1', 1);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      try {
+        await new Promise((resolve, reject) => {
+          const transaction = database.transaction('state', 'readwrite', {
+            durability: 'strict'
+          });
+          const store = transaction.objectStore('state');
+          const keys = store.getAllKeys();
+          keys.onsuccess = () => {
+            const trustKey = keys.result.find(key => String(key).startsWith('trust:'));
+            const record = store.get(trustKey);
+            record.onsuccess = () => {
+              store.put({ ...record.result, PCR0: '99'.repeat(48) }, trustKey);
+            };
+          };
+          transaction.oncomplete = resolve;
+          transaction.onerror = () => reject(transaction.error);
+          transaction.onabort = () => reject(transaction.error);
+        });
+      } finally {
+        database.close();
+      }
+    });
+
+    const error = await page.evaluate(async () => {
+      try {
+        await window.steveDemo.rotate();
+        return null;
+      } catch (failure) {
+        return failure.message;
+      }
+    });
+    expect(error).toMatch(/enrolled TOFU record/u);
+    const after = await currentStatus(page);
+    expect(after.session.id).toBe(enrolled.session.id);
+    expect(await page.evaluate(() => window.steveDemo.echo('after-failed-rotation'))).toEqual({
+      status: 200,
+      body: 'after-failed-rotation'
+    });
+  });
+
+  test('TOFU storage failure dispatches no application traffic', async ({ page }) => {
+    await openDemo(page);
+    await page.evaluate(() => window.steveDemo.configurePcrPolicy({ mode: 'tofu' }));
+    await page.evaluate(async () => {
+      const database = await new Promise((resolve, reject) => {
+        const request = indexedDB.open('steve-sdk-pcr-policy-v1', 2);
+        request.onupgradeneeded = () => request.result.deleteObjectStore('state');
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      database.close();
+    });
+    const before = await upstreamCount(page, 'POST', '/echo');
+
+    const rejected = await page.evaluate(() => window.steveDemo.echo('storage-failure'));
+
+    expect(rejected.status).toBe(502);
+    expect(await upstreamCount(page, 'POST', '/echo')).toBe(before);
+    expect((await currentStatus(page)).session).toBeNull();
   });
 
   test('reopens the exact 64-entry sequence window after timeout', async ({ page }) => {

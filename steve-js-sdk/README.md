@@ -36,7 +36,7 @@ or make a metadata preflight request.
 ## Browser support
 
 The SDK requires module service workers, ES2020, WebCrypto
-(SHA-256, HKDF, and AES-GCM), and WebAssembly. X25519 mode additionally
+(SHA-256, HKDF, and AES-GCM), Cache Storage, IndexedDB, and WebAssembly. X25519 mode additionally
 requires WebCrypto X25519; X-Wing requires a CSP that permits instantiating the
 same-origin WASM asset. Missing capabilities fail closed; there is no classic
 service-worker or cryptographic fallback.
@@ -66,11 +66,12 @@ session state.
 - lifecycle `state` and in-progress handshake `stage`;
 - protocol, key-establishment suite, KDF, and record protection;
 - base64url session ID and transcript hash, establishment trigger, and rotation time;
-- verifier profile/trust anchor and machine-readable attestation and binding checks.
+- verifier profile/trust anchor and machine-readable attestation and binding checks;
+- PCR trust as `not-checked`, `pinned`, `tofu-enrolled`, or `tofu-matched`.
 
-An `expectedPcrPolicy` result of `not-checked` is deliberate: current v2 reports
-PCR evidence but does not compare it with an independently supplied workload
-policy. Diagnostics never include private keys, shared secrets, derived keys,
+`attestation.checks.expectedPcrPolicy` is derived from the same result: it is
+`not-checked` when PCR policy is omitted and `verified` when a configured
+policy succeeds. Diagnostics never include private keys, shared secrets, derived keys,
 binders, nonces, or application plaintext.
 
 ## Configuration
@@ -83,10 +84,60 @@ registerEnclaveServiceWorker({
     excludePrefixes: ['/attestation', '/e2p/'],
     emitEncryptedPayloads: false,
     requestTimeoutMs: 30000,
-    expectedKeyExchange: 'X25519'
+    expectedKeyExchange: 'X25519',
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: pcr0Hex, PCR1: pcr1Hex, PCR2: pcr2Hex }]
+    }
   }
 })
 ```
+
+`pcrPolicy` is optional for backward compatibility. When omitted on a fresh
+worker, PCR evidence is reported but not checked. A pinned policy accepts one
+or more complete profiles:
+
+```javascript
+const pinned = {
+  mode: 'pinned',
+  profiles: [
+    { PCR0: oldPcr0, PCR1: oldPcr1, PCR2: oldPcr2 },
+    { PCR0: newPcr0, PCR1: newPcr1, PCR2: newPcr2, PCR3: newPcr3 }
+  ]
+}
+```
+
+Each profile must contain nonzero 96-hex-character PCR0, PCR1, and PCR2 values
+and may add PCR3 through PCR255. The worker accepts only one whole matching
+profile; it never combines values from different profiles. Unselected
+attested PCRs are ignored.
+
+TOFU records PCR0/1/2 and optional additional indices:
+
+```javascript
+const tofu = { mode: 'tofu', additionalPcrIndices: [3, 8] }
+```
+
+The worker enrolls exactly the sorted selected set after attestation, session
+binding, and key confirmation succeed. Later sessions must match the complete
+stored record. The record is namespaced by worker scope, enclave origin, and
+suite, but not by selected indices; changing the selected set therefore
+conflicts until the application explicitly migrates browser storage.
+
+Configuration calls are partial updates. Omitting `pcrPolicy` retains a stored
+policy; only `pcrPolicy: null` clears it. Clearing policy or calling `reset()`
+does not delete TOFU records. A fresh worker permits only the fixed bootstrap
+assets until configuration is restored or received; configuration or PCR
+storage failure blocks protected traffic locally without a network fallback.
+Target, suite, and policy changes invalidate the active session. Every initial
+session and rotation rechecks policy before the new session is published.
+
+Pinned profiles authenticate a deployment only if the expected PCR values
+arrive through an independently authenticated channel. Automatic browser TOFU
+provides continuity, not first-use identity. Clearing or evicting same-origin
+browser storage reopens enrollment. An attacker able to replace the
+same-origin page, worker, or configuration remains outside this feature's
+trust guarantee.
 
 `enclaveOrigin` is the absolute HTTP(S) origin where STEVE is exposed. It
 defaults to the service worker's origin. For a cross-origin deployment, allow

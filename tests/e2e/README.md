@@ -12,6 +12,10 @@ make test-e2e
 
 `make test-e2e` runs browser/WASM and Rust against signed synthetic STEVE for
 both `X25519` and `XWING-DRAFT10`. Synthetic evidence does not prove Nitro.
+The browser gate covers pinned success and rejection, TOFU enrollment and
+rotation, worker-restart persistence, selected-PCR conflict, storage failure,
+and preservation of the previous accepted session after a failed explicit
+rotation. Rejections do not reach the application endpoint.
 
 Focused runs:
 
@@ -88,11 +92,14 @@ make test-e2e-nitro-browser
 make test-e2e-nitro-rust
 ```
 
-All Nitro targets require exact, nonzero PCRs. Browser tests compare the
-verified reported values; the Rust SDK enforces them during session
-establishment and tests a mutated-PCR rejection. Run the gate once for the
-X-Wing deployment and once for X25519. Normal remote requests have a 10-second
-deadline; only the controlled timeout scenario uses 3 seconds. The gate does
-not retry application requests.
+All Nitro targets require independently obtained, exact, nonzero PCRs. The
+browser and Rust SDKs enforce them during session establishment and test a
+mutated-profile rejection before application traffic. The browser gate also
+enrolls PCR0/1/2 with TOFU after confirmation, matches the record on rotation,
+and matches it again after a service-worker restart. This proves continuity,
+not first-use workload identity. Run the gate once for the X-Wing deployment
+and once for X25519. Normal remote requests have a 10-second deadline; only the
+controlled timeout scenario uses 3 seconds. The gate does not retry application
+requests.
 
 Remote Nitro tests are opt-in release tests, not untrusted pull-request jobs.
