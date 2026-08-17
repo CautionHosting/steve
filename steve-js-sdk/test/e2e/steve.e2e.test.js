@@ -254,31 +254,44 @@ test('preserves legacy not-checked behavior only when PCR policy is explicitly o
 
 test('rejects a mutated pinned profile before application traffic', async ({ page }) => {
   await openDemo(page);
-  const before = await upstreamCount(page, 'POST', '/echo');
-  const rejected = await page.evaluate(async profilePcrs => {
-    const mutated = {
-      ...profilePcrs,
-      PCR2: `${profilePcrs.PCR2.slice(0, -2)}${profilePcrs.PCR2.endsWith('00') ? '01' : '00'}`
-    };
-    await window.steveDemo.configurePcrPolicy({
-      mode: 'pinned',
-      profiles: [mutated]
-    });
-    const client = await window.steveDemo.ready;
-    try {
-      await client.send('/echo', { method: 'POST', body: 'must-not-reach-upstream' });
-      return null;
-    } catch (error) {
-      return { code: error.code, stage: error.stage, message: error.message };
+  const protocolPaths = [];
+  const observeProtocolRequest = request => {
+    const url = new URL(request.url());
+    if (url.origin === targetOrigin && url.pathname.startsWith('/e2p/v2/')) {
+      protocolPaths.push(url.pathname);
     }
-  }, expectedPcrs);
+  };
+  page.context().on('request', observeProtocolRequest);
+  let rejected;
+  try {
+    rejected = await page.evaluate(async profilePcrs => {
+      const mutated = {
+        ...profilePcrs,
+        PCR2: `${profilePcrs.PCR2.slice(0, -2)}${profilePcrs.PCR2.endsWith('00') ? '01' : '00'}`
+      };
+      await window.steveDemo.configurePcrPolicy({
+        mode: 'pinned',
+        profiles: [mutated]
+      });
+      const client = await window.steveDemo.ready;
+      try {
+        await client.send('/echo', { method: 'POST', body: 'must-not-reach-upstream' });
+        return null;
+      } catch (error) {
+        return { code: error.code, stage: error.stage, message: error.message };
+      }
+    }, expectedPcrs);
+  } finally {
+    page.context().off('request', observeProtocolRequest);
+  }
 
   expect(rejected).toEqual({
     code: 'PCR_POLICY_MISMATCH',
     stage: 'pcr-policy',
     message: 'attested PCRs did not match one complete pinned profile'
   });
-  expect(await upstreamCount(page, 'POST', '/echo')).toBe(before);
+  expect(protocolPaths).toContain('/e2p/v2/session');
+  expect(protocolPaths).not.toContain('/e2p/v2/request');
   expect((await currentStatus(page)).session).toBeNull();
 });
 

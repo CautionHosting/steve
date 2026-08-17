@@ -96,7 +96,8 @@ make test-e2e-nitro-rust
 
 All Nitro targets require independently obtained, exact, nonzero PCRs. The
 browser and Rust SDKs enforce them during session establishment and test a
-mutated-profile rejection before application traffic. The browser gate also
+mutated-profile rejection that observes session creation but no application
+request at `/e2p/v2/request`. The browser gate also
 enrolls PCR0/1/2 with TOFU after confirmation, matches the record on rotation,
 and matches it again after a service-worker restart. This proves continuity,
 not first-use workload identity. Run the gate once for the X-Wing deployment

@@ -1758,6 +1758,7 @@ async function handleMessage(event) {
         break;
       }
       case "get-pcr-policy":
+        await configurationTail;
         requireConfiguration();
         port?.postMessage({
           type: "pcr-policy",

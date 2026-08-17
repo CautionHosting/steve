@@ -136,6 +136,7 @@ async function handleMessage(event) {
         break;
       }
       case 'get-pcr-policy':
+        await configurationTail;
         requireConfiguration();
         port?.postMessage({
           type: 'pcr-policy',
@@ -1236,6 +1237,7 @@ function updateStage(targetState, stage) {
 }
 
 globalThis.__STEVE_ENABLE_TEST_HOOKS__ === true && (self.__ENCLAVE_SW_TEST__ = {
+  handleMessage,
   configure,
   hasValidSession,
   lifecycleState,

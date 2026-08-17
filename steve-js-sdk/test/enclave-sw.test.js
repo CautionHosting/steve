@@ -21,6 +21,7 @@ const cachedResponses = new Map();
 const policyMarkers = new Set();
 const pcrTrustRecords = new Map();
 let cacheOpenError = null;
+let cachePutGate = null;
 let pcrStorageError = null;
 let captureClientMessages = false;
 const clientMessages = [];
@@ -41,6 +42,10 @@ globalThis.self = {
           return cachedResponses.get(key)?.clone();
         },
         async put(key, response) {
+          if (cachePutGate) {
+            cachePutGate.enter();
+            await cachePutGate.release;
+          }
           cachedResponses.set(key, response.clone());
         }
       };
@@ -69,7 +74,7 @@ globalThis.self.__STEVE_PCR_STORAGE_TEST__ = {
 globalThis.__STEVE_ENABLE_TEST_HOOKS__ = true;
 
 await import('../src/enclave-sw.js');
-const { configure, hasValidSession, resetState, ensureSession, getState, getConfig,
+const { handleMessage, configure, hasValidSession, resetState, ensureSession, getState, getConfig,
   protocolFetch, readBoundedResponse, resolveProtocolUrl, shouldProtectRequest, resetConfig,
   handleProtectedRequest, protectedSend, withDeadline, ProtocolHttpError, ProtocolTimeoutError,
   ProtocolTransportError,
@@ -97,6 +102,7 @@ test.afterEach(async () => {
   resetConfig();
   resetEstablishSession();
   cacheOpenError = null;
+  cachePutGate = null;
   pcrStorageError = null;
   policyMarkers.clear();
   pcrTrustRecords.clear();
@@ -425,6 +431,46 @@ test('only explicit pcrPolicy null clears the durable policy marker', async () =
   await configureAndPersist({ pcrPolicy: null });
   assert.equal(policyMarkers.has('https://example.test/'), false);
   assert.equal(getConfig().pcrPolicy, null);
+});
+
+test('get-pcr-policy waits for policy replacement persistence', async () => {
+  const original = '12'.repeat(48);
+  const replacement = '13'.repeat(48);
+  await configureAndPersist({
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: original, PCR1: original, PCR2: original }]
+    }
+  });
+
+  let releasePut;
+  let markPutEntered;
+  const putEntered = new Promise(resolve => { markPutEntered = resolve; });
+  cachePutGate = {
+    enter: markPutEntered,
+    release: new Promise(resolve => { releasePut = resolve; })
+  };
+  const replacing = configureAndPersist({
+    pcrPolicy: {
+      mode: 'pinned',
+      profiles: [{ PCR0: replacement, PCR1: replacement, PCR2: replacement }]
+    }
+  });
+  await putEntered;
+
+  let response;
+  const reading = handleMessage({
+    data: { type: 'get-pcr-policy' },
+    ports: [{ postMessage: value => { response = value; } }]
+  });
+  await Promise.resolve();
+  assert.equal(response, undefined);
+
+  releasePut();
+  await replacing;
+  await reading;
+  assert.equal(response.success, true);
+  assert.equal(response.policy.profiles[0].PCR0, replacement);
 });
 
 test('PCR policy storage failure blocks configuration and secure sessions', async () => {
