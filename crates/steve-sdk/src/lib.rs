@@ -1,5 +1,7 @@
 //! Native client for STEVE's attestation-bound E2P v2 transport.
 
+#[cfg(any(test, feature = "eval-attestation"))]
+mod eval_attestation;
 mod protocol;
 
 use std::{
@@ -40,6 +42,9 @@ use x_wing::{Ciphertext, Decapsulate, DecapsulationKey, Kem, KeyExport, XWingKem
 use x25519_dalek::{EphemeralSecret, PublicKey};
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(any(test, feature = "eval-attestation"))]
+use eval_attestation::EvalAttestationVerifier;
+
 pub use bootproof_sdk::format::nitro::NitroPcrs as ExpectedPcrs;
 
 const SESSION_ENDPOINT: &str = "/e2p/v2/session";
@@ -77,14 +82,14 @@ impl PcrTrustKey {
 pub enum PcrTrustRecord {
     /// The supplied PCRs were durably inserted.
     Inserted,
-    /// The key was already present with this value; it was not replaced.
+    /// The key was already present with this value; the client requires an exact match.
     Existing(ExpectedPcrs),
 }
 
 /// Durable storage used by trust-on-first-use PCR policy.
 #[async_trait]
 pub trait PcrTrustStore: Send + Sync {
-    /// Atomically insert `observed` when `key` is absent, or return the existing record.
+    /// Atomically insert the selected `observed` PCRs, or return the complete existing record.
     async fn load_or_insert(
         &self,
         key: PcrTrustKey,
@@ -101,7 +106,10 @@ pub struct PcrPolicy {
 #[derive(Clone)]
 enum PcrPolicyKind {
     Pinned(Vec<ExpectedPcrs>),
-    TrustOnFirstUse(Arc<dyn PcrTrustStore>),
+    TrustOnFirstUse {
+        store: Arc<dyn PcrTrustStore>,
+        pcr_indices: BTreeSet<u8>,
+    },
 }
 
 impl PcrPolicy {
@@ -121,8 +129,21 @@ impl PcrPolicy {
 
     /// Enroll the first verified PCR0/1/2 profile in caller-owned durable storage.
     pub fn trust_on_first_use(store: Arc<dyn PcrTrustStore>) -> Self {
+        Self::trust_on_first_use_with_additional_pcrs(store, [])
+    }
+
+    /// Enroll the first verified PCR0/1/2 profile plus the selected PCRs.
+    ///
+    /// Duplicate indices, including PCR0/1/2, are ignored. Existing records must
+    /// contain exactly the selected indices and values.
+    pub fn trust_on_first_use_with_additional_pcrs(
+        store: Arc<dyn PcrTrustStore>,
+        additional_pcr_indices: impl IntoIterator<Item = u8>,
+    ) -> Self {
+        let mut pcr_indices = BTreeSet::from([0, 1, 2]);
+        pcr_indices.extend(additional_pcr_indices);
         Self {
-            kind: PcrPolicyKind::TrustOnFirstUse(store),
+            kind: PcrPolicyKind::TrustOnFirstUse { store, pcr_indices },
         }
     }
 }
@@ -134,7 +155,10 @@ impl Debug for PcrPolicy {
                 .debug_struct("PcrPolicy::Pinned")
                 .field("profiles", &profiles.len())
                 .finish(),
-            PcrPolicyKind::TrustOnFirstUse(_) => formatter.write_str("PcrPolicy::TrustOnFirstUse"),
+            PcrPolicyKind::TrustOnFirstUse { pcr_indices, .. } => formatter
+                .debug_struct("PcrPolicy::TrustOnFirstUse")
+                .field("pcr_indices", pcr_indices)
+                .finish(),
         }
     }
 }
@@ -144,9 +168,9 @@ impl Debug for PcrPolicy {
 pub enum PcrTrustStatus {
     /// The attested PCRs matched one complete approved profile.
     Pinned,
-    /// This session atomically enrolled its verified PCR0/1/2 values.
+    /// This session atomically enrolled its selected verified PCR values.
     TofuEnrolled,
-    /// This session matched PCR0/1/2 values enrolled previously.
+    /// This session matched the selected PCR values enrolled previously.
     TofuMatched,
 }
 
@@ -543,6 +567,16 @@ impl ClientBuilder {
         self
     }
 
+    /// Trust the repository's signed synthetic attestation fixture.
+    ///
+    /// This is available only with the non-default `eval-attestation` feature and must never be
+    /// used for production verification.
+    #[cfg(feature = "eval-attestation")]
+    pub fn use_synthetic_attestation_for_testing(mut self) -> Self {
+        self.attestation_verifier = Arc::new(EvalAttestationVerifier);
+        self
+    }
+
     pub fn build(self) -> Result<Client> {
         let context_hash = native_context_hash(&self.base_url, self.application_context.as_deref());
         let http = self
@@ -829,7 +863,7 @@ impl Client {
                 .attestation_verifier
                 .verify(document, &candidate_pcrs, now, client_nonce)?;
         let pcrs = extract_pcrs(&payload)?;
-        if extract_required_attested_pcrs(&pcrs)? != candidate_pcrs {
+        if extract_attested_pcrs(&pcrs, [0, 1, 2])? != candidate_pcrs {
             return Err(Error::MalformedAttestation(
                 "verified PCRs differ from the signed COSE payload",
             ));
@@ -863,10 +897,11 @@ impl Client {
         observed: &NitroPcrs,
         key_exchange: KeyExchangeSuite,
     ) -> Result<PcrTrustStatus> {
-        let PcrPolicyKind::TrustOnFirstUse(store) = &self.inner.pcr_policy.kind else {
+        let PcrPolicyKind::TrustOnFirstUse { store, pcr_indices } = &self.inner.pcr_policy.kind
+        else {
             unreachable!("pinned PCR policy was already handled")
         };
-        let observed = extract_required_attested_pcrs(observed)?;
+        let observed = extract_attested_pcrs(observed, pcr_indices.iter().copied())?;
         let record = store
             .load_or_insert(
                 pcr_trust_key(&self.inner.context_hash, key_exchange),
@@ -877,7 +912,7 @@ impl Client {
         match record {
             PcrTrustRecord::Inserted => Ok(PcrTrustStatus::TofuEnrolled),
             PcrTrustRecord::Existing(existing) => {
-                let existing = extract_required_expected_pcrs(&existing)?;
+                validate_expected_pcrs(&existing)?;
                 if existing == observed {
                     Ok(PcrTrustStatus::TofuMatched)
                 } else {
@@ -1037,6 +1072,7 @@ async fn send_application_request(
     sequence: u64,
     plaintext: &[u8],
 ) -> Result<(Response, u64)> {
+    let request_plaintext_bytes = plaintext.len();
     let ciphertext = session.secrets.seal(
         Direction::ClientToServer,
         MessageType::Application,
@@ -1044,21 +1080,25 @@ async fn send_application_request(
         sequence,
         plaintext,
     )?;
+    let request_ciphertext_bytes = ciphertext.len();
     let envelope = encode_cbor(&Envelope {
         version: VERSION,
         session_id: session.id.to_vec(),
         sequence: sequence.to_be_bytes().to_vec(),
         ciphertext,
     })?;
+    let request_envelope_bytes = envelope.len();
     let (status, body) = client
         .send_protocol(REQUEST_ENDPOINT, envelope, MAX_APPLICATION_RESPONSE_BYTES)
         .await?;
+    let response_envelope_bytes = body.len();
     ensure_success("protected request", status, &body)?;
     let envelope: Envelope = decode_cbor(&body)?;
     let (response_session_id, response_sequence) = envelope.validate()?;
     if response_session_id != session.id || response_sequence != sequence {
         return Err(Error::UnexpectedSequence);
     }
+    let response_ciphertext_bytes = envelope.ciphertext.len();
     let plaintext = session.secrets.open(
         Direction::ServerToClient,
         MessageType::Application,
@@ -1066,8 +1106,92 @@ async fn send_application_request(
         sequence,
         &envelope.ciphertext,
     )?;
+    let response_plaintext_bytes = plaintext.len();
     let response: ApplicationResponse = decode_cbor(&plaintext)?;
-    Ok((response.try_into()?, response_sequence))
+    let exchange = ProtectedExchange {
+        session_id: session.id,
+        sequence,
+        key_exchange: client.inner.expected_key_exchange,
+        pcr_trust: session.attestation.pcr_trust,
+        outer_status: status,
+        request_plaintext_bytes,
+        request_ciphertext_bytes,
+        request_envelope_bytes,
+        response_envelope_bytes,
+        response_ciphertext_bytes,
+        response_plaintext_bytes,
+    };
+    Ok((response.into_response(exchange)?, response_sequence))
+}
+
+/// Non-secret metadata for one authenticated STEVE application exchange.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtectedExchange {
+    session_id: [u8; 16],
+    sequence: u64,
+    key_exchange: KeyExchangeSuite,
+    pcr_trust: PcrTrustStatus,
+    outer_status: StatusCode,
+    request_plaintext_bytes: usize,
+    request_ciphertext_bytes: usize,
+    request_envelope_bytes: usize,
+    response_envelope_bytes: usize,
+    response_ciphertext_bytes: usize,
+    response_plaintext_bytes: usize,
+}
+
+impl ProtectedExchange {
+    pub fn protocol(&self) -> &'static str {
+        PROTOCOL_ID
+    }
+
+    pub fn protection(&self) -> &'static str {
+        "AES-256-GCM"
+    }
+
+    pub fn session_id(&self) -> &[u8; 16] {
+        &self.session_id
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn key_exchange(&self) -> KeyExchangeSuite {
+        self.key_exchange
+    }
+
+    pub fn pcr_trust(&self) -> PcrTrustStatus {
+        self.pcr_trust
+    }
+
+    pub fn outer_status(&self) -> StatusCode {
+        self.outer_status
+    }
+
+    pub fn request_plaintext_bytes(&self) -> usize {
+        self.request_plaintext_bytes
+    }
+
+    pub fn request_ciphertext_bytes(&self) -> usize {
+        self.request_ciphertext_bytes
+    }
+
+    pub fn request_envelope_bytes(&self) -> usize {
+        self.request_envelope_bytes
+    }
+
+    pub fn response_envelope_bytes(&self) -> usize {
+        self.response_envelope_bytes
+    }
+
+    pub fn response_ciphertext_bytes(&self) -> usize {
+        self.response_ciphertext_bytes
+    }
+
+    pub fn response_plaintext_bytes(&self) -> usize {
+        self.response_plaintext_bytes
+    }
 }
 
 #[derive(Debug)]
@@ -1075,6 +1199,7 @@ pub struct Response {
     status: StatusCode,
     headers: HeaderMap,
     body: Vec<u8>,
+    exchange: ProtectedExchange,
 }
 
 impl Response {
@@ -1088,6 +1213,10 @@ impl Response {
 
     pub fn bytes(&self) -> &[u8] {
         &self.body
+    }
+
+    pub fn exchange(&self) -> &ProtectedExchange {
+        &self.exchange
     }
 
     pub fn into_bytes(self) -> Vec<u8> {
@@ -1132,20 +1261,18 @@ struct ApplicationResponse {
     error: Option<String>,
 }
 
-impl TryFrom<ApplicationResponse> for Response {
-    type Error = Error;
-
-    fn try_from(response: ApplicationResponse) -> Result<Self> {
-        if !(200..=599).contains(&response.status) {
-            return Err(Error::InvalidResponseStatus(response.status));
+impl ApplicationResponse {
+    fn into_response(self, exchange: ProtectedExchange) -> Result<Response> {
+        if !(200..=599).contains(&self.status) {
+            return Err(Error::InvalidResponseStatus(self.status));
         }
-        let status = StatusCode::from_u16(response.status)
-            .map_err(|_| Error::InvalidResponseStatus(response.status))?;
+        let status = StatusCode::from_u16(self.status)
+            .map_err(|_| Error::InvalidResponseStatus(self.status))?;
         let mut headers = HeaderMap::new();
-        for (key, value) in response.headers {
+        for (key, value) in self.headers {
             headers.append(HeaderName::try_from(key)?, HeaderValue::try_from(value)?);
         }
-        let body = match (response.body, response.error) {
+        let body = match (self.body, self.error) {
             (Some(body), _) => body,
             (None, Some(error)) => {
                 headers
@@ -1155,10 +1282,11 @@ impl TryFrom<ApplicationResponse> for Response {
             }
             (None, None) => Vec::new(),
         };
-        Ok(Self {
+        Ok(Response {
             status,
             headers,
             body,
+            exchange,
         })
     }
 }
@@ -1221,12 +1349,15 @@ fn extract_unverified_required_pcrs(document: &[u8]) -> Result<NitroPcrs> {
         .ok_or(Error::MalformedAttestation("COSE payload"))?;
     let payload = serde_cbor::from_slice(payload)
         .map_err(|_| Error::MalformedAttestation("COSE payload CBOR"))?;
-    extract_required_attested_pcrs(&extract_pcrs(&payload)?)
+    extract_attested_pcrs(&extract_pcrs(&payload)?, [0, 1, 2])
 }
 
-fn extract_required_attested_pcrs(pcrs: &NitroPcrs) -> Result<NitroPcrs> {
-    let mut required = NitroPcrs::with_capacity(3);
-    for index in [0, 1, 2] {
+fn extract_attested_pcrs(
+    pcrs: &NitroPcrs,
+    indices: impl IntoIterator<Item = u8>,
+) -> Result<NitroPcrs> {
+    let mut selected = NitroPcrs::new();
+    for index in indices {
         let value = pcrs.get(&index).ok_or(Error::InvalidAttestedPcr {
             index,
             reason: "missing",
@@ -1243,17 +1374,9 @@ fn extract_required_attested_pcrs(pcrs: &NitroPcrs) -> Result<NitroPcrs> {
                 reason: "all-zero debug PCRs are not accepted",
             });
         }
-        required.insert(index, value.clone());
+        selected.insert(index, value.clone());
     }
-    Ok(required)
-}
-
-fn extract_required_expected_pcrs(pcrs: &NitroPcrs) -> Result<NitroPcrs> {
-    validate_expected_pcrs(pcrs)?;
-    Ok([0, 1, 2]
-        .into_iter()
-        .map(|index| (index, pcrs[&index].clone()))
-        .collect())
+    Ok(selected)
 }
 
 fn pcr_profile_matches(profile: &NitroPcrs, observed: &NitroPcrs) -> bool {

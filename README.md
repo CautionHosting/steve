@@ -73,6 +73,7 @@ For requests intercepted by the active v2 worker, the host terminates TLS but on
 |-----------|----------|-------------|
 | `steve` | Enclave | Rust proxy - decrypts requests, encrypts responses |
 | `steve-sdk` | Client (Rust) | Native SDK with pinned-allowlist and TOFU PCR policies |
+| `steve-sdk-uniffi` | Client (Swift) | Generated Swift facade over the native Rust SDK |
 | `steve-cli` | Client (Rust) | One-request CLI using the native SDK policies |
 | `steve-js-sdk` | Client (Browser) | Service worker for web applications |
 
@@ -190,10 +191,11 @@ closed without a classic-worker or cryptographic fallback. See
 ### Native (Rust)
 
 The native SDK requires an explicit PCR policy. A pinned policy accepts one or
-more reviewed, complete PCR0/1/2 profiles. TOFU records the first fully verified
-profile in caller-owned durable storage and requires it on later sessions. PCRs
-are checked together with the Nitro certificate chain, fresh nonce, session
-transcript, selected suite, and derived-key binder.
+more reviewed profiles containing at least PCR0/1/2. TOFU records PCR0/1/2 by
+default and may include caller-selected additional PCRs. It requires the exact
+selected set on later sessions. PCRs are checked together with the Nitro
+certificate chain, fresh nonce, session transcript, selected suite, and
+derived-key binder.
 
 ```rust
 use steve_sdk::{Client, ExpectedPcrs};
@@ -218,6 +220,23 @@ their own binding with `Client::builder(...).application_context(...)`.
 Sessions rotate after 25 minutes. Requests have a 30-second deadline and are
 never automatically retried because an upstream operation may already have
 executed.
+
+### Native (Swift via UniFFI)
+
+`steve-sdk-uniffi` exposes the native SDK's pinned and TOFU policies,
+attestation, rotation, X25519/X-Wing selection, and binary HTTP requests through
+generated Swift bindings. Rust continues to own the network stack, Tokio
+runtime, attestation, protocol state, cryptography, and session keys.
+
+Swift TOFU uses PCR0/1/2 by default and accepts additional PCR indices at
+initialization. The application-owned trust store receives and must preserve
+exactly that selected set; the complete signed map remains available in the
+attestation result.
+
+Bindings and the static library are generated under `target/`, not committed.
+See [`crates/steve-sdk-uniffi/README.md`](crates/steve-sdk-uniffi/README.md) for
+the API, generation/linking commands, TOFU callback contract, concurrency, and
+security boundary.
 
 ### CLI
 
@@ -248,6 +267,7 @@ npm --prefix steve-js-sdk ci --ignore-scripts
 
 make test
 make test-e2e
+make test-swift # macOS-only generated-binding smoke test
 ```
 
 Manual UI:

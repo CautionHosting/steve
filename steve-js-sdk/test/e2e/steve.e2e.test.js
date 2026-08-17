@@ -113,7 +113,7 @@ function expectAttestationProfile(status) {
     });
     expect(status.attestation.synthetic).toBe(true);
     expect(status.attestation.moduleId).toBe('steve-local-eval');
-    expect(Object.keys(status.attestation.pcrs)).toEqual(['PCR0', 'PCR1', 'PCR2']);
+    expect(Object.keys(status.attestation.pcrs)).toEqual(['PCR0', 'PCR1', 'PCR2', 'PCR3']);
   }
 }
 

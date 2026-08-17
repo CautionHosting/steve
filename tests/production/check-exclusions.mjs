@@ -117,10 +117,23 @@ if (
 const metadata = JSON.parse(
   run('cargo', ['metadata', '--no-deps', '--format-version', '1'], root)
 );
-const steve = metadata.packages.find(pkg => pkg.name === 'steve');
-if (!steve || steve.features.default?.length !== 0) {
-  throw new Error('steve default features must remain empty');
+
+function requirePackage(name) {
+  const pkg = metadata.packages.find(candidate => candidate.name === name);
+  if (!pkg) {
+    throw new Error(`cargo metadata is missing the ${name} package`);
+  }
+  return pkg;
 }
+
+function requireEmptyDefaultFeatures(pkg) {
+  if (!Array.isArray(pkg.features.default) || pkg.features.default.length !== 0) {
+    throw new Error(`${pkg.name} default features must remain empty`);
+  }
+}
+
+const steve = requirePackage('steve');
+requireEmptyDefaultFeatures(steve);
 const evalBinary = steve.targets.find(target => target.name === 'steve-eval');
 const requiredFeatures = evalBinary?.['required-features'];
 if (
@@ -130,6 +143,25 @@ if (
   requiredFeatures[0] !== 'eval-attestation'
 ) {
   throw new Error('steve-eval must require the non-default eval-attestation feature');
+}
+
+const nativeSdk = requirePackage('steve-sdk');
+requireEmptyDefaultFeatures(nativeSdk);
+if (!Array.isArray(nativeSdk.features['eval-attestation'])) {
+  throw new Error('steve-sdk must keep eval-attestation as a non-default feature');
+}
+
+const uniffiSdk = requirePackage('steve-sdk-uniffi');
+requireEmptyDefaultFeatures(uniffiSdk);
+const syntheticTesting = uniffiSdk.features['synthetic-testing'];
+if (
+  !Array.isArray(syntheticTesting) ||
+  syntheticTesting.length !== 1 ||
+  syntheticTesting[0] !== 'steve-sdk/eval-attestation'
+) {
+  throw new Error(
+    'steve-sdk-uniffi synthetic-testing must map only to steve-sdk/eval-attestation'
+  );
 }
 
 console.log('production package excludes eval trust material and eval-only artifacts');

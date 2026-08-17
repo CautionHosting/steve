@@ -2,7 +2,6 @@ use super::*;
 
 use rand_core::{TryCryptoRng, TryRng};
 use std::{
-    collections::BTreeMap,
     convert::Infallible,
     sync::{
         RwLock,
@@ -19,13 +18,9 @@ use axum::{
     response::{IntoResponse, Response as AxumResponse},
     routing::any,
 };
-use base64::engine::general_purpose::STANDARD as BASE64;
 use coset::{CborSerializable, CoseSign1, TaggedCborSerializable};
 use p384::{
-    ecdsa::{
-        Signature, SigningKey, VerifyingKey,
-        signature::{Signer as SignatureSigner, Verifier as SignatureVerifier},
-    },
+    ecdsa::{Signature, SigningKey, signature::Signer as SignatureSigner},
     pkcs8::DecodePrivateKey,
 };
 use serde_cbor::Value;
@@ -36,9 +31,6 @@ use steve::{
     eval_attestation::EvalAttestationProvider,
 };
 use tokio::{net::TcpListener, time::sleep};
-use x509_parser::{certificate::X509Certificate, prelude::FromDer};
-
-const EVAL_LEAF_CERT_PEM: &str = include_str!("../../../tests/e2e/fixtures/eval-leaf-cert.pem");
 const EVAL_LEAF_KEY_PEM: &str = include_str!("../../../tests/e2e/fixtures/eval-leaf-key.pem");
 
 fn expected_pcrs() -> NitroPcrs {
@@ -46,117 +38,8 @@ fn expected_pcrs() -> NitroPcrs {
         (0, vec![0x10; 48]),
         (1, vec![0x11; 48]),
         (2, vec![0x12; 48]),
+        (3, vec![0x13; 48]),
     ])
-}
-
-#[derive(Debug)]
-struct EvalAttestationVerifier;
-
-impl AttestationVerifier for EvalAttestationVerifier {
-    fn verify(
-        &self,
-        document: &[u8],
-        expected_pcrs: &NitroPcrs,
-        _now: Duration,
-        nonce: &[u8; 32],
-    ) -> std::result::Result<Value, bootproof_sdk::format::Error> {
-        let cose = CoseSign1::from_tagged_slice(document)
-            .map_err(|_| malformed_attestation("eval cose sign1"))?;
-        let payload_bytes = cose
-            .payload
-            .as_ref()
-            .ok_or_else(|| missing_attestation("eval payload"))?;
-        let payload: Value = serde_cbor::from_slice(payload_bytes)
-            .map_err(|_| malformed_attestation("eval payload"))?;
-
-        let leaf_der = decode_pem(EVAL_LEAF_CERT_PEM)?;
-        let certificate = value_bytes(&payload, "certificate")?;
-        if certificate != leaf_der {
-            return Err(bootproof_sdk::format::Error::InvalidCABundle);
-        }
-        let (_, certificate) = X509Certificate::from_der(&leaf_der)
-            .map_err(|_| malformed_attestation("eval certificate"))?;
-        let verifying_key = VerifyingKey::from_sec1_bytes(
-            certificate.public_key().subject_public_key.data.as_ref(),
-        )
-        .map_err(|_| malformed_attestation("eval public key"))?;
-        cose.verify_signature(&[], |signature, data| {
-            let signature = Signature::from_slice(signature)
-                .map_err(|_| bootproof_sdk::format::Error::BadSignature)?;
-            verifying_key
-                .verify(data, &signature)
-                .map_err(|_| bootproof_sdk::format::Error::BadSignature)
-        })?;
-
-        let actual_nonce = value_bytes(&payload, "nonce")?;
-        if actual_nonce != nonce {
-            return Err(bootproof_sdk::format::Error::InvalidNonce);
-        }
-        let actual_pcrs = value_pcrs(&payload)?;
-        for (index, expected) in expected_pcrs {
-            if actual_pcrs.get(index) != Some(expected) {
-                return Err(bootproof_sdk::format::Error::InvalidAAD(
-                    format!("pcr {index}").into(),
-                ));
-            }
-        }
-        Ok(payload)
-    }
-}
-
-fn decode_pem(pem: &str) -> std::result::Result<Vec<u8>, bootproof_sdk::format::Error> {
-    let encoded = pem
-        .lines()
-        .filter(|line| !line.starts_with("-----"))
-        .collect::<String>();
-    BASE64
-        .decode(encoded)
-        .map_err(|_| malformed_attestation("eval certificate pem"))
-}
-
-fn value_map(
-    value: &Value,
-) -> std::result::Result<&BTreeMap<Value, Value>, bootproof_sdk::format::Error> {
-    let Value::Map(map) = value else {
-        return Err(malformed_attestation("eval payload map"));
-    };
-    Ok(map)
-}
-
-fn value_bytes<'a>(
-    value: &'a Value,
-    name: &'static str,
-) -> std::result::Result<&'a [u8], bootproof_sdk::format::Error> {
-    let Some(Value::Bytes(bytes)) = value_map(value)?.get(&Value::Text(name.to_owned())) else {
-        return Err(missing_attestation(name));
-    };
-    Ok(bytes)
-}
-
-fn value_pcrs(value: &Value) -> std::result::Result<NitroPcrs, bootproof_sdk::format::Error> {
-    let Some(Value::Map(pcrs)) = value_map(value)?.get(&Value::Text("pcrs".to_owned())) else {
-        return Err(missing_attestation("pcrs"));
-    };
-    pcrs.iter()
-        .map(|(index, value)| {
-            let Value::Integer(index) = index else {
-                return Err(malformed_attestation("pcr index"));
-            };
-            let index = u8::try_from(*index).map_err(|_| malformed_attestation("pcr index"))?;
-            let Value::Bytes(value) = value else {
-                return Err(malformed_attestation("pcr value"));
-            };
-            Ok((index, value.clone()))
-        })
-        .collect()
-}
-
-fn malformed_attestation(message: &'static str) -> bootproof_sdk::format::Error {
-    bootproof_sdk::format::Error::MalformedData(message.into())
-}
-
-fn missing_attestation(message: &'static str) -> bootproof_sdk::format::Error {
-    bootproof_sdk::format::Error::MissingData(message.into())
 }
 
 #[derive(Default)]
@@ -172,9 +55,9 @@ struct ControlledProvider {
 enum EvidenceMutation {
     Certificate,
     Nonce,
-    MissingPcr,
-    ZeroPcr,
-    ShortPcr,
+    MissingPcr(u8),
+    ZeroPcr(u8),
+    ShortPcr(u8),
 }
 
 impl AttestationProvider for ControlledProvider {
@@ -235,19 +118,21 @@ fn mutate_eval_evidence(
             };
             value[0] ^= 1;
         }
-        EvidenceMutation::MissingPcr | EvidenceMutation::ZeroPcr | EvidenceMutation::ShortPcr => {
+        EvidenceMutation::MissingPcr(index)
+        | EvidenceMutation::ZeroPcr(index)
+        | EvidenceMutation::ShortPcr(index) => {
             let Some(Value::Map(pcrs)) = payload.get_mut(&Value::Text("pcrs".into())) else {
                 return Err(AttestationError::Eval("missing PCRs".into()));
             };
-            let index = Value::Integer(2.into());
+            let index = Value::Integer(index.into());
             match mutation {
-                EvidenceMutation::MissingPcr => {
+                EvidenceMutation::MissingPcr(_) => {
                     pcrs.remove(&index);
                 }
-                EvidenceMutation::ZeroPcr => {
+                EvidenceMutation::ZeroPcr(_) => {
                     pcrs.insert(index, Value::Bytes(vec![0; 48]));
                 }
-                EvidenceMutation::ShortPcr => {
+                EvidenceMutation::ShortPcr(_) => {
                     pcrs.insert(index, Value::Bytes(vec![1; 47]));
                 }
                 _ => unreachable!(),
@@ -616,7 +501,7 @@ fn attested_pcrs_require_nonzero_pcr_zero_one_and_two() {
     let mut missing = expected_pcrs();
     missing.remove(&2);
     assert!(matches!(
-        extract_required_attested_pcrs(&missing),
+        extract_attested_pcrs(&missing, [0, 1, 2]),
         Err(Error::InvalidAttestedPcr {
             index: 2,
             reason: "missing"
@@ -626,14 +511,14 @@ fn attested_pcrs_require_nonzero_pcr_zero_one_and_two() {
     let mut zero = expected_pcrs();
     zero.insert(1, vec![0; 48]);
     assert!(matches!(
-        extract_required_attested_pcrs(&zero),
+        extract_attested_pcrs(&zero, [0, 1, 2]),
         Err(Error::InvalidAttestedPcr { index: 1, .. })
     ));
 
     let mut short = expected_pcrs();
     short.insert(0, vec![1; 47]);
     assert!(matches!(
-        extract_required_attested_pcrs(&short),
+        extract_attested_pcrs(&short, [0, 1, 2]),
         Err(Error::InvalidAttestedPcr { index: 0, .. })
     ));
 }
@@ -1045,13 +930,92 @@ async fn tofu_enrolls_after_confirmation_and_matches_on_rotation() {
 
     let first = client.initialize().await.unwrap();
     assert_eq!(first.pcr_trust, PcrTrustStatus::TofuEnrolled);
+    assert_eq!(first.pcrs, expected_pcrs());
     assert_eq!(store.calls.load(AtomicOrdering::Relaxed), 1);
-    assert_eq!(store.records.lock().unwrap().len(), 1);
+    let records = store.records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    let mut required = expected_pcrs();
+    required.remove(&3);
+    assert_eq!(records.values().next(), Some(&required));
+    drop(records);
 
     let second = client.rotate_session().await.unwrap();
     assert_eq!(second.pcr_trust, PcrTrustStatus::TofuMatched);
     assert_ne!(first.session_id, second.session_id);
     assert_eq!(store.calls.load(AtomicOrdering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn tofu_additional_pcrs_are_canonical_and_enforced() {
+    let provider = Arc::new(ControlledProvider::default());
+    let (steve_url, _) = test_server(provider, KeyExchangeSuite::X25519).await;
+    let store = Arc::new(MemoryPcrTrustStore::default());
+    let policy = PcrPolicy::trust_on_first_use_with_additional_pcrs(store.clone(), [3, 1, 3]);
+    let client = test_client_with_policy(&steve_url, policy, KeyExchangeSuite::X25519);
+
+    let first = client.initialize().await.unwrap();
+    assert_eq!(first.pcr_trust, PcrTrustStatus::TofuEnrolled);
+    assert_eq!(first.pcrs, expected_pcrs());
+    let enrolled = store.records.lock().unwrap().values().next().cloned();
+    assert_eq!(enrolled, Some(expected_pcrs()));
+    let second = client.rotate_session().await.unwrap();
+    assert_eq!(second.pcr_trust, PcrTrustStatus::TofuMatched);
+
+    let mut wrong = expected_pcrs();
+    wrong.insert(3, vec![0x77; 48]);
+    store.replace_records(wrong);
+    assert!(matches!(
+        client.rotate_session().await,
+        Err(Error::PcrTrustMismatch)
+    ));
+    assert_eq!(
+        client.verify_attestation().await.unwrap().session_id,
+        second.session_id
+    );
+}
+
+#[tokio::test]
+async fn changing_tofu_pcr_selection_conflicts_with_the_existing_record() {
+    let provider = Arc::new(ControlledProvider::default());
+    let (steve_url, _) = test_server(provider, KeyExchangeSuite::X25519).await;
+
+    let default_store = Arc::new(MemoryPcrTrustStore::default());
+    test_client_with_policy(
+        &steve_url,
+        PcrPolicy::trust_on_first_use(default_store.clone()),
+        KeyExchangeSuite::X25519,
+    )
+    .initialize()
+    .await
+    .unwrap();
+    let stronger = test_client_with_policy(
+        &steve_url,
+        PcrPolicy::trust_on_first_use_with_additional_pcrs(default_store, [3]),
+        KeyExchangeSuite::X25519,
+    );
+    assert!(matches!(
+        stronger.initialize().await,
+        Err(Error::PcrTrustMismatch)
+    ));
+
+    let stronger_store = Arc::new(MemoryPcrTrustStore::default());
+    test_client_with_policy(
+        &steve_url,
+        PcrPolicy::trust_on_first_use_with_additional_pcrs(stronger_store.clone(), [3]),
+        KeyExchangeSuite::X25519,
+    )
+    .initialize()
+    .await
+    .unwrap();
+    let default = test_client_with_policy(
+        &steve_url,
+        PcrPolicy::trust_on_first_use(stronger_store),
+        KeyExchangeSuite::X25519,
+    );
+    assert!(matches!(
+        default.initialize().await,
+        Err(Error::PcrTrustMismatch)
+    ));
 }
 
 #[tokio::test]
@@ -1128,9 +1092,9 @@ async fn invalid_attestation_and_binding_do_not_write_tofu() {
         (false, true, None),
         (false, false, Some(EvidenceMutation::Certificate)),
         (false, false, Some(EvidenceMutation::Nonce)),
-        (false, false, Some(EvidenceMutation::MissingPcr)),
-        (false, false, Some(EvidenceMutation::ZeroPcr)),
-        (false, false, Some(EvidenceMutation::ShortPcr)),
+        (false, false, Some(EvidenceMutation::MissingPcr(2))),
+        (false, false, Some(EvidenceMutation::ZeroPcr(2))),
+        (false, false, Some(EvidenceMutation::ShortPcr(2))),
     ];
     for (corrupt_signature, corrupt_binding, mutation) in cases {
         let provider = Arc::new(ControlledProvider::default());
@@ -1152,6 +1116,32 @@ async fn invalid_attestation_and_binding_do_not_write_tofu() {
         );
 
         assert!(client.initialize().await.is_err());
+        assert_eq!(store.calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(store.records.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn invalid_additional_attested_pcrs_do_not_write_tofu() {
+    for mutation in [
+        EvidenceMutation::MissingPcr(3),
+        EvidenceMutation::ZeroPcr(3),
+        EvidenceMutation::ShortPcr(3),
+    ] {
+        let provider = Arc::new(ControlledProvider::default());
+        *provider.evidence_mutation.lock().unwrap() = Some(mutation);
+        let (steve_url, _) = test_server(provider, KeyExchangeSuite::X25519).await;
+        let store = Arc::new(MemoryPcrTrustStore::default());
+        let client = test_client_with_policy(
+            &steve_url,
+            PcrPolicy::trust_on_first_use_with_additional_pcrs(store.clone(), [3]),
+            KeyExchangeSuite::X25519,
+        );
+
+        assert!(matches!(
+            client.initialize().await,
+            Err(Error::InvalidAttestedPcr { index: 3, .. })
+        ));
         assert_eq!(store.calls.load(AtomicOrdering::Relaxed), 0);
         assert!(store.records.lock().unwrap().is_empty());
     }
@@ -1189,7 +1179,20 @@ async fn failed_confirmation_does_not_write_tofu() {
 
 #[test]
 fn application_response_preserves_repeated_headers() {
-    let response = Response::try_from(ApplicationResponse {
+    let exchange = ProtectedExchange {
+        session_id: [9; 16],
+        sequence: 7,
+        key_exchange: KeyExchangeSuite::X25519,
+        pcr_trust: PcrTrustStatus::Pinned,
+        outer_status: StatusCode::OK,
+        request_plaintext_bytes: 10,
+        request_ciphertext_bytes: 26,
+        request_envelope_bytes: 64,
+        response_envelope_bytes: 65,
+        response_ciphertext_bytes: 27,
+        response_plaintext_bytes: 11,
+    };
+    let response = ApplicationResponse {
         status: StatusCode::OK.as_u16(),
         headers: vec![
             ("set-cookie".to_string(), "a=1".to_string()),
@@ -1197,9 +1200,11 @@ fn application_response_preserves_repeated_headers() {
         ],
         body: None,
         error: None,
-    })
+    }
+    .into_response(exchange.clone())
     .unwrap();
 
+    assert_eq!(response.exchange(), &exchange);
     assert_eq!(
         response
             .headers()
@@ -1229,6 +1234,24 @@ async fn xwing_signed_eval_server_round_trip_and_rotation() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
     assert_eq!(response.bytes(), b"xwing secret request");
+    let exchange = response.exchange();
+    assert_eq!(exchange.protocol(), "STEVE-E2P-V2");
+    assert_eq!(exchange.protection(), "AES-256-GCM");
+    assert_eq!(exchange.session_id(), &first.session_id);
+    assert_eq!(exchange.sequence(), 1);
+    assert_eq!(exchange.key_exchange(), KeyExchangeSuite::XWingDraft10);
+    assert_eq!(exchange.pcr_trust(), PcrTrustStatus::Pinned);
+    assert_eq!(exchange.outer_status(), StatusCode::OK);
+    assert_eq!(
+        exchange.request_ciphertext_bytes(),
+        exchange.request_plaintext_bytes() + 16
+    );
+    assert!(exchange.request_envelope_bytes() > exchange.request_ciphertext_bytes());
+    assert_eq!(
+        exchange.response_ciphertext_bytes(),
+        exchange.response_plaintext_bytes() + 16
+    );
+    assert!(exchange.response_envelope_bytes() > exchange.response_ciphertext_bytes());
     assert_eq!(
         upstream.last_request.read().unwrap().as_ref().unwrap().1,
         b"xwing secret request"
