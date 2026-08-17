@@ -55,6 +55,7 @@ impl AttestationProvider for EvalAttestationProvider {
                 (0, ByteBuf::from(vec![0x10; 48])),
                 (1, ByteBuf::from(vec![0x11; 48])),
                 (2, ByteBuf::from(vec![0x12; 48])),
+                (3, ByteBuf::from(vec![0x13; 48])),
             ]
             .into_iter()
             .collect(),

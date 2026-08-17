@@ -228,6 +228,11 @@ attestation, rotation, X25519/X-Wing selection, and binary HTTP requests through
 generated Swift bindings. Rust continues to own the network stack, Tokio
 runtime, attestation, protocol state, cryptography, and session keys.
 
+Swift TOFU uses PCR0/1/2 by default and accepts additional PCR indices at
+initialization. The application-owned trust store receives and must preserve
+exactly that selected set; the complete signed map remains available in the
+attestation result.
+
 Bindings and the static library are generated under `target/`, not committed.
 See [`crates/steve-sdk-uniffi/README.md`](crates/steve-sdk-uniffi/README.md) for
 the API, generation/linking commands, TOFU callback contract, concurrency, and

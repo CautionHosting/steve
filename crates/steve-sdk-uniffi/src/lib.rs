@@ -251,12 +251,18 @@ pub fn create_pinned(
     create_pinned_with_mode(config, profiles, AttestationMode::Nitro)
 }
 
-#[uniffi::export]
+#[uniffi::export(default(additional_pcr_indices))]
 pub fn create_tofu(
     config: SteveClientConfig,
     trust_store: Arc<dyn PcrTrustStore>,
+    additional_pcr_indices: Vec<u8>,
 ) -> Result<Arc<SteveClient>, SteveError> {
-    create_tofu_with_mode(config, trust_store, AttestationMode::Nitro)
+    create_tofu_with_mode(
+        config,
+        trust_store,
+        additional_pcr_indices,
+        AttestationMode::Nitro,
+    )
 }
 
 #[cfg(feature = "synthetic-testing")]
@@ -269,12 +275,18 @@ pub fn create_pinned_for_synthetic_testing(
 }
 
 #[cfg(feature = "synthetic-testing")]
-#[uniffi::export]
+#[uniffi::export(default(additional_pcr_indices))]
 pub fn create_tofu_for_synthetic_testing(
     config: SteveClientConfig,
     trust_store: Arc<dyn PcrTrustStore>,
+    additional_pcr_indices: Vec<u8>,
 ) -> Result<Arc<SteveClient>, SteveError> {
-    create_tofu_with_mode(config, trust_store, AttestationMode::Synthetic)
+    create_tofu_with_mode(
+        config,
+        trust_store,
+        additional_pcr_indices,
+        AttestationMode::Synthetic,
+    )
 }
 
 #[uniffi::export]
@@ -334,9 +346,13 @@ fn create_pinned_with_mode(
 fn create_tofu_with_mode(
     config: SteveClientConfig,
     trust_store: Arc<dyn PcrTrustStore>,
+    additional_pcr_indices: Vec<u8>,
     mode: AttestationMode,
 ) -> Result<Arc<SteveClient>, SteveError> {
-    let policy = PcrPolicy::trust_on_first_use(Arc::new(ForeignPcrTrustStore { trust_store }));
+    let policy = PcrPolicy::trust_on_first_use_with_additional_pcrs(
+        Arc::new(ForeignPcrTrustStore { trust_store }),
+        additional_pcr_indices,
+    );
     create_client(config, policy, mode)
 }
 

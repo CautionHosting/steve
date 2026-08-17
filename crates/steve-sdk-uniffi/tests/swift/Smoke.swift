@@ -31,6 +31,7 @@ func expectedProfile() -> PcrProfile {
         Pcr(index: 0, value: Data(repeating: 0x10, count: 48)),
         Pcr(index: 1, value: Data(repeating: 0x11, count: 48)),
         Pcr(index: 2, value: Data(repeating: 0x12, count: 48)),
+        Pcr(index: 3, value: Data(repeating: 0x13, count: 48)),
     ])
 }
 
@@ -176,10 +177,16 @@ func runTofuXwing() async throws {
     }
     report("Swift TOFU callback failure failed closed with its message")
 
+    let _ = try createTofuForSyntheticTesting(
+        config: config(.xwingDraft10),
+        trustStore: MemoryTrustStore()
+    )
+
     let store = MemoryTrustStore()
     let client = try createTofuForSyntheticTesting(
         config: config(.xwingDraft10),
-        trustStore: store
+        trustStore: store,
+        additionalPcrIndices: Data([3])
     )
     let first = try await client.verifyAttestation()
     try requireAttestation(first, trust: .tofuEnrolled)
@@ -192,10 +199,10 @@ func runTofuXwing() async throws {
     try require(snapshot.keys.allSatisfy { $0.count == 32 }, "TOFU key must be 32 bytes")
     try require(snapshot.keys[0] == snapshot.keys[1], "TOFU key changed across rotation")
     try require(
-        snapshot.profiles.allSatisfy { $0.pcrs.map(\.index) == [0, 1, 2] },
-        "TOFU callback must receive PCR0/1/2 only"
+        snapshot.profiles.allSatisfy { $0.pcrs.map(\.index) == [0, 1, 2, 3] },
+        "TOFU callback must receive PCR0/1/2 and the selected PCR3"
     )
-    report("rotation matched PCR0/1/2 using a stable 32-byte trust key")
+    report("rotation matched PCR0/1/2/3 using a stable 32-byte trust key")
 
     let body = Data([0x00, 0x01, 0xfe, 0xff])
     let response = try await client.send(request: request(

@@ -38,6 +38,10 @@ request timeouts retain the Rust SDK defaults: 25 minutes, 10 seconds, and 30
 seconds respectively. Zero values are literal: a zero rotation interval rotates
 before every operation, while zero timeouts expire immediately.
 
+`createTofu` selects PCR0/1/2 by default. Its trailing
+`additionalPcrIndices` argument defaults to empty; for example,
+`Data([3, 8])` selects PCR0/1/2/3/8.
+
 HTTP methods and paths are passed to the native SDK. Header values and bodies
 cross the FFI as `Data`; response header entries preserve repeated names and
 normalize names to lowercase. Compare header names case-insensitively.
@@ -60,17 +64,24 @@ thread, and must be thread-safe. It must not call or wait on methods of the same
 `SteveClient`. The client retains the store for its lifetime; any back-reference
 from the store to the client must be weak. `loadOrInsert` must atomically:
 
-- durably insert the observed PCR0/1/2 and return `inserted`; or
+- durably insert exactly the observed selected PCRs and return `inserted`; or
 - return `existing(profile:)` without replacing the stored value.
+
+The callback receives exactly the canonical selected set: PCR0/1/2 plus the
+sorted, deduplicated `additionalPcrIndices`. An existing profile must contain
+exactly those indices and values; missing, extra, or changed entries fail
+closed. The complete signed PCR map remains available in `AttestationInfo`.
 
 Once running, the callback cannot be cancelled. A session-establishment timeout
 does not roll back caller-owned storage: insertion may still complete, and a
 retry can return `tofuMatched` without a prior successful `tofuEnrolled` result.
 
 The 32-byte key is bound to the normalized origin, application context, and
-selected suite. Callback failures fail closed, and their messages are retained
-inside `SteveError.PcrTrustStore`. Complete signed PCR maps remain available in
-`AttestationInfo`; the callback intentionally receives only PCR0/1/2.
+selected suite, not the selected PCR indices. Changing the selection therefore
+conflicts with an existing record and requires explicit record migration or a
+distinct application context. Callback failures fail closed, and their messages
+are retained inside `SteveError.PcrTrustStore`. Stores that return extra entries
+for the default PCR0/1/2 selection now fail closed.
 
 ## Security and validation
 
@@ -85,10 +96,10 @@ make test-swift
 This requires macOS Command Line Tools and Docker. It does not require full
 Xcode, signing, a paid Apple account, or an iOS project. The gate generates and
 compiles the bindings once, then exercises pinned X25519 and Swift-owned TOFU
-with XWING-DRAFT10 against signed synthetic evidence. It proves FFI and
-encrypted-protocol interoperability, not Nitro hardware or production PCRs.
-Its synthetic library, bindings, and executable stay isolated under
-`target/steve-sdk-uniffi-smoke`.
+with XWING-DRAFT10 against signed synthetic evidence, including caller-selected
+PCR3. It proves FFI and encrypted-protocol interoperability, not Nitro hardware
+or production PCRs. Its synthetic library, bindings, and executable stay
+isolated under `target/steve-sdk-uniffi-smoke`.
 
 There is no Keychain, Secure Enclave, platform KEM provider, or persistent
 session-key API in v1. Session key generation and use remain ephemeral inside
