@@ -257,7 +257,13 @@ async function readValue(openDatabase, key) {
   const database = await openDatabase();
   try {
     return await new Promise((resolve, reject) => {
-      const transaction = database.transaction(STORE_NAME, 'readonly');
+      let transaction;
+      try {
+        transaction = database.transaction(STORE_NAME, 'readonly');
+      } catch (error) {
+        reject(storageError(error));
+        return;
+      }
       const request = transaction.objectStore(STORE_NAME).get(key);
       let value;
       request.onsuccess = () => { value = request.result; };

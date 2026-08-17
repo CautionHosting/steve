@@ -197,8 +197,34 @@ test('worker failures expose stable structured errors', async () => {
   );
 });
 
+test('waitForInitialization propagates granular establishment errors', async () => {
+  const client = new EnclaveClient({});
+  client.getStatus = async () => ({ initialized: false });
+  const waiting = client.waitForInitialization(1000);
+  await Promise.resolve();
+
+  client.emit('error', {
+    operation: 'initialization',
+    code: 'PCR_POLICY_MISMATCH',
+    stage: 'pcr-policy',
+    message: 'attested PCRs did not match'
+  });
+
+  await assert.rejects(waiting, error =>
+    error instanceof SteveError
+      && error.code === 'PCR_POLICY_MISMATCH'
+      && error.stage === 'pcr-policy'
+  );
+});
+
 test('send dispatches one relative protected request and returns its session ID', async () => {
   const messages = [];
+  const timeoutDelays = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    timeoutDelays.push(delay);
+    return originalSetTimeout(callback, delay, ...args);
+  };
   serviceWorker.controller = {
     postMessage: (message, ports) => {
       messages.push(message);
@@ -214,11 +240,17 @@ test('send dispatches one relative protected request and returns its session ID'
   };
   const client = new EnclaveClient({});
 
-  const { response, sessionId } = await client.send('/items?q=1', {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain' },
-    body: 'payload'
-  });
+  let result;
+  try {
+    result = await client.send('/items?q=1', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: 'payload'
+    });
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+  const { response, sessionId } = result;
 
   assert.equal(messages.length, 1);
   assert.equal(messages[0].type, 'protected-send');
@@ -228,6 +260,7 @@ test('send dispatches one relative protected request and returns its session ID'
   assert.equal(response.status, 201);
   assert.equal(await response.text(), 'created');
   assert.equal(sessionId, 'session-id');
+  assert.ok(timeoutDelays.includes(315000));
 });
 
 test('send rejects absolute paths and browser retry or redirect options', async () => {

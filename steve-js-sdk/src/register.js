@@ -1,5 +1,5 @@
 const CONTROLLER_TIMEOUT_MS = 5000;
-const PROTECTED_SEND_TIMEOUT_MS = 5 * 60 * 1000 + 5000;
+const PROTECTED_SEND_TIMEOUT_MS = 5 * 60 * 1000 + 15 * 1000;
 
 export class SteveError extends Error {
   constructor(details = {}) {
@@ -265,7 +265,7 @@ export class EnclaveClient {
       };
 
       const onError = (data) => {
-        if (data.stage === 'initialization') {
+        if (data.operation === 'initialization' || data.stage === 'initialization') {
           cleanup();
           reject(new SteveError(data));
         }

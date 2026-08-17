@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import {
+  createBrowserPcrPolicyStorage,
   enforceTofuPcrPolicy,
   exactPcrsMatch,
   normalizePcrPolicy,
@@ -232,5 +233,27 @@ test('TOFU fails closed on changed values, selection, or storage failure', async
       async loadOrInsert() { throw new Error('PCR policy storage failed'); }
     }),
     /PCR policy storage failed/u
+  );
+});
+
+test('policy marker transaction failures return structured storage errors', async () => {
+  const database = {
+    transaction() { throw new Error('database is closed'); },
+    close() {}
+  };
+  const databaseFactory = {
+    open() {
+      const request = { result: database };
+      queueMicrotask(() => request.onsuccess());
+      return request;
+    }
+  };
+  const storage = createBrowserPcrPolicyStorage(databaseFactory);
+
+  await assert.rejects(
+    storage.isPolicyRequired('https://app.example/'),
+    error => error.code === 'PCR_TRUST_STORAGE'
+      && error.stage === 'pcr-trust'
+      && error.cause?.message === 'database is closed'
   );
 });

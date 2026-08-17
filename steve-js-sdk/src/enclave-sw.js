@@ -358,6 +358,7 @@ async function handleProtectedRequest(
     const requestUrl = new URL(request.url);
     notifyClients('error', {
       ...errorDetails(error, session ? 'request' : 'initialization'),
+      operation: session ? 'request' : 'initialization',
       url: requestUrl.origin + requestUrl.pathname,
     });
     if (returnDetails) throw error;

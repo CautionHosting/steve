@@ -1,6 +1,6 @@
 // src/register.js
 var CONTROLLER_TIMEOUT_MS = 5e3;
-var PROTECTED_SEND_TIMEOUT_MS = 5 * 60 * 1e3 + 5e3;
+var PROTECTED_SEND_TIMEOUT_MS = 5 * 60 * 1e3 + 15 * 1e3;
 var SteveError = class extends Error {
   constructor(details = {}) {
     const normalized = typeof details === "string" ? { message: details } : details;
@@ -232,7 +232,7 @@ var EnclaveClient = class {
         resolve(data);
       };
       const onError = (data) => {
-        if (data.stage === "initialization") {
+        if (data.operation === "initialization" || data.stage === "initialization") {
           cleanup();
           reject(new SteveError(data));
         }

@@ -185,7 +185,8 @@ same same-origin bootstrap trust boundary described above.
 
 `initialize()`, `rotateSession()`, and `reset()` return the resulting status.
 `rotateKey()` remains an alias for compatibility. `getStatus()` reads status
-without changing session state.
+without changing session state. `waitForInitialization()` returns immediately
+when ready or waits and propagates the underlying establishment error.
 
 Policy changes remain authoritative in the worker:
 

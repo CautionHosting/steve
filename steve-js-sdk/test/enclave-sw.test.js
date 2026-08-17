@@ -1058,10 +1058,29 @@ test('an invalid protected response resets the secure session', async () => {
   assert.equal(getState().session, null);
   const errorMessage = clientMessages.find(message => message.type === 'enclave:error');
   assert.equal(errorMessage.url, 'https://example.test/invalid-response');
+  assert.equal(errorMessage.operation, 'request');
   assert.throws(
     () => session.sequences.accept(1n, 1n),
     /unsupported envelope version/u
   );
+});
+
+test('session establishment errors identify the initialization operation', async () => {
+  captureClientMessages = true;
+  const mismatch = new Error('attested PCRs did not match');
+  mismatch.code = 'PCR_POLICY_MISMATCH';
+  mismatch.stage = 'pcr-policy';
+  setEstablishSession(async () => { throw mismatch; });
+
+  const response = await handleProtectedRequest(
+    new Request('https://example.test/initialization-failure')
+  );
+
+  assert.equal(response.status, 502);
+  const errorMessage = clientMessages.find(message => message.type === 'enclave:error');
+  assert.equal(errorMessage.operation, 'initialization');
+  assert.equal(errorMessage.code, 'PCR_POLICY_MISMATCH');
+  assert.equal(errorMessage.stage, 'pcr-policy');
 });
 
 test('an oversized protected response resets the secure session', async () => {
