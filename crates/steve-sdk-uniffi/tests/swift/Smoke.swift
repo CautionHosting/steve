@@ -121,6 +121,30 @@ func runPinnedX25519() async throws {
     ))
     try require(response.status == 200, "protected echo returned a non-200 status")
     try require(response.body == body, "protected echo changed the binary body")
+    let exchange = response.exchange
+    try require(exchange.protocolName == "STEVE-E2P-V2", "exchange protocol metadata differed")
+    try require(exchange.protection == "AES-256-GCM", "exchange protection metadata differed")
+    try require(exchange.sessionId == first.sessionId, "exchange reported the wrong session")
+    try require(exchange.sequence == 1, "first application exchange did not use sequence 1")
+    try require(exchange.keyExchange == .x25519, "exchange reported the wrong session KEM")
+    try require(exchange.pcrTrust == .pinned, "exchange reported the wrong PCR trust result")
+    try require(exchange.outerStatus == 200, "exchange reported the wrong outer HTTP status")
+    try require(
+        exchange.requestCiphertextBytes == exchange.requestPlaintextBytes + 16,
+        "request AES-GCM ciphertext size differed"
+    )
+    try require(
+        exchange.requestEnvelopeBytes > exchange.requestCiphertextBytes,
+        "request envelope did not include authenticated metadata"
+    )
+    try require(
+        exchange.responseCiphertextBytes == exchange.responsePlaintextBytes + 16,
+        "response AES-GCM ciphertext size differed"
+    )
+    try require(
+        exchange.responseEnvelopeBytes > exchange.responseCiphertextBytes,
+        "response envelope did not include authenticated metadata"
+    )
     try require(
         response.headers.contains {
             $0.name.lowercased() == "content-type" && $0.value == bytes("application/octet-stream")
@@ -213,6 +237,9 @@ func runTofuXwing() async throws {
     ))
     try require(response.status == 200, "X-Wing protected echo returned a non-200 status")
     try require(response.body == body, "X-Wing protected echo changed the binary body")
+    try require(response.exchange.sessionId == rotated.sessionId, "exchange reported the wrong rotated session")
+    try require(response.exchange.keyExchange == .xwingDraft10, "exchange reported the wrong session KEM")
+    try require(response.exchange.pcrTrust == .tofuMatched, "exchange reported the wrong TOFU result")
     report("X-Wing protected binary echo preserved the response")
     print("PASS Swift UniFFI smoke: XWING-DRAFT10 TOFU")
 }

@@ -1179,7 +1179,20 @@ async fn failed_confirmation_does_not_write_tofu() {
 
 #[test]
 fn application_response_preserves_repeated_headers() {
-    let response = Response::try_from(ApplicationResponse {
+    let exchange = ProtectedExchange {
+        session_id: [9; 16],
+        sequence: 7,
+        key_exchange: KeyExchangeSuite::X25519,
+        pcr_trust: PcrTrustStatus::Pinned,
+        outer_status: StatusCode::OK,
+        request_plaintext_bytes: 10,
+        request_ciphertext_bytes: 26,
+        request_envelope_bytes: 64,
+        response_envelope_bytes: 65,
+        response_ciphertext_bytes: 27,
+        response_plaintext_bytes: 11,
+    };
+    let response = ApplicationResponse {
         status: StatusCode::OK.as_u16(),
         headers: vec![
             ("set-cookie".to_string(), "a=1".to_string()),
@@ -1187,9 +1200,11 @@ fn application_response_preserves_repeated_headers() {
         ],
         body: None,
         error: None,
-    })
+    }
+    .into_response(exchange.clone())
     .unwrap();
 
+    assert_eq!(response.exchange(), &exchange);
     assert_eq!(
         response
             .headers()
@@ -1219,6 +1234,24 @@ async fn xwing_signed_eval_server_round_trip_and_rotation() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
     assert_eq!(response.bytes(), b"xwing secret request");
+    let exchange = response.exchange();
+    assert_eq!(exchange.protocol(), "STEVE-E2P-V2");
+    assert_eq!(exchange.protection(), "AES-256-GCM");
+    assert_eq!(exchange.session_id(), &first.session_id);
+    assert_eq!(exchange.sequence(), 1);
+    assert_eq!(exchange.key_exchange(), KeyExchangeSuite::XWingDraft10);
+    assert_eq!(exchange.pcr_trust(), PcrTrustStatus::Pinned);
+    assert_eq!(exchange.outer_status(), StatusCode::OK);
+    assert_eq!(
+        exchange.request_ciphertext_bytes(),
+        exchange.request_plaintext_bytes() + 16
+    );
+    assert!(exchange.request_envelope_bytes() > exchange.request_ciphertext_bytes());
+    assert_eq!(
+        exchange.response_ciphertext_bytes(),
+        exchange.response_plaintext_bytes() + 16
+    );
+    assert!(exchange.response_envelope_bytes() > exchange.response_ciphertext_bytes());
     assert_eq!(
         upstream.last_request.read().unwrap().as_ref().unwrap().1,
         b"xwing secret request"

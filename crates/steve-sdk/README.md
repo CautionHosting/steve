@@ -23,6 +23,12 @@ let client = Client::new("https://secure.example", expected_pcrs).await?;
 let response = client.get("/api/secret").send().await?;
 ```
 
+Each successful `Response` carries non-secret `ProtectedExchange` metadata for
+the exact authenticated exchange: session ID, sequence, KEM and PCR trust
+result, outer HTTP status, and plaintext, ciphertext, and complete-envelope byte
+counts in both directions. `response.exchange()` exposes this receipt without
+exposing keys, IV prefixes, nonces, binders, shared secrets, or ciphertext.
+
 `Client::new` and `Client::builder` remain single-profile pinned conveniences.
 For an upgrade window, approve multiple complete profiles explicitly:
 

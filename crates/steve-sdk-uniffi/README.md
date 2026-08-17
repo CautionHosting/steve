@@ -48,6 +48,13 @@ normalize names to lowercase. Compare header names case-insensitively.
 Duplicate request names retain the SDK's last-value-wins behavior. Invalid
 methods, names, values, paths, and non-UTF-8 request header values fail through
 typed `SteveError` cases. Application HTTP 4xx/5xx values remain responses.
+Every successful response includes non-secret protected-exchange metadata: the
+exact session ID and sequence, session KEM and PCR trust result, outer HTTP
+status, protocol and payload-protection names, and plaintext, ciphertext, and
+complete-envelope byte counts in both directions. The SDK records these values
+where it authenticates the response, so they remain accurate across lazy session
+establishment and automatic rotation. It never exposes keys, IV prefixes,
+nonces, binders, shared secrets, or ciphertext through this metadata.
 The Rust-only `reqwest::ClientBuilder` injection point and generic text/JSON
 helpers are not part of the FFI; Swift uses the byte-oriented request and
 response DTOs.

@@ -42,6 +42,15 @@ impl From<KeyExchangeSuite> for steve_sdk::KeyExchangeSuite {
     }
 }
 
+impl From<steve_sdk::KeyExchangeSuite> for KeyExchangeSuite {
+    fn from(value: steve_sdk::KeyExchangeSuite) -> Self {
+        match value {
+            steve_sdk::KeyExchangeSuite::X25519 => Self::X25519,
+            steve_sdk::KeyExchangeSuite::XWingDraft10 => Self::XwingDraft10,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
 pub struct Pcr {
     pub index: u8,
@@ -108,6 +117,24 @@ pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<HttpHeader>,
     pub body: Vec<u8>,
+    pub exchange: ProtectedExchangeInfo,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct ProtectedExchangeInfo {
+    pub protocol_name: String,
+    pub protection: String,
+    pub session_id: Vec<u8>,
+    pub sequence: u64,
+    pub key_exchange: KeyExchangeSuite,
+    pub pcr_trust: PcrTrustStatus,
+    pub outer_status: u16,
+    pub request_plaintext_bytes: u64,
+    pub request_ciphertext_bytes: u64,
+    pub request_envelope_bytes: u64,
+    pub response_envelope_bytes: u64,
+    pub response_ciphertext_bytes: u64,
+    pub response_plaintext_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, uniffi::Enum)]
@@ -417,6 +444,7 @@ fn profile_from_core(profile: &ExpectedPcrs) -> PcrProfile {
 
 fn response_from_core(response: steve_sdk::Response) -> HttpResponse {
     let status = response.status().as_u16();
+    let exchange = exchange_from_core(response.exchange());
     let headers = response
         .headers()
         .iter()
@@ -429,7 +457,30 @@ fn response_from_core(response: steve_sdk::Response) -> HttpResponse {
         status,
         headers,
         body: response.into_bytes(),
+        exchange,
     }
+}
+
+fn exchange_from_core(exchange: &steve_sdk::ProtectedExchange) -> ProtectedExchangeInfo {
+    ProtectedExchangeInfo {
+        protocol_name: exchange.protocol().to_owned(),
+        protection: exchange.protection().to_owned(),
+        session_id: exchange.session_id().to_vec(),
+        sequence: exchange.sequence(),
+        key_exchange: exchange.key_exchange().into(),
+        pcr_trust: exchange.pcr_trust().into(),
+        outer_status: exchange.outer_status().as_u16(),
+        request_plaintext_bytes: byte_count(exchange.request_plaintext_bytes()),
+        request_ciphertext_bytes: byte_count(exchange.request_ciphertext_bytes()),
+        request_envelope_bytes: byte_count(exchange.request_envelope_bytes()),
+        response_envelope_bytes: byte_count(exchange.response_envelope_bytes()),
+        response_ciphertext_bytes: byte_count(exchange.response_ciphertext_bytes()),
+        response_plaintext_bytes: byte_count(exchange.response_plaintext_bytes()),
+    }
+}
+
+fn byte_count(value: usize) -> u64 {
+    u64::try_from(value).expect("STEVE byte counts fit in u64")
 }
 
 fn runtime() -> Result<&'static Runtime, SteveError> {

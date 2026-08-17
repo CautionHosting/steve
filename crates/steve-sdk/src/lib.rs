@@ -1072,6 +1072,7 @@ async fn send_application_request(
     sequence: u64,
     plaintext: &[u8],
 ) -> Result<(Response, u64)> {
+    let request_plaintext_bytes = plaintext.len();
     let ciphertext = session.secrets.seal(
         Direction::ClientToServer,
         MessageType::Application,
@@ -1079,21 +1080,25 @@ async fn send_application_request(
         sequence,
         plaintext,
     )?;
+    let request_ciphertext_bytes = ciphertext.len();
     let envelope = encode_cbor(&Envelope {
         version: VERSION,
         session_id: session.id.to_vec(),
         sequence: sequence.to_be_bytes().to_vec(),
         ciphertext,
     })?;
+    let request_envelope_bytes = envelope.len();
     let (status, body) = client
         .send_protocol(REQUEST_ENDPOINT, envelope, MAX_APPLICATION_RESPONSE_BYTES)
         .await?;
+    let response_envelope_bytes = body.len();
     ensure_success("protected request", status, &body)?;
     let envelope: Envelope = decode_cbor(&body)?;
     let (response_session_id, response_sequence) = envelope.validate()?;
     if response_session_id != session.id || response_sequence != sequence {
         return Err(Error::UnexpectedSequence);
     }
+    let response_ciphertext_bytes = envelope.ciphertext.len();
     let plaintext = session.secrets.open(
         Direction::ServerToClient,
         MessageType::Application,
@@ -1101,8 +1106,92 @@ async fn send_application_request(
         sequence,
         &envelope.ciphertext,
     )?;
+    let response_plaintext_bytes = plaintext.len();
     let response: ApplicationResponse = decode_cbor(&plaintext)?;
-    Ok((response.try_into()?, response_sequence))
+    let exchange = ProtectedExchange {
+        session_id: session.id,
+        sequence,
+        key_exchange: client.inner.expected_key_exchange,
+        pcr_trust: session.attestation.pcr_trust,
+        outer_status: status,
+        request_plaintext_bytes,
+        request_ciphertext_bytes,
+        request_envelope_bytes,
+        response_envelope_bytes,
+        response_ciphertext_bytes,
+        response_plaintext_bytes,
+    };
+    Ok((response.into_response(exchange)?, response_sequence))
+}
+
+/// Non-secret metadata for one authenticated STEVE application exchange.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtectedExchange {
+    session_id: [u8; 16],
+    sequence: u64,
+    key_exchange: KeyExchangeSuite,
+    pcr_trust: PcrTrustStatus,
+    outer_status: StatusCode,
+    request_plaintext_bytes: usize,
+    request_ciphertext_bytes: usize,
+    request_envelope_bytes: usize,
+    response_envelope_bytes: usize,
+    response_ciphertext_bytes: usize,
+    response_plaintext_bytes: usize,
+}
+
+impl ProtectedExchange {
+    pub fn protocol(&self) -> &'static str {
+        PROTOCOL_ID
+    }
+
+    pub fn protection(&self) -> &'static str {
+        "AES-256-GCM"
+    }
+
+    pub fn session_id(&self) -> &[u8; 16] {
+        &self.session_id
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn key_exchange(&self) -> KeyExchangeSuite {
+        self.key_exchange
+    }
+
+    pub fn pcr_trust(&self) -> PcrTrustStatus {
+        self.pcr_trust
+    }
+
+    pub fn outer_status(&self) -> StatusCode {
+        self.outer_status
+    }
+
+    pub fn request_plaintext_bytes(&self) -> usize {
+        self.request_plaintext_bytes
+    }
+
+    pub fn request_ciphertext_bytes(&self) -> usize {
+        self.request_ciphertext_bytes
+    }
+
+    pub fn request_envelope_bytes(&self) -> usize {
+        self.request_envelope_bytes
+    }
+
+    pub fn response_envelope_bytes(&self) -> usize {
+        self.response_envelope_bytes
+    }
+
+    pub fn response_ciphertext_bytes(&self) -> usize {
+        self.response_ciphertext_bytes
+    }
+
+    pub fn response_plaintext_bytes(&self) -> usize {
+        self.response_plaintext_bytes
+    }
 }
 
 #[derive(Debug)]
@@ -1110,6 +1199,7 @@ pub struct Response {
     status: StatusCode,
     headers: HeaderMap,
     body: Vec<u8>,
+    exchange: ProtectedExchange,
 }
 
 impl Response {
@@ -1123,6 +1213,10 @@ impl Response {
 
     pub fn bytes(&self) -> &[u8] {
         &self.body
+    }
+
+    pub fn exchange(&self) -> &ProtectedExchange {
+        &self.exchange
     }
 
     pub fn into_bytes(self) -> Vec<u8> {
@@ -1167,20 +1261,18 @@ struct ApplicationResponse {
     error: Option<String>,
 }
 
-impl TryFrom<ApplicationResponse> for Response {
-    type Error = Error;
-
-    fn try_from(response: ApplicationResponse) -> Result<Self> {
-        if !(200..=599).contains(&response.status) {
-            return Err(Error::InvalidResponseStatus(response.status));
+impl ApplicationResponse {
+    fn into_response(self, exchange: ProtectedExchange) -> Result<Response> {
+        if !(200..=599).contains(&self.status) {
+            return Err(Error::InvalidResponseStatus(self.status));
         }
-        let status = StatusCode::from_u16(response.status)
-            .map_err(|_| Error::InvalidResponseStatus(response.status))?;
+        let status = StatusCode::from_u16(self.status)
+            .map_err(|_| Error::InvalidResponseStatus(self.status))?;
         let mut headers = HeaderMap::new();
-        for (key, value) in response.headers {
+        for (key, value) in self.headers {
             headers.append(HeaderName::try_from(key)?, HeaderValue::try_from(value)?);
         }
-        let body = match (response.body, response.error) {
+        let body = match (self.body, self.error) {
             (Some(body), _) => body,
             (None, Some(error)) => {
                 headers
@@ -1190,10 +1282,11 @@ impl TryFrom<ApplicationResponse> for Response {
             }
             (None, None) => Vec::new(),
         };
-        Ok(Self {
+        Ok(Response {
             status,
             headers,
             body,
+            exchange,
         })
     }
 }
