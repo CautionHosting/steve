@@ -842,7 +842,13 @@ async function installFakeSession() {
     createdAt: Date.now(),
     enclaveOrigin: getConfig().enclaveOrigin,
     configGeneration: getConfigGeneration(),
-    attestation: { verified: true, pcrs: {}, moduleId: 'test-module' }
+    keyExchange: X25519_KEY_EXCHANGE,
+    attestation: {
+      verified: true,
+      pcrs: {},
+      pcrTrust: 'not-checked',
+      moduleId: 'test-module'
+    }
   };
   setEstablishSession(async () => session);
   await ensureSession();
@@ -891,9 +897,16 @@ test('protected responses preserve repeated headers', async () => {
   assert.equal(response.headers.get('x-repeat'), 'one, two');
 });
 
-test('protectedSend returns the accepted session ID and rejects non-relative paths', async () => {
+test('protectedSend returns non-secret metadata for the accepted exchange', async () => {
   const session = await installFakeSession();
-  globalThis.fetch = (url, options) => validProtocolResponse(options, session, 201);
+  let requestEnvelope;
+  let responseEnvelope;
+  globalThis.fetch = async (url, options) => {
+    requestEnvelope = new Uint8Array(options.body);
+    const response = await validProtocolResponse(options, session, 201);
+    responseEnvelope = new Uint8Array(await response.clone().arrayBuffer());
+    return response;
+  };
 
   const result = await protectedSend({
     path: '/items?q=1',
@@ -904,9 +917,46 @@ test('protectedSend returns the accepted session ID and rejects non-relative pat
 
   assert.equal(result.status, 201);
   assert.equal(result.sessionId.length, 22);
+  const requestCiphertext = decodeEnvelope(requestEnvelope).ciphertext;
+  const responseCiphertext = decodeEnvelope(responseEnvelope).ciphertext;
+  assert.deepEqual(result.exchange, {
+    protocolName: 'STEVE-E2P-V2',
+    protection: 'AES-256-GCM',
+    sessionId: result.sessionId,
+    sequence: '1',
+    keyExchange: 'X25519',
+    pcrTrust: 'not-checked',
+    outerStatus: 200,
+    requestPlaintextBytes: requestCiphertext.length - 16,
+    requestCiphertextBytes: requestCiphertext.length,
+    requestEnvelopeBytes: requestEnvelope.length,
+    responseEnvelopeBytes: responseEnvelope.length,
+    responseCiphertextBytes: responseCiphertext.length,
+    responsePlaintextBytes: responseCiphertext.length - 16
+  });
+  assert.doesNotMatch(JSON.stringify(result.exchange), /payload/u);
+});
+
+test('protectedSend reports each sequence and authenticated application error', async () => {
+  const session = await installFakeSession();
+  globalThis.fetch = (url, options) => validProtocolResponse(options, session, 404);
+
+  const first = await protectedSend({ path: '/missing', headers: [], body: new Uint8Array() });
+  const second = await protectedSend({ path: '/missing', headers: [], body: new Uint8Array() });
+
+  assert.equal(first.status, 404);
+  assert.equal(first.exchange.sequence, '1');
+  assert.equal(second.exchange.sequence, '2');
+  assert.equal(first.exchange.sessionId, second.exchange.sessionId);
+});
+
+test('protectedSend rejects invalid paths without exchange metadata', async () => {
+  await installFakeSession();
   await assert.rejects(
     protectedSend({ path: 'https://other.test/items', headers: [], body: new Uint8Array() }),
-    error => error.code === 'INVALID_REQUEST' && error.stage === 'request'
+    error => error.code === 'INVALID_REQUEST'
+      && error.stage === 'request'
+      && !Object.hasOwn(error, 'exchange')
   );
 });
 

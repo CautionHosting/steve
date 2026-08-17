@@ -166,8 +166,11 @@ Omitting `pcrPolicy` retains the compatibility behavior: PCRs are reported as
 `not-checked` and do not authenticate the expected deployment.
 
 For an explicit protected call, `client.send('/api/secret')` routes an
-origin-relative path through E2P without SDK retries and returns both the
-`Response` and protecting session ID. STEVE does not follow upstream redirects;
+origin-relative path through E2P without SDK retries and returns the `Response`,
+protecting session ID, and non-secret exchange metadata. The metadata covers
+protocol, suite, PCR trust result, sequence, outer status, and serialized
+plaintext/ciphertext/envelope byte counts; it excludes raw records, application
+data, and cryptographic secrets. STEVE does not follow upstream redirects;
 the call returns their `3xx` response, while a redirect of the outer protocol
 request fails. Client methods expose structured `SteveError` fields (`code`,
 `stage`, `message`, and optional `httpStatus`). The worker serializes PCR policy

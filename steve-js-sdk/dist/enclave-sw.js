@@ -1802,7 +1802,8 @@ async function protectedSend(input) {
     status: result.response.status,
     headers: [...result.response.headers.entries()],
     body: new Uint8Array(await result.response.arrayBuffer()),
-    sessionId: result.sessionId
+    sessionId: result.sessionId,
+    exchange: result.exchange
   };
 }
 function deserializeProtectedRequest(input, activeConfig) {
@@ -1892,8 +1893,9 @@ async function handleProtectedRequest(request, requestConfig = config, requestGe
           signal,
           session.enclaveOrigin
         );
+        const outerStatus = response.status;
         if (!response.ok) {
-          throw new ProtocolHttpError(response.status, "request", "v2 request");
+          throw new ProtocolHttpError(outerStatus, "request", "v2 request");
         }
         const responseBytes = await readBoundedResponse(
           response,
@@ -1919,7 +1921,22 @@ async function handleProtectedRequest(request, requestConfig = config, requestGe
         return {
           response: new Response(body, { status: decoded.status, headers: decoded.headers }),
           sequenceValue: responseEnvelope.sequenceValue,
-          responseEnvelope: responseBytes
+          responseEnvelope: responseBytes,
+          exchange: {
+            protocolName: PROTOCOL_ID,
+            protection: RECORD_PROTECTION,
+            sessionId: encodeDiagnosticBytes(session.id),
+            sequence: sequence.toString(),
+            keyExchange: session.keyExchange,
+            pcrTrust: session.attestation.pcrTrust,
+            outerStatus,
+            requestPlaintextBytes: plaintext.length,
+            requestCiphertextBytes: ciphertext.length,
+            requestEnvelopeBytes: envelope.length,
+            responseEnvelopeBytes: responseBytes.length,
+            responseCiphertextBytes: responseEnvelope.ciphertext.length,
+            responsePlaintextBytes: responsePlaintext.length
+          }
         };
       },
       "v2 request timed out",
@@ -1934,7 +1951,8 @@ async function handleProtectedRequest(request, requestConfig = config, requestGe
     }
     return returnDetails ? {
       response: protectedResponse.response,
-      sessionId: encodeDiagnosticBytes(session.id)
+      sessionId: encodeDiagnosticBytes(session.id),
+      exchange: protectedResponse.exchange
     } : protectedResponse.response;
   } catch (error) {
     if (session && sequence !== void 0 && isRequestLocalFailure(error)) {

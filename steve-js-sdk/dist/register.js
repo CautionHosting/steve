@@ -203,7 +203,8 @@ var EnclaveClient = class {
         status: result.status,
         headers: result.headers
       }),
-      sessionId: result.sessionId
+      sessionId: result.sessionId,
+      exchange: result.exchange
     };
   }
   async getPcrPolicy() {

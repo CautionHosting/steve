@@ -230,7 +230,8 @@ export class EnclaveClient {
         status: result.status,
         headers: result.headers
       }),
-      sessionId: result.sessionId
+      sessionId: result.sessionId,
+      exchange: result.exchange
     };
   }
 

@@ -196,24 +196,41 @@ test('protects a 100 KiB body and requests an identity response', async ({ page 
   });
 });
 
-test('client.send routes exactly one protected relative request and returns its session ID', async ({ page }) => {
+test('client.send returns one protected exchange without exposing payloads', async ({ page }) => {
   await openDemo(page);
   const before = isNitro ? null : await upstreamCount(page, 'POST', '/echo');
   const result = await page.evaluate(async () => {
     const client = await window.steveDemo.ready;
-    const { response, sessionId } = await client.send('/echo', {
+    const { response, sessionId, exchange } = await client.send('/echo', {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain' },
       body: 'explicit-protected-send'
     });
-    return { status: response.status, body: await response.text(), sessionId };
+    return { status: response.status, body: await response.text(), sessionId, exchange };
   });
 
-  expect(result).toEqual({
-    status: 200,
-    body: 'explicit-protected-send',
-    sessionId: (await currentStatus(page)).session.id
+  const current = await currentStatus(page);
+  expect(result.status).toBe(200);
+  expect(result.body).toBe('explicit-protected-send');
+  expect(result.sessionId).toBe(current.session.id);
+  expect(result.exchange).toMatchObject({
+    protocolName: 'STEVE-E2P-V2',
+    protection: 'AES-256-GCM',
+    sessionId: current.session.id,
+    keyExchange,
+    pcrTrust: 'pinned',
+    outerStatus: 200
   });
+  expect(result.exchange.sequence).toMatch(/^[1-9][0-9]*$/u);
+  for (const name of [
+    'requestPlaintextBytes',
+    'requestCiphertextBytes',
+    'requestEnvelopeBytes',
+    'responseEnvelopeBytes',
+    'responseCiphertextBytes',
+    'responsePlaintextBytes'
+  ]) expect(result.exchange[name]).toBeGreaterThan(0);
+  expect(JSON.stringify(result.exchange)).not.toContain('explicit-protected-send');
   if (!isNitro) {
     expect(await upstreamCount(page, 'POST', '/echo')).toBe(before + 1);
   }

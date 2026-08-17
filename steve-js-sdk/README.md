@@ -167,7 +167,7 @@ Use `client.send()` when a call must enter the worker's protected E2P path
 without relying on fetch interception:
 
 ```javascript
-const { response, sessionId } = await client.send('/api/secret', {
+const { response, sessionId, exchange } = await client.send('/api/secret', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ operation: 'read' })
@@ -179,9 +179,37 @@ authority, or fragment. The only request options are `method`, `headers`, and
 `body`; the call supplies no implicit browser credentials or cookies. STEVE does
 not follow an upstream redirect and returns its `3xx` response. A redirect of
 the outer protocol request fails, and the SDK never retries. The result contains
-a normal `Response` and the base64url ID of the session that protected the
-request. This API guarantees routing through the active worker, subject to the
-same same-origin bootstrap trust boundary described above.
+a normal `Response`, the base64url ID of the session that protected the request,
+and non-secret `exchange` metadata:
+
+```javascript
+{
+  protocolName: 'STEVE-E2P-V2',
+  protection: 'AES-256-GCM',
+  sessionId: '...',
+  sequence: '1',
+  keyExchange: 'X25519',
+  pcrTrust: 'pinned',
+  outerStatus: 200,
+  requestPlaintextBytes: 74,
+  requestCiphertextBytes: 90,
+  requestEnvelopeBytes: 133,
+  responseEnvelopeBytes: 121,
+  responseCiphertextBytes: 78,
+  responsePlaintextBytes: 62
+}
+```
+
+`sequence` is a decimal string so all `u64` values remain exact in JavaScript.
+The byte counts describe serialized STEVE application records, not only HTTP
+body bytes. Metadata is returned only after the response session and sequence
+match and its AEAD record and application response validate. It never includes
+keys, nonces, raw envelopes, ciphertext, or application data. `sessionId`
+remains at the top level for compatibility and equals `exchange.sessionId`.
+`outerStatus` is the SDK-observed HTTPS protocol status; it is not part of the
+encrypted application record.
+This API guarantees routing through the active worker, subject to the same
+same-origin bootstrap trust boundary described above.
 
 `initialize()`, `rotateSession()`, and `reset()` return the resulting status.
 `rotateKey()` remains an alias for compatibility. `getStatus()` reads status

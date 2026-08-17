@@ -217,7 +217,7 @@ test('waitForInitialization propagates granular establishment errors', async () 
   );
 });
 
-test('send dispatches one relative protected request and returns its session ID', async () => {
+test('send returns the protected response, compatibility session ID, and exchange metadata', async () => {
   const messages = [];
   const timeoutDelays = [];
   const originalSetTimeout = globalThis.setTimeout;
@@ -234,7 +234,22 @@ test('send dispatches one relative protected request and returns its session ID'
         status: 201,
         headers: [['content-type', 'text/plain']],
         body: new TextEncoder().encode('created'),
-        sessionId: 'session-id'
+        sessionId: 'session-id',
+        exchange: {
+          protocolName: 'STEVE-E2P-V2',
+          protection: 'AES-256-GCM',
+          sessionId: 'session-id',
+          sequence: '1',
+          keyExchange: 'X25519',
+          pcrTrust: 'pinned',
+          outerStatus: 200,
+          requestPlaintextBytes: 64,
+          requestCiphertextBytes: 80,
+          requestEnvelopeBytes: 123,
+          responseEnvelopeBytes: 120,
+          responseCiphertextBytes: 77,
+          responsePlaintextBytes: 61
+        }
       });
     }
   };
@@ -250,7 +265,7 @@ test('send dispatches one relative protected request and returns its session ID'
   } finally {
     globalThis.setTimeout = originalSetTimeout;
   }
-  const { response, sessionId } = result;
+  const { response, sessionId, exchange } = result;
 
   assert.equal(messages.length, 1);
   assert.equal(messages[0].type, 'protected-send');
@@ -260,6 +275,21 @@ test('send dispatches one relative protected request and returns its session ID'
   assert.equal(response.status, 201);
   assert.equal(await response.text(), 'created');
   assert.equal(sessionId, 'session-id');
+  assert.deepEqual(exchange, {
+    protocolName: 'STEVE-E2P-V2',
+    protection: 'AES-256-GCM',
+    sessionId: 'session-id',
+    sequence: '1',
+    keyExchange: 'X25519',
+    pcrTrust: 'pinned',
+    outerStatus: 200,
+    requestPlaintextBytes: 64,
+    requestCiphertextBytes: 80,
+    requestEnvelopeBytes: 123,
+    responseEnvelopeBytes: 120,
+    responseCiphertextBytes: 77,
+    responsePlaintextBytes: 61
+  });
   assert.ok(timeoutDelays.includes(315000));
 });
 
