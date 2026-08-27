@@ -119,6 +119,9 @@ The complete encoded request MUST NOT exceed 4,096 bytes.
 | `attestation_document` | `bstr` | Non-empty AWS Nitro attestation document carrying the binding in [Section 6](#6-nitro-attestation-binding). |
 | `expires_in_seconds` | `uint` | `30`, the pending-session lifetime. |
 
+Clients MUST reject an empty attestation document or any pending-session
+expiry other than `30`.
+
 ### 2.3 `Envelope`
 
 | Field | CBOR type | Requirement |
@@ -151,6 +154,8 @@ The plaintext protected by an application envelope is a CBOR map.
 | `headers` | array of `[tstr, tstr]` pairs | Zero or more HTTP response header name/value pairs. Repeated names remain separate entries in upstream order. |
 | `body` | `bstr` or `null` | Response body, or `null` when absent. |
 | `error` | `tstr` or absent | Optional forwarding error. When `body` is absent, clients expose this as an error body. |
+
+Clients MUST reject a present `error` member that is not a text string.
 
 STEVE filters connection-specific and unsafe forwarding headers. Its protected
 upstream response-body limit is 33,554,432 bytes. Because CBOR and AEAD add
@@ -306,6 +311,9 @@ Before confirmation, a client MUST:
 3. parse `user_data` as UTF-8 JSON;
 4. verify all five members above against locally computed values; and
 5. reject malformed or padded binary encodings and any mismatch.
+
+Base64url binding values are canonical only when decoding and then re-encoding
+without padding reproduces the exact input string.
 
 The binder proves that the attested endpoint derived the same KEM shared
 secret. The Nitro signature binds the binder and transcript hash to the

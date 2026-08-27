@@ -859,14 +859,16 @@ async function validProtocolResponse(
   options,
   session,
   applicationStatus = 200,
-  headers = [['content-type', 'text/plain']]
+  headers = [['content-type', 'text/plain']],
+  responseOverrides = {}
 ) {
   const requestEnvelope = decodeEnvelope(new Uint8Array(options.body));
   const plaintext = encodeCBOR({
     status: applicationStatus,
     headers,
     body: null,
-    error: applicationStatus >= 400 ? 'application rejected' : null
+    ...(applicationStatus >= 400 ? { error: 'application rejected' } : {}),
+    ...responseOverrides
   });
   const ciphertext = await seal(
     session.material,
@@ -972,6 +974,51 @@ test('protected responses reject malformed header pairs', async () => {
   const response = await handleProtectedRequest(new Request('https://example.test/headers'));
 
   assert.equal(response.status, 502);
+});
+
+test('protected responses require a present error to be a string', async () => {
+  let session = await installFakeSession();
+  globalThis.fetch = (url, options) => validProtocolResponse(options, session);
+
+  const absent = await handleProtectedRequest(
+    new Request('https://example.test/absent-error')
+  );
+
+  assert.equal(absent.status, 200);
+  assert.equal(getState().session, session);
+
+  globalThis.fetch = (url, options) => validProtocolResponse(
+    options,
+    session,
+    200,
+    [],
+    { error: '' }
+  );
+
+  const accepted = await handleProtectedRequest(
+    new Request('https://example.test/empty-error')
+  );
+
+  assert.equal(accepted.status, 200);
+  assert.equal(getState().session, session);
+
+  for (const error of [null, 7]) {
+    session = await installFakeSession();
+    globalThis.fetch = (url, options) => validProtocolResponse(
+      options,
+      session,
+      200,
+      [],
+      { error }
+    );
+
+    const rejected = await handleProtectedRequest(
+      new Request(`https://example.test/non-string-error-${String(error)}`)
+    );
+
+    assert.equal(rejected.status, 502);
+    assert.equal(getState().session, null);
+  }
 });
 
 test('opt-in wire traces expose encrypted envelopes but not application plaintext', async () => {

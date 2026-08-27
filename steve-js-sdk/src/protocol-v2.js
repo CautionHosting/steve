@@ -18,6 +18,7 @@ export const MAX_ENVELOPE_BYTES = MAX_CBOR_BYTES;
 
 const encoder = new TextEncoder();
 const MAGIC = encoder.encode('STEVE-E2P-V2\0');
+const PENDING_SESSION_EXPIRY_SECONDS = 30;
 const KEY_MATERIAL_LENGTHS = Object.freeze({
   [X25519_KEY_EXCHANGE]: Object.freeze({ client: 32, server: 32 }),
   [XWING_KEY_EXCHANGE]: Object.freeze({ client: 1216, server: 1120 })
@@ -260,10 +261,11 @@ export function decodeSessionResponse(bytes, expectedKeyExchange) {
   }
   requireLength('session ID', response.session_id, 16);
   requireKeyMaterial(expectedKeyExchange, 'server', response.server_key_material);
-  if (!(response.attestation_document instanceof Uint8Array)) {
+  if (!(response.attestation_document instanceof Uint8Array)
+      || response.attestation_document.length === 0) {
     throw new Error('invalid attestation document');
   }
-  if (!Number.isInteger(response.expires_in_seconds) || response.expires_in_seconds <= 0) {
+  if (response.expires_in_seconds !== PENDING_SESSION_EXPIRY_SECONDS) {
     throw new Error('invalid pending-session expiry');
   }
   return response;
@@ -344,7 +346,11 @@ export function decodeBase64Url(value) {
   const padded = value.replaceAll('-', '+').replaceAll('_', '/')
     + '='.repeat((4 - (value.length % 4)) % 4);
   const binary = atob(padded);
-  return Uint8Array.from(binary, character => character.charCodeAt(0));
+  const decoded = Uint8Array.from(binary, character => character.charCodeAt(0));
+  if (encodeBase64Url(decoded) !== value) {
+    throw new Error('invalid base64url value in attestation');
+  }
+  return decoded;
 }
 
 function requireLength(name, value, length) {

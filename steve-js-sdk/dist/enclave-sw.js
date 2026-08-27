@@ -734,6 +734,7 @@ var REQUEST_ENDPOINT = "/e2p/v2/request";
 var MAX_ENVELOPE_BYTES = MAX_CBOR_BYTES;
 var encoder = new TextEncoder();
 var MAGIC = encoder.encode("STEVE-E2P-V2\0");
+var PENDING_SESSION_EXPIRY_SECONDS = 30;
 var KEY_MATERIAL_LENGTHS = Object.freeze({
   [X25519_KEY_EXCHANGE]: Object.freeze({ client: 32, server: 32 }),
   [XWING_KEY_EXCHANGE]: Object.freeze({ client: 1216, server: 1120 })
@@ -938,10 +939,10 @@ function decodeSessionResponse(bytes, expectedKeyExchange) {
   }
   requireLength("session ID", response.session_id, 16);
   requireKeyMaterial(expectedKeyExchange, "server", response.server_key_material);
-  if (!(response.attestation_document instanceof Uint8Array)) {
+  if (!(response.attestation_document instanceof Uint8Array) || response.attestation_document.length === 0) {
     throw new Error("invalid attestation document");
   }
-  if (!Number.isInteger(response.expires_in_seconds) || response.expires_in_seconds <= 0) {
+  if (response.expires_in_seconds !== PENDING_SESSION_EXPIRY_SECONDS) {
     throw new Error("invalid pending-session expiry");
   }
   return response;
@@ -1007,7 +1008,11 @@ function decodeBase64Url(value) {
   }
   const padded = value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - value.length % 4) % 4);
   const binary = atob(padded);
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  const decoded = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  if (encodeBase64Url(decoded) !== value) {
+    throw new Error("invalid base64url value in attestation");
+  }
+  return decoded;
 }
 function requireLength(name, value, length) {
   if (!(value instanceof Uint8Array) || value.length !== length) {
@@ -2406,6 +2411,9 @@ function validateApplicationResponse(response) {
   }
   if (response.body !== null && response.body !== void 0 && !(response.body instanceof Uint8Array)) {
     throw new Error("invalid protected application body");
+  }
+  if (Object.prototype.hasOwnProperty.call(response, "error") && typeof response.error !== "string") {
+    throw new Error("invalid protected application error");
   }
 }
 function shouldProtectRequest(request, activeConfig = config) {

@@ -56,6 +56,7 @@ const MAX_APPLICATION_RESPONSE_BYTES: usize = 32 * 1024 * 1024 + 64 * 1024;
 const DEFAULT_SESSION_ROTATION_INTERVAL: Duration = Duration::from_secs(25 * 60);
 const DEFAULT_SESSION_ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const PENDING_SESSION_EXPIRY_SECONDS: u32 = 30;
 const REPLAY_WINDOW_SIZE: u128 = 64;
 const PCR_SIZE: usize = 48;
 const NATIVE_CONTEXT_MAGIC: &[u8] = b"STEVE-E2P-V2-NATIVE\0";
@@ -756,7 +757,7 @@ impl Client {
             return Err(Error::Protocol("unsupported session response version"));
         }
         ensure_session_response_suite(key_exchange, response.key_exchange)?;
-        if response.expires_in_seconds == 0 {
+        if response.expires_in_seconds != PENDING_SESSION_EXPIRY_SECONDS {
             return Err(Error::Protocol("invalid pending session expiry"));
         }
         if response.attestation_document.is_empty() {
@@ -1258,7 +1259,17 @@ struct ApplicationResponse {
     headers: Vec<(String, String)>,
     #[serde(with = "serde_bytes")]
     body: Option<Vec<u8>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
     error: Option<String>,
+}
+
+fn deserialize_optional_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 impl ApplicationResponse {

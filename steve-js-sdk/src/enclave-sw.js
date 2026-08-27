@@ -886,6 +886,10 @@ function validateApplicationResponse(response) {
   if (response.body !== null && response.body !== undefined && !(response.body instanceof Uint8Array)) {
     throw new Error('invalid protected application body');
   }
+  if (Object.prototype.hasOwnProperty.call(response, 'error')
+      && typeof response.error !== 'string') {
+    throw new Error('invalid protected application error');
+  }
 }
 
 function shouldProtectRequest(request, activeConfig = config) {

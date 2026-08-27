@@ -192,6 +192,27 @@ test('attested binder requires exact transcript values', () => {
   );
   assert.throws(
     () => verifyBinding(
+      { ...userData, session_id: `${userData.session_id}=` },
+      keyExchange,
+      sessionId,
+      transcriptHash,
+      binder
+    ),
+    /invalid base64url value/u
+  );
+  assert.equal(userData.session_id.endsWith('w'), true);
+  assert.throws(
+    () => verifyBinding(
+      { ...userData, session_id: `${userData.session_id.slice(0, -1)}x` },
+      keyExchange,
+      sessionId,
+      transcriptHash,
+      binder
+    ),
+    /invalid base64url value/u
+  );
+  assert.throws(
+    () => verifyBinding(
       { ...userData, key_exchange: XWING_KEY_EXCHANGE },
       keyExchange,
       sessionId,
@@ -235,6 +256,22 @@ test('session wire uses generic key material fields and exact suite', () => {
     }), X25519_KEY_EXCHANGE),
     /key exchange mismatch/u
   );
+  assert.throws(
+    () => decodeSessionResponse(encodeCBOR({
+      ...response,
+      attestation_document: new Uint8Array()
+    }), X25519_KEY_EXCHANGE),
+    /invalid attestation document/u
+  );
+  for (const expiresInSeconds of [0, 29, 31]) {
+    assert.throws(
+      () => decodeSessionResponse(encodeCBOR({
+        ...response,
+        expires_in_seconds: expiresInSeconds
+      }), X25519_KEY_EXCHANGE),
+      /invalid pending-session expiry/u
+    );
+  }
 });
 
 test('X-Wing transcript binds the suite and exact 1216/1120-byte material', () => {

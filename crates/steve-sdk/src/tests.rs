@@ -571,6 +571,37 @@ async fn session_response_suite_mismatch_aborts_before_attestation() {
     assert_eq!(requests.load(AtomicOrdering::Relaxed), 1);
 }
 
+#[tokio::test]
+async fn session_response_noncanonical_expiry_aborts_before_attestation() {
+    let app = Router::new().route(
+        "/e2p/v2/session",
+        axum::routing::post(|| async {
+            (
+                [("content-type", "application/cbor")],
+                encode_cbor(&SessionResponse {
+                    version: VERSION,
+                    key_exchange: KeyExchangeSuite::X25519,
+                    session_id: vec![1; 16],
+                    server_key_material: vec![2; 32],
+                    attestation_document: vec![1],
+                    expires_in_seconds: 31,
+                })
+                .unwrap(),
+            )
+        }),
+    );
+    let url = spawn_router(app).await;
+    let client = Client::builder(&url, expected_pcrs())
+        .unwrap()
+        .build()
+        .unwrap();
+
+    assert!(matches!(
+        client.initialize().await,
+        Err(Error::Protocol("invalid pending session expiry"))
+    ));
+}
+
 #[test]
 fn corrupted_xwing_ciphertext_uses_implicit_rejection_without_a_kem_error() {
     let client = ClientKem::generate(KeyExchangeSuite::XWingDraft10);
@@ -1214,6 +1245,44 @@ fn application_response_preserves_repeated_headers() {
             .collect::<Vec<_>>(),
         ["a=1", "b=2"]
     );
+}
+
+#[test]
+fn application_response_error_requires_text_when_present() {
+    let decode = |value: serde_json::Value| {
+        let encoded = encode_cbor(&value).unwrap();
+        decode_cbor::<ApplicationResponse>(&encoded)
+    };
+
+    assert!(decode(serde_json::json!({
+        "status": 200,
+        "headers": [],
+        "body": null
+    }))
+    .unwrap()
+    .error
+    .is_none());
+    assert_eq!(
+        decode(serde_json::json!({
+            "status": 200,
+            "headers": [],
+            "body": null,
+            "error": ""
+        }))
+        .unwrap()
+        .error
+        .as_deref(),
+        Some("")
+    );
+    for error in [serde_json::Value::Null, serde_json::json!(7)] {
+        assert!(decode(serde_json::json!({
+            "status": 200,
+            "headers": [],
+            "body": null,
+            "error": error
+        }))
+        .is_err());
+    }
 }
 
 #[tokio::test]
