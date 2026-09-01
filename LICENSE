@@ -1,0 +1,136 @@
+# License
+
+Copyright (c) 2025 Caution SEZC
+
+SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Commercial
+
+This software is dual-licensed under the GNU Affero General Public License v3.0 (AGPL-3.0) and a commercial license.
+
+## AGPL-3.0 License (Open Source)
+
+**For open source projects, personal use, and non-commercial use:**
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/agpl-3.0.html>.
+
+### What this means:
+
+- You can use, modify, and distribute this software for free
+- You can run this software as a service
+- **You must share ALL source code** of your modified version
+- **You must share ALL code that uses this software as a library**
+- **If you run this software as a service, you must share your full source code** (including modifications) to your users
+
+The AGPL-3.0 includes the "network use" clause, which means if you run this software as a hosted service, you must provide the complete source code to anyone who interacts with it over a network.
+
+**This is perfect for:**
+- Open source projects that already share their code
+- Personal projects and learning
+- Academic research
+- Contributing back to the community
+
+**This may NOT work for:**
+- Businesses wanting to keep their infrastructure proprietary
+- Companies offering competing PaaS services
+- Organizations with proprietary modifications
+
+## Commercial License
+
+**For businesses, proprietary use, and hosted services:**
+
+If you want to use this software in a proprietary product, run it as a service without sharing your source code, or integrate it into commercial software, you need a commercial license.
+
+### Commercial license benefits:
+
+- ✅ Keep your code proprietary
+- ✅ No obligation to share modifications
+- ✅ Run as a hosted service without source code disclosure
+- ✅ Priority support
+- ✅ Legal protection and indemnification
+- ✅ Custom features and consultation
+
+### Pricing:
+
+Contact us for commercial licensing:
+- **Email:** info@caution.co
+- **Website:** https://caution.co
+
+Pricing is based on:
+- Number of users/organizations
+- Deployment scale (self-hosted vs. managed service)
+- Support level required
+- Custom feature development
+
+## Why Dual License?
+
+We believe in open source software, but we also recognize that some organizations need the flexibility to keep their modifications private. The dual license model allows:
+
+1. **Open source projects** to benefit from this software for free
+2. **Commercial users** to use this software without AGPL obligations
+3. **Sustainable development** through commercial license revenue
+4. **Everyone** to benefit from improvements and bug fixes
+
+## FAQ
+
+### Q: I'm a business. Do I need a commercial license?
+
+**A:** It depends:
+- If you're comfortable sharing ALL your code (including infrastructure code, deployment scripts, etc.), you can use the AGPL version
+- If you want to keep ANY part of your implementation private, you need a commercial license
+- If you're running this software as a service for others, you likely need a commercial license
+
+### Q: I want to contribute code. Which license applies?
+
+**A:** By contributing to this software, you agree to license your contributions under both AGPL-3.0 and the commercial license. This allows us to offer both license options. See CONTRIBUTING.md for details.
+
+### Q: Can I fork this software and offer it under a different license?
+
+**A:** You can fork under AGPL-3.0, but:
+- Your fork must remain AGPL-3.0
+- You must share all source code
+- You cannot relicense as proprietary
+- You cannot remove the AGPL requirements
+
+### Q: I'm using this software internally at my company. Do I need a commercial license?
+
+**A:** If you're only using this software internally and not offering it as a service to others, AGPL allows this as long as you're willing to share your source code with anyone who has network access to your software instance. Most companies prefer a commercial license to keep internal modifications private.
+
+### Q: What about SaaS companies using this software?
+
+**A:** The AGPL specifically covers the SaaS use case. If you offer this software as a hosted service, you must provide your complete source code to users. Most SaaS companies choose our commercial license instead.
+
+### Q: Can I use this software to deploy proprietary applications?
+
+**A:** Yes! The applications you deploy ON this software remain yours with their own licenses. This license only covers this software itself and modifications to this software. Your applications are not affected.
+
+### Q: What if I'm a non-profit or educational institution?
+
+**A:** Contact us! We offer special pricing for non-profits, educational institutions, and open source projects. Many qualify for free commercial licenses.
+
+## License Compliance
+
+If you use this software under AGPL-3.0, you must:
+
+1. **Include license notices**: Keep all copyright and license notices intact
+2. **Provide source access**: Make your complete source code available to users
+3. **Document modifications**: Clearly mark any changes you've made
+4. **License downstream**: Any distributed modifications must be AGPL-3.0
+5. **Offer network access to source**: If running as a service, provide source code download
+
+Failure to comply with AGPL-3.0 automatically terminates your license to use this software.
+
+## Changing Licenses
+
+You can change from AGPL to commercial license at any time by purchasing a commercial license. Contact us to discuss your needs.
+
+## Full License Texts
+
+The complete license texts are available in the [LICENSES/](LICENSES/) directory:
+
+- **AGPL-3.0**: [LICENSES/AGPL-3.0-only.txt](LICENSES/AGPL-3.0-only.txt)
+- **Commercial**: [LICENSES/LicenseRef-Commercial.txt](LICENSES/LicenseRef-Commercial.txt)
+
+The AGPL-3.0 license is also available at: https://www.gnu.org/licenses/agpl-3.0.txt
