@@ -3,6 +3,8 @@ name = "steve-sdk-uniffi"
 version = "0.1.0"
 edition = "2024"
 readme = "README.md"
+license = "MIT"
+publish = false
 
 [lib]
 crate-type = ["lib", "staticlib"]

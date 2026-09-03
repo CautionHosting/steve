@@ -3,6 +3,8 @@ name = "steve-cli"
 version = "0.1.0"
 edition = "2024"
 readme = "README.md"
+license = "AGPL-3.0-only OR Commercial"
+publish = false
 
 [dependencies]
 async-trait = "=0.1.89"
