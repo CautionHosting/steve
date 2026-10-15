@@ -262,3 +262,9 @@ The browser gate compares verified evidence with the expected PCRs; the Rust SDK
 enforces them during connection. Do not source expected PCRs from the unverified
 remote response. See [tests/e2e/README.md](tests/e2e/README.md) for CI,
 fixture-deployment, focused-test, and trust-boundary details.
+
+## Source repository
+
+Canonical source: https://git.caution.co/public/steve. This migration updates
+repository locations while retaining the existing dependency revisions and package
+versions. Build measurements must be verified again after rebuilding.
