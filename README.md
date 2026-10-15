@@ -265,6 +265,4 @@ fixture-deployment, focused-test, and trust-boundary details.
 
 ## Source repository
 
-Canonical source: https://git.caution.co/public/steve. This migration updates
-repository locations while retaining the existing dependency revisions and package
-versions. Build measurements must be verified again after rebuilding.
+Canonical source: https://git.caution.co/public/steve.

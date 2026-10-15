@@ -34,10 +34,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://codeberg.org/caution/transport-security-service-worker.git"
+    "url": "git+https://git.caution.co/public/steve.git",
+    "directory": "steve-js-sdk"
   },
   "dependencies": {
-    "tee-attestation-js": "git+https://git.distrust.co/public/tee-attestation-js.git#ba0d0c57de673c8576c91a8730775a87575f5c10"
+    "tee-attestation-js": "git+https://git.caution.co/public/tee-attestation-js.git#ba0d0c57de673c8576c91a8730775a87575f5c10"
   },
   "devDependencies": {
     "@noble/post-quantum": "0.6.1",
