@@ -92,8 +92,30 @@ pub fn write_metadata() -> Result<(), BoxError> {
 fn write_metadata_to(metadata_path: &str, key_exchange: KeyExchangeSuite) -> Result<(), BoxError> {
     let metadata = StaticMetadataOutput::new(key_exchange);
     debug!(?metadata, %metadata_path, "writing enclave metadata");
-    let metadata_file = std::fs::File::create_new(metadata_path)?;
-    serde_json::to_writer(metadata_file, &metadata)?;
+    write_metadata_json_to(std::path::Path::new(metadata_path), &metadata)
+}
+
+fn write_metadata_json_to(
+    metadata_path: &std::path::Path,
+    metadata: &impl Serialize,
+) -> Result<(), BoxError> {
+    let parent = metadata_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut staging = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // This metadata is public: preserve File::create_new's 0666 & !umask mode.
+        staging.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut metadata_file = staging.tempfile_in(parent)?;
+    // Keep incomplete JSON off the published path; the staging file is unbuffered.
+    serde_json::to_writer(&mut metadata_file, metadata)?;
+    metadata_file
+        .persist_noclobber(metadata_path)
+        .map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -2472,6 +2494,134 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn metadata_is_published_only_after_serialization_completes() {
+        struct ObservedMetadata<'a>(&'a std::path::Path);
+
+        impl Serialize for ObservedMetadata<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeMap;
+
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("e2p_protocol_version", &2)?;
+                // Check visibility partway through serialization.
+                assert!(
+                    !self.0.exists(),
+                    "metadata destination became visible before serialization completed"
+                );
+                map.serialize_entry("e2p_key_exchange", "X25519")?;
+                map.end()
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata.json");
+        write_metadata_json_to(&path, &ObservedMetadata(&path)).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            br#"{"e2p_protocol_version":2,"e2p_key_exchange":"X25519"}"#
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_preserves_create_new_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let reference = std::fs::File::create_new(directory.path().join("reference")).unwrap();
+        let path = directory.path().join("metadata.json");
+        write_metadata_to(path.to_str().unwrap(), KeyExchangeSuite::X25519).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode(),
+            reference.metadata().unwrap().permissions().mode(),
+            "metadata must keep create_new's umask-respecting readability"
+        );
+    }
+
+    #[test]
+    fn metadata_serialization_failure_leaves_no_files() {
+        struct FailingMetadata;
+
+        impl Serialize for FailingMetadata {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeMap;
+
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("e2p_protocol_version", &2)?;
+                Err(serde::ser::Error::custom(
+                    "deliberate serialization failure",
+                ))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata.json");
+        let error = write_metadata_json_to(&path, &FailingMetadata).unwrap_err();
+        assert_eq!(error.to_string(), "deliberate serialization failure");
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn metadata_does_not_replace_destination_created_during_serialization() {
+        struct RacingMetadata<'a>(&'a std::path::Path);
+
+        impl Serialize for RacingMetadata<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let result =
+                    StaticMetadataOutput::new(KeyExchangeSuite::X25519).serialize(serializer)?;
+                std::fs::write(self.0, b"other writer").unwrap();
+                Ok(result)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata.json");
+        let error = write_metadata_json_to(&path, &RacingMetadata(&path)).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"other writer");
+        // Even retaining the error must not retain the staging file.
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_does_not_replace_dangling_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata.json");
+        let missing = directory.path().join("missing.json");
+        std::os::unix::fs::symlink(&missing, &path).unwrap();
+
+        let error =
+            write_metadata_to(path.to_str().unwrap(), KeyExchangeSuite::X25519).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read_link(&path).unwrap(), missing);
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn metadata_supports_relative_paths() {
+        // Reserve a unique basename with RAII cleanup, without changing process cwd.
+        let path = tempfile::NamedTempFile::new_in(".")
+            .unwrap()
+            .into_temp_path();
+        std::fs::remove_file(&path).unwrap();
+        let basename = path.file_name().unwrap().to_str().unwrap();
+        write_metadata_to(basename, KeyExchangeSuite::X25519).unwrap();
+        let expected =
+            serde_json::to_vec(&StaticMetadataOutput::new(KeyExchangeSuite::X25519)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
     #[test]
