@@ -22,7 +22,7 @@ hkdf = "0.12.4"
 sha2 = "0.10.9"
 x25519-dalek = "2.0.1"
 x-wing = { version = "=0.1.0", features = ["getrandom", "zeroize"] }
-bootproof = { git = "https://git.caution.co/public/bootproof.git", rev = "78f531a2c245404a9d8879fb71cc397096ae0077", version = "0.1.0" }
+bootproof = { git = "https://git.caution.co/public/bootproof.git", rev = "b346db17523ad9b13ef41eb9c14df3328bbd80d1", version = "0.1.0" }
 p384 = { version = "0.13.1", features = ["ecdsa", "pem", "pkcs8"], optional = true }
 zeroize = { version = "1.8", features = ["derive"] }
 
