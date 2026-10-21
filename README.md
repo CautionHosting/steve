@@ -337,3 +337,7 @@ The browser and Rust gates enforce the expected PCRs during connection and
 reject a mutated profile before application traffic. Do not source expected
 PCRs from the unverified remote response. See [tests/e2e/README.md](tests/e2e/README.md) for CI,
 fixture-deployment, focused-test, and trust-boundary details.
+
+## Source repository
+
+Canonical source: https://git.caution.co/public/steve.
