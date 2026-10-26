@@ -1228,7 +1228,7 @@ var steve_xwing_wasm_default = __wbg_init;
 
 // src/key-exchange.js
 var XWING_WASM_PATH = "./xwing/steve_xwing_wasm_bg.wasm";
-var XWING_WASM_SHA256 = false ? null : "802131b0e84424760f3e2e37bcee0c76fb029aa3480d7742b839f60508cc0912";
+var XWING_WASM_SHA256 = false ? null : "1cc73ccc10dbf78e8d9398f0836254f06748493348818efa9b494e5a6e439ce8";
 function createVerifiedXWingModuleLoader(initializer) {
   if (typeof initializer !== "function") {
     throw new TypeError("X-Wing module initializer must be a function");
