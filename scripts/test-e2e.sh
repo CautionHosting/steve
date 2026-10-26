@@ -63,7 +63,9 @@ build_swift_smoke() {
   compiler_deployment_target=${swift_target##*macosx}
   deployment_target=${MACOSX_DEPLOYMENT_TARGET:-$compiler_deployment_target}
   echo "Building Swift UniFFI library, bindings, and smoke executable"
+  # Stripping proc-macro dylibs under a deployment target breaks rustc loading them.
   MACOSX_DEPLOYMENT_TARGET=$deployment_target \
+  CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP=none \
     cargo build --release --locked --manifest-path "$ROOT_DIR/Cargo.toml" \
       --target-dir "$SWIFT_CARGO_TARGET_DIR" \
       -p steve-sdk-uniffi --features synthetic-testing --lib
