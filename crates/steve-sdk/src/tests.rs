@@ -224,6 +224,18 @@ async fn spawn_raw_response(response: Vec<u8>) -> String {
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
+        // Read the request head first; an unsolicited response is rejected by hyper.
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            socket.readable().await.unwrap();
+            match socket.try_read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => request.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("raw request read failed: {error}"),
+            }
+        }
         let mut written = 0;
         while written < response.len() {
             socket.writable().await.unwrap();
